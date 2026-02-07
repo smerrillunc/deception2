@@ -1,0 +1,47 @@
+{
+  "name": "venhoff_2025_reasoning_functions",
+  "version": "v1",
+  "instructions": "Choose exactly one label that best matches the sentence's primary function.",
+  "labels": [
+    {
+      "id": "problem_setup",
+      "name": "Problem Setup",
+      "description": "Parsing or rephrasing the problem."
+    },
+    {
+      "id": "plan_generation",
+      "name": "Plan Generation",
+      "description": "Stating or deciding on a plan of action, meta-reasoning."
+    },
+    {
+      "id": "fact_retrieval",
+      "name": "Fact Retrieval",
+      "description": "Recalling facts, formulas, or problem details without computation."
+    },
+    {
+      "id": "active_computation",
+      "name": "Active Computation",
+      "description": "Algebra, calculations, or other manipulations toward the answer."
+    },
+    {
+      "id": "uncertainty_management",
+      "name": "Uncertainty Management",
+      "description": "Expressing confusion, re-evaluating, including backtracking."
+    },
+    {
+      "id": "result_consolidation",
+      "name": "Result Consolidation",
+      "description": "Aggregating intermediate results, summarizing, or preparing the final answer."
+    },
+    {
+      "id": "self_checking",
+      "name": "Self Checking",
+      "description": "Verifying previous steps, checking calculations, and re-confirmations."
+    },
+    {
+      "id": "final_answer_emission",
+      "name": "Final Answer Emission",
+      "description": "Explicitly stating the final answer."
+    }
+  ]
+}
