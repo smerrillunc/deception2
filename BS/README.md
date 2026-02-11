@@ -112,6 +112,25 @@ Output:
 - `src/extract_sentence_features.py`: builds a modeling dataset with text + localization features
 - `src/sentence_pipeline.py`: shared sentence utilities + taxonomy support
 
+## Werewolf Environment
+
+A Werewolf environment is now available with the same mining + sentence-localization workflow shape used for BS.
+
+### Mine Werewolf deception examples
+```bash
+python BS/src/werewolf_deception_miner.py   --model_name deepseek-ai/DeepSeek-R1-Distill-Qwen-7B   --is_reasoning_model   --output_dir BS/Results/WerewolfDeceptionMining/demo
+```
+
+Output records include:
+- `deceptive` and `naturally_deceptive` labels for discussion claims
+- `truth_context` with hidden-role mapping for localization-time truth checks
+- standard fields (`messages`, `prompt`, `game_id`, `turn_idx`, etc.)
+
+### Demo notebook
+- `Notebooks/werewolf_environment_demo.ipynb`
+
+The notebook shows environment usage plus end-to-end commands for building sentence datasets and running localization on Werewolf examples.
+
 ## Notes
 - Sentence splitting uses a simple regex; swap in spaCy if you want higher-quality segmentation.
 - If you want to tag `action_raw_text` instead, change `--text_field` in `run_sentence_dataset.sh`.

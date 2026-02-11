@@ -1,6 +1,6 @@
 # Deception2
 
-This repository contains the BS deception mining + sentence‑level localization pipeline.
+This repository contains BS and Werewolf deception mining environments plus the sentence‑level localization pipeline.
 
 ## Quick Start
 See the main pipeline docs here:
@@ -9,3 +9,6 @@ See the main pipeline docs here:
 ## Layout
 - `BS/`: Core code, scripts, config, and results (ignored in git)
 
+
+
+- Werewolf demo notebook: `BS/Notebooks/werewolf_environment_demo.ipynb`

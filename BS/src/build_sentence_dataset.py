@@ -88,7 +88,7 @@ def main(argv=None):
         examples_iter,
         text_field=args.text_field,
         example_id_field="example_id",
-        include_example_fields=["deceptive", "current_rank", "prompt", "game_id", "turn_idx"],
+        include_example_fields=["deceptive", "naturally_deceptive", "current_rank", "truth_context", "prompt", "game_id", "turn_idx", "game_type"],
     )
     write_jsonl(sentences, sentences_path)
 

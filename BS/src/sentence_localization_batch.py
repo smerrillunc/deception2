@@ -168,8 +168,12 @@ def main(argv=None):
             truthful_rank = int(ex.get("truthful_rank"))
         elif ex.get("previous_rank") is not None:
             truthful_rank = int(ex.get("previous_rank"))
-        else:
+        elif ex.get("current_rank") is not None:
             truthful_rank = int(ex.get("current_rank"))
+        elif ex.get("truth_context") is not None:
+            truthful_rank = ex.get("truth_context")
+        else:
+            continue
 
         sentences = [
             {

@@ -114,8 +114,12 @@ def main(argv=None):
         truthful_rank = int(example.get("truthful_rank"))
     elif example.get("previous_rank") is not None:
         truthful_rank = int(example.get("previous_rank"))
-    else:
+    elif example.get("current_rank") is not None:
         truthful_rank = int(example.get("current_rank"))
+    elif example.get("truth_context") is not None:
+        truthful_rank = example.get("truth_context")
+    else:
+        raise ValueError("Example missing truthful_rank/current_rank/truth_context.")
 
     sentences = [
         {
