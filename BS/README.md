@@ -112,6 +112,8 @@ Output:
 - `src/extract_sentence_features.py`: builds a modeling dataset with text + localization features
 - `src/sentence_pipeline.py`: shared sentence utilities + taxonomy support
 
+For Werewolf docs, see `../Werewolf/README.md`.
+
 ## Notes
 - Sentence splitting uses a simple regex; swap in spaCy if you want higher-quality segmentation.
 - If you want to tag `action_raw_text` instead, change `--text_field` in `run_sentence_dataset.sh`.
