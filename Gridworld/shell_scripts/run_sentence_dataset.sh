@@ -50,9 +50,26 @@ fi
 
 TEXT_FIELD="${TEXT_FIELD:-action_reasoning}"
 FALLBACK_TEXT_FIELD="${FALLBACK_TEXT_FIELD:-action_raw_text}"
-ONLY_DECEPTIVE="${ONLY_DECEPTIVE:-1}"
+LABEL_FILTER="${LABEL_FILTER:-deceptive_only}"
+ONLY_DECEPTIVE="${ONLY_DECEPTIVE:-0}"
+ONLY_TRUTHFUL="${ONLY_TRUTHFUL:-0}"
 INCLUDE_MESSAGES="${INCLUDE_MESSAGES:-0}"
 LIMIT="${LIMIT:-0}"
+
+if [[ "$ONLY_DECEPTIVE" == "1" && "$ONLY_TRUTHFUL" == "1" ]]; then
+  echo "Cannot set both ONLY_DECEPTIVE=1 and ONLY_TRUTHFUL=1"
+  exit 1
+fi
+if [[ "$ONLY_DECEPTIVE" == "1" ]]; then
+  LABEL_FILTER="deceptive_only"
+fi
+if [[ "$ONLY_TRUTHFUL" == "1" ]]; then
+  LABEL_FILTER="truthful_only"
+fi
+if [[ "$LABEL_FILTER" != "all" && "$LABEL_FILTER" != "deceptive_only" && "$LABEL_FILTER" != "truthful_only" ]]; then
+  echo "Invalid LABEL_FILTER=$LABEL_FILTER. Expected one of: all, deceptive_only, truthful_only"
+  exit 1
+fi
 
 mkdir -p "$OUT_DIR"
 
@@ -64,11 +81,8 @@ CMD=(
   --out_dir "$OUT_DIR"
   --text_field "$TEXT_FIELD"
   --fallback_text_field "$FALLBACK_TEXT_FIELD"
+  --label_filter "$LABEL_FILTER"
 )
-
-if [[ "$ONLY_DECEPTIVE" == "1" ]]; then
-  CMD+=(--only_deceptive)
-fi
 
 if [[ "$INCLUDE_MESSAGES" == "1" ]]; then
   CMD+=(--include_messages)
@@ -84,6 +98,7 @@ echo "INPUT_ROOT: $INPUT_ROOT"
 echo "OUT_DIR: $OUT_DIR"
 echo "TEXT_FIELD: $TEXT_FIELD"
 echo "FALLBACK_TEXT_FIELD: $FALLBACK_TEXT_FIELD"
+echo "LABEL_FILTER: $LABEL_FILTER"
 
 echo "Building sentence dataset..."
 "${CMD[@]}"

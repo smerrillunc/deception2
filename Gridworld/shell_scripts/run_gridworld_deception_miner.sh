@@ -52,7 +52,21 @@ MODEL_TAG="${MODEL_NAME//\//_}"
 SEED_BASE=${SEED_BASE:-0}
 MAX_GAMES=${MAX_GAMES:-1000}
 MAX_TURNS=${MAX_TURNS:-1000}
-TARGET_DECEPTIVE=${TARGET_DECEPTIVE:-1000}
+LABEL_FILTER="${LABEL_FILTER:-deceptive_only}"
+if [[ "$LABEL_FILTER" != "all" && "$LABEL_FILTER" != "deceptive_only" && "$LABEL_FILTER" != "truthful_only" ]]; then
+    echo "Invalid LABEL_FILTER=$LABEL_FILTER. Expected one of: all, deceptive_only, truthful_only"
+    exit 1
+fi
+if [[ "$LABEL_FILTER" == "truthful_only" ]]; then
+    TARGET_DECEPTIVE=${TARGET_DECEPTIVE:-0}
+    TARGET_TRUTHFUL=${TARGET_TRUTHFUL:-1000}
+elif [[ "$LABEL_FILTER" == "deceptive_only" ]]; then
+    TARGET_DECEPTIVE=${TARGET_DECEPTIVE:-1000}
+    TARGET_TRUTHFUL=${TARGET_TRUTHFUL:-0}
+else
+    TARGET_DECEPTIVE=${TARGET_DECEPTIVE:-0}
+    TARGET_TRUTHFUL=${TARGET_TRUTHFUL:-0}
+fi
 
 GRID_WIDTH=${GRID_WIDTH:-9}
 GRID_HEIGHT=${GRID_HEIGHT:-9}
@@ -76,6 +90,7 @@ mkdir -p "$OUT_DIR"
 
 echo "Output dir: $OUT_DIR"
 echo "Model: $MODEL_NAME"
+echo "Label filter: $LABEL_FILTER"
 echo "Running miner..."
 
 CMD=(
@@ -86,7 +101,9 @@ CMD=(
     --seed "$SEED_BASE"
     --max_games "$MAX_GAMES"
     --max_turns "$MAX_TURNS"
+    --label_filter "$LABEL_FILTER"
     --target_deceptive "$TARGET_DECEPTIVE"
+    --target_truthful "$TARGET_TRUTHFUL"
     --grid_width "$GRID_WIDTH"
     --grid_height "$GRID_HEIGHT"
     --wall_prob "$WALL_PROB"

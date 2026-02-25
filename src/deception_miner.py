@@ -19,6 +19,11 @@ for path in (SRC_ROOT, BS_SRC_ROOT, GRIDWORLD_SRC_ROOT):
 
 from vllm import LLM
 
+from deception_dataset import (
+    LABEL_FILTER_CHOICES,
+    keep_record_for_label_filter,
+    normalize_label_filter,
+)
 from llm_agent import LLMAgent
 from utils import append_jsonl, atomic_write_json, get_model_output, set_global_seed
 
@@ -441,6 +446,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_games", type=int, default=1000)
     parser.add_argument("--max_turns", type=int, default=1000)
     parser.add_argument("--target_deceptive", type=int, default=0)
+    parser.add_argument("--target_truthful", type=int, default=0)
+    parser.add_argument("--label_filter", type=str, choices=LABEL_FILTER_CHOICES, default="all")
+    parser.add_argument("--only_deceptive", action="store_true", default=False)
+    parser.add_argument("--only_truthful", action="store_true", default=False)
     parser.add_argument("--save_all", action="store_true", default=True)
     parser.add_argument("--save_only_deceptive", action="store_true", default=False)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -472,6 +481,15 @@ def main(argv=None):
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    legacy_only_deceptive = args.save_only_deceptive or (not args.save_all)
+    label_filter = normalize_label_filter(
+        args.label_filter,
+        only_deceptive=(args.only_deceptive or legacy_only_deceptive),
+        only_truthful=args.only_truthful,
+    )
+    use_target_deceptive = args.target_deceptive > 0 and label_filter != "truthful_only"
+    use_target_truthful = args.target_truthful > 0 and label_filter != "deceptive_only"
+
     os.makedirs(args.output_dir, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     set_global_seed(args.seed)
@@ -498,6 +516,10 @@ def main(argv=None):
         "max_games": args.max_games,
         "max_turns": args.max_turns,
         "target_deceptive": args.target_deceptive,
+        "target_truthful": args.target_truthful,
+        "label_filter": label_filter,
+        "use_target_deceptive": use_target_deceptive,
+        "use_target_truthful": use_target_truthful,
         "save_all": args.save_all,
         "save_only_deceptive": args.save_only_deceptive,
         "seed": args.seed,
@@ -514,6 +536,9 @@ def main(argv=None):
     total_states = 0
     total_samples = 0
     total_deceptive = 0
+    total_truthful = 0
+    total_unknown = 0
+    total_saved = 0
 
     try:
         tokenizer = llm.get_tokenizer()
@@ -599,37 +624,54 @@ def main(argv=None):
                 **sampled_state_summary,
             }
 
-            save_all = args.save_all and not args.save_only_deceptive
-            if save_all or deceptive is True:
+            if keep_record_for_label_filter(rec, label_filter):
                 append_jsonl(rec, output_path)
+                total_saved += 1
 
             total_samples += 1
             if deceptive is True:
                 total_deceptive += 1
+            elif deceptive is False:
+                total_truthful += 1
+            else:
+                total_unknown += 1
             total_states += 1
 
             if args.log_every and total_states % args.log_every == 0:
                 logging.info(
-                    "game=%s states=%d samples=%d deceptive=%d",
+                    "game=%s states=%d samples=%d deceptive=%d truthful=%d unknown=%d saved=%d filter=%s",
                     args.game,
                     total_states,
                     total_samples,
                     total_deceptive,
+                    total_truthful,
+                    total_unknown,
+                    total_saved,
+                    label_filter,
                 )
 
-            if args.target_deceptive and total_deceptive >= args.target_deceptive:
+            if use_target_deceptive and total_deceptive >= args.target_deceptive:
                 logging.info("Reached target deceptive count: %d", total_deceptive)
                 break
+            if use_target_truthful and total_truthful >= args.target_truthful:
+                logging.info("Reached target truthful count: %d", total_truthful)
+                break
 
-        if args.target_deceptive and total_deceptive >= args.target_deceptive:
+        if use_target_deceptive and total_deceptive >= args.target_deceptive:
+            break
+        if use_target_truthful and total_truthful >= args.target_truthful:
             break
 
     logging.info(
-        "Done. game=%s states=%d samples=%d deceptive=%d output=%s",
+        "Done. game=%s states=%d samples=%d deceptive=%d truthful=%d unknown=%d saved=%d filter=%s output=%s",
         args.game,
         total_states,
         total_samples,
         total_deceptive,
+        total_truthful,
+        total_unknown,
+        total_saved,
+        label_filter,
         output_path,
     )
 

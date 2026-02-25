@@ -5,7 +5,7 @@ echo "Activating conda environment: deception"
 source /playpen-ssd/smerrill/miniconda/etc/profile.d/conda.sh
 conda activate deception
 
-GPU_IDS=(${GPU_IDS:-2 3 4 5 6 7})
+GPU_IDS=(${GPU_IDS:-2 3 4 5 6})
 NUM_SHARDS=${NUM_SHARDS:-${#GPU_IDS[@]}}
 
 if [[ ${#GPU_IDS[@]} -lt $NUM_SHARDS ]]; then
@@ -13,14 +13,28 @@ if [[ ${#GPU_IDS[@]} -lt $NUM_SHARDS ]]; then
   exit 1
 fi
 
-MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
+MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 REASONING_FLAG="${REASONING_FLAG:---is_reasoning_model}"
 MODEL_TAG="${MODEL_NAME//\//_}"
 
 SEED_BASE=${SEED_BASE:-0}
 MAX_GAMES=${MAX_GAMES:-1000}
 MAX_TURNS=${MAX_TURNS:-1000}
-TARGET_DECEPTIVE=${TARGET_DECEPTIVE:-1000}
+LABEL_FILTER="${LABEL_FILTER:-deceptive_only}"
+if [[ "$LABEL_FILTER" != "all" && "$LABEL_FILTER" != "deceptive_only" && "$LABEL_FILTER" != "truthful_only" ]]; then
+  echo "Invalid LABEL_FILTER=$LABEL_FILTER. Expected one of: all, deceptive_only, truthful_only"
+  exit 1
+fi
+if [[ "$LABEL_FILTER" == "truthful_only" ]]; then
+  TARGET_DECEPTIVE=${TARGET_DECEPTIVE:-0}
+  TARGET_TRUTHFUL=${TARGET_TRUTHFUL:-1000}
+elif [[ "$LABEL_FILTER" == "deceptive_only" ]]; then
+  TARGET_DECEPTIVE=${TARGET_DECEPTIVE:-1000}
+  TARGET_TRUTHFUL=${TARGET_TRUTHFUL:-0}
+else
+  TARGET_DECEPTIVE=${TARGET_DECEPTIVE:-0}
+  TARGET_TRUTHFUL=${TARGET_TRUTHFUL:-0}
+fi
 
 GRID_WIDTH=${GRID_WIDTH:-9}
 GRID_HEIGHT=${GRID_HEIGHT:-9}
@@ -43,6 +57,7 @@ mkdir -p "$OUT_BASE"
 
 echo "Launching $NUM_SHARDS miners across GPUs: ${GPU_IDS[*]:0:$NUM_SHARDS}"
 echo "Model: $MODEL_NAME"
+echo "Label filter: $LABEL_FILTER"
 
 for i in $(seq 0 $((NUM_SHARDS - 1))); do
   GPU=${GPU_IDS[$i]}
@@ -60,7 +75,9 @@ for i in $(seq 0 $((NUM_SHARDS - 1))); do
       --seed "$SEED"
       --max_games "$MAX_GAMES"
       --max_turns "$MAX_TURNS"
+      --label_filter "$LABEL_FILTER"
       --target_deceptive "$TARGET_DECEPTIVE"
+      --target_truthful "$TARGET_TRUTHFUL"
       --grid_width "$GRID_WIDTH"
       --grid_height "$GRID_HEIGHT"
       --wall_prob "$WALL_PROB"

@@ -75,10 +75,27 @@ REPETITION_PENALTY="${REPETITION_PENALTY:-1.2}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-10000}"
 METHOD="${METHOD:-adaptive}"
 MODE="${MODE:-prefix}"
-ONLY_DECEPTIVE="${ONLY_DECEPTIVE:-1}"
+LABEL_FILTER="${LABEL_FILTER:-deceptive_only}"
+ONLY_DECEPTIVE="${ONLY_DECEPTIVE:-0}"
+ONLY_TRUTHFUL="${ONLY_TRUTHFUL:-0}"
 SHARD_ID="${SHARD_ID:-0}"
 NUM_SHARDS="${NUM_SHARDS:-1}"
 LOG_EVERY="${LOG_EVERY:-25}"
+
+if [[ "$ONLY_DECEPTIVE" == "1" && "$ONLY_TRUTHFUL" == "1" ]]; then
+  echo "Cannot set both ONLY_DECEPTIVE=1 and ONLY_TRUTHFUL=1"
+  exit 1
+fi
+if [[ "$ONLY_DECEPTIVE" == "1" ]]; then
+  LABEL_FILTER="deceptive_only"
+fi
+if [[ "$ONLY_TRUTHFUL" == "1" ]]; then
+  LABEL_FILTER="truthful_only"
+fi
+if [[ "$LABEL_FILTER" != "all" && "$LABEL_FILTER" != "deceptive_only" && "$LABEL_FILTER" != "truthful_only" ]]; then
+  echo "Invalid LABEL_FILTER=$LABEL_FILTER. Expected one of: all, deceptive_only, truthful_only"
+  exit 1
+fi
 
 SCRIPT="/playpen-ssd/smerrill/deception2/src/sentence_localization_batch.py"
 
@@ -109,6 +126,7 @@ CMD=(
   --max_new_tokens "$MAX_NEW_TOKENS"
   --method "$METHOD"
   --mode "$MODE"
+  --label_filter "$LABEL_FILTER"
   --shard_id "$SHARD_ID"
   --num_shards "$NUM_SHARDS"
   --log_every "$LOG_EVERY"
@@ -123,10 +141,6 @@ if [[ "$OUT_DIR" != "none" ]]; then
   CMD+=(--out_dir "$OUT_DIR")
 fi
 
-if [[ "$ONLY_DECEPTIVE" == "1" ]]; then
-  CMD+=(--only_deceptive)
-fi
-
 echo "GAME: $GAME"
 echo "MODEL_NAME: $MODEL_NAME"
 echo "EXAMPLES_PATH: $EXAMPLES_PATH"
@@ -139,6 +153,7 @@ echo "JSONL_PATH: $JSONL_PATH"
 if [[ "$OUT_DIR" != "none" ]]; then
   echo "OUT_DIR: $OUT_DIR"
 fi
+echo "LABEL_FILTER: $LABEL_FILTER"
 
 echo "Running localization..."
 "${CMD[@]}"

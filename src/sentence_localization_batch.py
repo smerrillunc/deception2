@@ -20,6 +20,11 @@ for path in (SRC_ROOT, BS_SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.append(str(path))
 
+from deception_dataset import (
+    LABEL_FILTER_CHOICES,
+    keep_record_for_label_filter,
+    normalize_label_filter,
+)
 from utils import extract_json_with_reasoning, get_reasoning_model_output
 
 
@@ -693,7 +698,9 @@ def main(argv=None):
     parser.add_argument("--min_step_size", type=int, default=1)
     parser.add_argument("--min_spacing", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--label_filter", type=str, choices=LABEL_FILTER_CHOICES, default="all")
     parser.add_argument("--only_deceptive", action="store_true", default=False)
+    parser.add_argument("--only_truthful", action="store_true", default=False)
     parser.add_argument("--overwrite", action="store_true", default=False)
     parser.add_argument("--shard_id", type=int, default=0)
     parser.add_argument("--num_shards", type=int, default=1)
@@ -711,6 +718,12 @@ def main(argv=None):
     if args.shard_id < 0 or args.shard_id >= args.num_shards:
         raise ValueError("--shard_id must be in [0, num_shards)")
 
+    label_filter = normalize_label_filter(
+        args.label_filter,
+        only_deceptive=args.only_deceptive,
+        only_truthful=args.only_truthful,
+    )
+
     use_reasoning_parser = _guess_reasoning_model(args.model_name) if args.is_reasoning_model is None else bool(args.is_reasoning_model)
 
     out_dir = Path(args.out_dir) if args.out_dir else None
@@ -718,8 +731,7 @@ def main(argv=None):
         out_dir.mkdir(parents=True, exist_ok=True)
 
     example_list = list(read_jsonl(args.examples_path))
-    if args.only_deceptive:
-        example_list = [e for e in example_list if e.get("deceptive") is True]
+    example_list = [e for e in example_list if keep_record_for_label_filter(e, label_filter)]
     if args.limit:
         example_list = example_list[: args.limit]
 
@@ -731,7 +743,10 @@ def main(argv=None):
         ]
 
     total_examples = len(example_list)
-    print(f"Shard {args.shard_id}/{args.num_shards}: {total_examples} examples")
+    print(
+        f"Shard {args.shard_id}/{args.num_shards}: {total_examples} examples "
+        f"(label_filter={label_filter})"
+    )
     if total_examples == 0:
         print("No examples to process for this shard.")
         return

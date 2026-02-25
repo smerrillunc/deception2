@@ -6,7 +6,12 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
-from deception_dataset import iter_deception_records
+from deception_dataset import (
+    LABEL_FILTER_CHOICES,
+    iter_deception_records,
+    keep_record_for_label_filter,
+    normalize_label_filter,
+)
 from sentence_pipeline import build_sentence_records, write_jsonl
 
 
@@ -39,13 +44,15 @@ def _write_examples(
     out_path: Path,
     text_field: str,
     fallback_text_field: Optional[str],
-    only_deceptive: bool,
+    label_filter: str,
+    limit: int,
     include_messages: bool,
 ) -> Iterable[Dict]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
     with out_path.open("w", encoding="utf-8") as f:
         for rec in records:
-            if only_deceptive and rec.get("deceptive") is not True:
+            if not keep_record_for_label_filter(rec, label_filter):
                 continue
 
             example_id = _example_id(rec)
@@ -64,6 +71,9 @@ def _write_examples(
 
             f.write(json.dumps(rec) + "\n")
             yield rec
+            written += 1
+            if limit and written >= limit:
+                break
 
 
 def main(argv=None):
@@ -73,9 +83,17 @@ def main(argv=None):
     parser.add_argument("--text_field", type=str, default="action_reasoning")
     parser.add_argument("--fallback_text_field", type=str, default="action_raw_text")
     parser.add_argument("--include_messages", action="store_true", default=False)
+    parser.add_argument("--label_filter", type=str, choices=LABEL_FILTER_CHOICES, default="all")
     parser.add_argument("--only_deceptive", action="store_true", default=False)
+    parser.add_argument("--only_truthful", action="store_true", default=False)
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args(argv)
+
+    label_filter = normalize_label_filter(
+        args.label_filter,
+        only_deceptive=args.only_deceptive,
+        only_truthful=args.only_truthful,
+    )
 
     out_dir = Path(args.out_dir)
     examples_path = out_dir / "examples.jsonl"
@@ -88,22 +106,16 @@ def main(argv=None):
         flatten_action=True,
         include_meta=True,
         strict_json=True,
+        label_filter=label_filter,
     )
 
-    def _limited(records):
-        count = 0
-        for rec in records:
-            if args.limit and count >= args.limit:
-                break
-            yield rec
-            count += 1
-
     examples_iter = _write_examples(
-        _limited(records_iter),
+        records_iter,
         examples_path,
         text_field=args.text_field,
         fallback_text_field=args.fallback_text_field,
-        only_deceptive=args.only_deceptive,
+        label_filter=label_filter,
+        limit=args.limit,
         include_messages=args.include_messages,
     )
 
@@ -125,6 +137,7 @@ def main(argv=None):
 
     print(f"Wrote examples: {examples_path}")
     print(f"Wrote sentences: {sentences_path}")
+    print(f"Label filter: {label_filter}")
 
 
 if __name__ == "__main__":
