@@ -4,9 +4,9 @@
 #SBATCH --error=gw_loc_deceptive_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64g
+#SBATCH --mem=40g
 #SBATCH --time=6-23:00:00
-#SBATCH -p a100-gpu,l40-gpu
+#SBATCH -p l40-gpu
 #SBATCH --qos=gpu_access
 #SBATCH --gres=gpu:1
 
@@ -15,7 +15,6 @@ set -euo pipefail
 # ---------------- User parameters ----------------
 CONDA_ENV="deception"
 MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-GAME="gridworld" # gridworld | bs
 N_SAMPLES=50
 TEMPERATURE=0.5
 TOP_P=0.5
@@ -34,12 +33,15 @@ conda activate "$CONDA_ENV"
 PROJECT_ROOT="/work/users/s/m/smerrill/deception2"
 SRC_ROOT="$PROJECT_ROOT/src"
 
+GAME="bs"
 # DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-14B_deceptive" # complete
-# DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-14B_truthful" 
+DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-14B_truthful" # 33005650
 # DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-7B_deceptive" # complete
 # DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-7B_truthful" # running
-# DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B_deceptive" # complete
-# DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B_truthful"
+
+# GAME="gridworld"
+# DATA_DIR="/work/users/s/m/smerrill/deception2/Gridworld/Results/SentencePipeline/v1/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B_deceptive" # complete
+# DATA_DIR="/work/users/s/m/smerrill/deception2/Gridworld/Results/SentencePipeline/v1/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B_truthful" # JOB 33005216
 
 
 if [[ -z "${DATA_DIR:-}" ]]; then
@@ -49,8 +51,8 @@ fi
 
 EXAMPLES_PATH="$DATA_DIR/examples.jsonl"
 SENTENCES_PATH="$DATA_DIR/sentences.jsonl"
-OUT_DIR="$DATA_DIR/localization_deceptive"
-JSONL_PATH="$DATA_DIR/localization_deceptive.jsonl"
+OUT_DIR="$DATA_DIR/localization"
+JSONL_PATH="$DATA_DIR/localization.jsonl"
 
 if [[ ! -f "$EXAMPLES_PATH" ]]; then
   echo "Missing examples file: $EXAMPLES_PATH"
@@ -71,7 +73,7 @@ CMD=(
   --max_new_tokens "$MAX_NEW_TOKENS"
   --method "$METHOD"
   --mode "$MODE"
-  --label_filter deceptive_only
+  --label_filter all
   --shard_id 0
   --num_shards 1
   --log_every "$LOG_EVERY"
