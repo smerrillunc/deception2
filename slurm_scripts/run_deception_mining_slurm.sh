@@ -14,8 +14,8 @@ set -euo pipefail
 
 # ---------------- User parameters ----------------
 CONDA_ENV="deception"
-MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-GAME="bs"                   # bs | gridworld
+MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+GAME="gridworld"                   # bs | gridworld
 IS_REASONING_MODEL=1        # 1 to pass --is_reasoning_model
 
 TEMPERATURE=0.5
@@ -48,9 +48,9 @@ HISTORY_WINDOW=15
 AUTO_MOVE_EXPLORER=1        # 1 => --auto_move_explorer, 0 => --no-auto_move_explorer
 
 # Set one OUTPUT_DIR.
-# OUTPUT_DIR="/work/users/s/m/smerrill/deception2/BS/Results/DeceptionMining/DeepSeek-R1-Distill-Qwen-7B/$(date +%Y-%m-%d)/gpu_0"
-# OUTPUT_DIR="/work/users/s/m/smerrill/deception2/Gridworld/Results/DeceptionMining/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/$(date +%Y-%m-%d)/gpu_0"
-OUTPUT_DIR=""
+GAME_SAVE=Gridworld
+MODEL_TAIL="${MODEL_NAME##*/}"
+OUTPUT_DIR="/work/users/s/m/smerrill/deception2/$GAME_SAVE/Results/DeceptionMining/$MODEL_TAIL/$(date +%Y-%m-%d)"
 # ---------------- End parameters -----------------
 
 module load anaconda
@@ -115,6 +115,6 @@ echo "Command to run:"
 printf '%q ' "${CMD[@]}"
 echo
 
-"${CMD[@]}"
+#"${CMD[@]}"
 
 echo "Deception mining complete."
