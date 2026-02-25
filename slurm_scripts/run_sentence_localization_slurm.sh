@@ -10,6 +10,8 @@
 #SBATCH --qos=gpu_access
 #SBATCH --gres=gpu:1
 
+set -euo pipefail
+
 # ---------------- User parameters ----------------
 CONDA_ENV="deception"
 MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
@@ -29,7 +31,7 @@ LOG_EVERY=25
 module load anaconda
 conda activate "$CONDA_ENV"
 
-PROJECT_ROOT = "/work/users/s/m/smerrill/deception2"
+PROJECT_ROOT="/work/users/s/m/smerrill/deception2"
 SRC_ROOT="$PROJECT_ROOT/src"
 
 # DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-14B_deceptive" # complete
@@ -39,6 +41,11 @@ SRC_ROOT="$PROJECT_ROOT/src"
 # DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B_deceptive" # complete
 # DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B_truthful"
 
+
+if [[ -z "${DATA_DIR:-}" ]]; then
+  echo "DATA_DIR is not set. Set DATA_DIR near the top of this script."
+  exit 1
+fi
 
 EXAMPLES_PATH="$DATA_DIR/examples.jsonl"
 SENTENCES_PATH="$DATA_DIR/sentences.jsonl"
@@ -51,22 +58,36 @@ if [[ ! -f "$EXAMPLES_PATH" ]]; then
   exit 1
 fi
 
-conda run -n "$CONDA_ENV" python "$SRC_ROOT/sentence_localization_batch.py" \
-  --game "$GAME" \
-  --examples_path "$EXAMPLES_PATH" \
-  --model_name "$MODEL_NAME" \
-  --jsonl_path "$JSONL_PATH" \
-  --n_samples "$N_SAMPLES" \
-  --temperature "$TEMPERATURE" \
-  --top_p "$TOP_P" \
-  --repetition_penalty "$REPETITION_PENALTY" \
-  --max_new_tokens "$MAX_NEW_TOKENS" \ 
-  --method "$METHOD" \ 
-  --mode "$MODE" \ 
-  --label_filter deceptive_only \ 
-  --shard_id 0 \ 
-  --num_shards 1 \ 
-  --log_every "$LOG_EVERY" \ 
-  --out_dir "$OUT_DIR" \ 
+CMD=(
+  conda run -n "$CONDA_ENV" python "$SRC_ROOT/sentence_localization_batch.py"
+  --game "$GAME"
+  --examples_path "$EXAMPLES_PATH"
+  --model_name "$MODEL_NAME"
+  --jsonl_path "$JSONL_PATH"
+  --n_samples "$N_SAMPLES"
+  --temperature "$TEMPERATURE"
+  --top_p "$TOP_P"
+  --repetition_penalty "$REPETITION_PENALTY"
+  --max_new_tokens "$MAX_NEW_TOKENS"
+  --method "$METHOD"
+  --mode "$MODE"
+  --label_filter deceptive_only
+  --shard_id 0
+  --num_shards 1
+  --log_every "$LOG_EVERY"
+  --out_dir "$OUT_DIR"
+)
+if [[ -f "$SENTENCES_PATH" ]]; then
+  CMD+=(--sentences_path "$SENTENCES_PATH")
+fi
+if [[ "$LIMIT" -gt 0 ]]; then
+  CMD+=(--limit "$LIMIT")
+fi
+
+echo "Command to run:"
+printf '%q ' "${CMD[@]}"
+echo
+
+"${CMD[@]}"
 
 echo "Gridworld deceptive localization complete."
