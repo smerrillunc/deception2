@@ -52,7 +52,6 @@ fi
 EXAMPLES_PATH="$DATA_DIR/examples.jsonl"
 SENTENCES_PATH="$DATA_DIR/sentences.jsonl"
 OUT_DIR="$DATA_DIR/localization"
-JSONL_PATH="$DATA_DIR/localization.jsonl"
 
 if [[ ! -f "$EXAMPLES_PATH" ]]; then
   echo "Missing examples file: $EXAMPLES_PATH"
@@ -65,7 +64,6 @@ CMD=(
   --game "$GAME"
   --examples_path "$EXAMPLES_PATH"
   --model_name "$MODEL_NAME"
-  --jsonl_path "$JSONL_PATH"
   --n_samples "$N_SAMPLES"
   --temperature "$TEMPERATURE"
   --top_p "$TOP_P"
@@ -92,4 +90,4 @@ echo
 
 "${CMD[@]}"
 
-echo "Gridworld deceptive localization complete."
+echo "Sentence localization complete (per-example JSONs written to $OUT_DIR)."

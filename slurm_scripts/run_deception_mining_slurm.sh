@@ -115,6 +115,6 @@ echo "Command to run:"
 printf '%q ' "${CMD[@]}"
 echo
 
-#"${CMD[@]}"
+"${CMD[@]}"
 
 echo "Deception mining complete."
