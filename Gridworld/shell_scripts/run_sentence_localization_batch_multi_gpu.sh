@@ -4,8 +4,20 @@ set -euo pipefail
 echo "Activating conda environment: deception"
 source /playpen-ssd/smerrill/miniconda/etc/profile.d/conda.sh
 conda activate deception
+hash -r
 
-GPU_IDS=(${GPU_IDS:-2 3 4 5 6})
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  echo "ERROR: conda env not active after 'conda activate deception'."
+  exit 1
+fi
+PYTHON_BIN="$CONDA_PREFIX/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "ERROR: expected python not found at $PYTHON_BIN"
+  exit 1
+fi
+echo "Python in env: $PYTHON_BIN"
+
+GPU_IDS=(${GPU_IDS:-2 3 4 5 6 7})
 NUM_SHARDS=${NUM_SHARDS:-${#GPU_IDS[@]}}
 
 if [[ ${#GPU_IDS[@]} -lt $NUM_SHARDS ]]; then
@@ -19,15 +31,15 @@ if [[ "$GAME" != "gridworld" && "$GAME" != "bs" && "$GAME" != "auto" ]]; then
   exit 1
 fi
 
-MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
-MODEL_TAG="${MODEL_NAME//\//_}"
-AUTO_BUILD_DATASET="${AUTO_BUILD_DATASET:-0}"
-LABEL_FILTER="${LABEL_FILTER:-deceptive_only}"
-
-if [[ "$LABEL_FILTER" != "all" && "$LABEL_FILTER" != "deceptive_only" && "$LABEL_FILTER" != "truthful_only" ]]; then
-  echo "Invalid LABEL_FILTER=$LABEL_FILTER. Expected one of: all, deceptive_only, truthful_only"
+MODEL_NAME="${MODEL_NAME:-}"
+if [[ -z "${MODEL_NAME:-}" ]]; then
+  echo "MODEL_NAME is required."
+  echo "Example:"
+  echo "  MODEL_NAME=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B $0"
   exit 1
 fi
+MODEL_TAG="${MODEL_NAME//\//_}"
+LABEL_FILTER="all"
 
 if [[ -z "${DATA_DIR:-}" ]]; then
   if [[ "$GAME" == "bs" ]]; then
@@ -36,21 +48,15 @@ if [[ -z "${DATA_DIR:-}" ]]; then
     DATA_DIR="/playpen-ssd/smerrill/deception2/Gridworld/Results/SentencePipeline/v1/${MODEL_TAG}"
   fi
 fi
+export DATA_DIR
 
 EXAMPLES_PATH="${EXAMPLES_PATH:-$DATA_DIR/examples.jsonl}"
 
 if [[ ! -f "$EXAMPLES_PATH" ]]; then
-  if [[ "$AUTO_BUILD_DATASET" == "1" ]]; then
-    echo "examples.jsonl not found. Building sentence dataset once before launching shards..."
-    GAME="$GAME" MODEL_NAME="$MODEL_NAME" OUT_DIR="$DATA_DIR" \
-      /playpen-ssd/smerrill/deception2/Gridworld/shell_scripts/run_sentence_dataset.sh
-  else
-    echo "Missing examples file: $EXAMPLES_PATH"
-    echo "Run dataset build first:"
-    echo "  GAME=$GAME MODEL_NAME=$MODEL_NAME /playpen-ssd/smerrill/deception2/Gridworld/shell_scripts/run_sentence_dataset.sh"
-    echo "Or rerun with AUTO_BUILD_DATASET=1"
-    exit 1
-  fi
+  echo "Missing examples file: $EXAMPLES_PATH"
+  echo "Run dataset build first:"
+  echo "  GAME=$GAME MODEL_NAME=$MODEL_NAME OUT_DIR=$DATA_DIR /playpen-ssd/smerrill/deception2/Gridworld/shell_scripts/run_sentence_dataset.sh"
+  exit 1
 fi
 
 echo "Launching $NUM_SHARDS localization shards across GPUs: ${GPU_IDS[*]:0:$NUM_SHARDS}"

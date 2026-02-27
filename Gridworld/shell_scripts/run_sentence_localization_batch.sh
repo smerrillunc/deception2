@@ -4,6 +4,18 @@ set -euo pipefail
 echo "Activating conda environment: deception"
 source /playpen-ssd/smerrill/miniconda/etc/profile.d/conda.sh
 conda activate deception
+hash -r
+
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  echo "ERROR: conda env not active after 'conda activate deception'."
+  exit 1
+fi
+PYTHON_BIN="$CONDA_PREFIX/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "ERROR: expected python not found at $PYTHON_BIN"
+  exit 1
+fi
+echo "Python in env: $PYTHON_BIN"
 
 if [[ -z "${SKIP_GPU_LIST:-}" ]]; then
   echo "Available GPUs:"
@@ -28,22 +40,10 @@ else
 fi
 
 if [[ -z "${MODEL_NAME:-}" ]]; then
-  if [[ ! -t 0 ]]; then
-    MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-  else
-    echo "Select a model:"
-    echo "  1) deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-    echo "  2) deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-    echo "  3) deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
-    echo ""
-    read -r -p "Enter model number (1-3): " MODEL_CHOICE
-    case "$MODEL_CHOICE" in
-      1) MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" ;;
-      2) MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B" ;;
-      3) MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" ;;
-      *) echo "Invalid model selection: $MODEL_CHOICE"; exit 1 ;;
-    esac
-  fi
+  echo "MODEL_NAME is required."
+  echo "Example:"
+  echo "  MODEL_NAME=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B $0"
+  exit 1
 fi
 
 GAME="${GAME:-gridworld}"
@@ -66,7 +66,6 @@ EXAMPLES_PATH="${EXAMPLES_PATH:-$DATA_DIR/examples.jsonl}"
 SENTENCES_PATH="${SENTENCES_PATH:-$DATA_DIR/sentences.jsonl}"
 OUT_DIR="${OUT_DIR:-$DATA_DIR/localization}"
 JSONL_PATH="${JSONL_PATH:-$DATA_DIR/localization.jsonl}"
-AUTO_BUILD_DATASET="${AUTO_BUILD_DATASET:-0}"
 
 N_SAMPLES="${N_SAMPLES:-50}"
 TEMPERATURE="${TEMPERATURE:-0.5}"
@@ -75,46 +74,22 @@ REPETITION_PENALTY="${REPETITION_PENALTY:-1.2}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-10000}"
 METHOD="${METHOD:-adaptive}"
 MODE="${MODE:-prefix}"
-LABEL_FILTER="${LABEL_FILTER:-deceptive_only}"
-ONLY_DECEPTIVE="${ONLY_DECEPTIVE:-0}"
-ONLY_TRUTHFUL="${ONLY_TRUTHFUL:-0}"
+LABEL_FILTER="all"
 SHARD_ID="${SHARD_ID:-0}"
 NUM_SHARDS="${NUM_SHARDS:-1}"
 LOG_EVERY="${LOG_EVERY:-25}"
 
-if [[ "$ONLY_DECEPTIVE" == "1" && "$ONLY_TRUTHFUL" == "1" ]]; then
-  echo "Cannot set both ONLY_DECEPTIVE=1 and ONLY_TRUTHFUL=1"
-  exit 1
-fi
-if [[ "$ONLY_DECEPTIVE" == "1" ]]; then
-  LABEL_FILTER="deceptive_only"
-fi
-if [[ "$ONLY_TRUTHFUL" == "1" ]]; then
-  LABEL_FILTER="truthful_only"
-fi
-if [[ "$LABEL_FILTER" != "all" && "$LABEL_FILTER" != "deceptive_only" && "$LABEL_FILTER" != "truthful_only" ]]; then
-  echo "Invalid LABEL_FILTER=$LABEL_FILTER. Expected one of: all, deceptive_only, truthful_only"
-  exit 1
-fi
-
 SCRIPT="/playpen-ssd/smerrill/deception2/src/sentence_localization_batch.py"
 
 if [[ ! -f "$EXAMPLES_PATH" ]]; then
-  if [[ "$AUTO_BUILD_DATASET" == "1" ]]; then
-    echo "examples.jsonl not found. Auto-building sentence dataset first..."
-    GAME="$GAME" MODEL_NAME="$MODEL_NAME" DATA_DIR="$DATA_DIR" \
-      /playpen-ssd/smerrill/deception2/Gridworld/shell_scripts/run_sentence_dataset.sh
-  else
-    echo "Missing examples file: $EXAMPLES_PATH"
-    echo "Run dataset build first:"
-    echo "  GAME=$GAME MODEL_NAME=$MODEL_NAME /playpen-ssd/smerrill/deception2/Gridworld/shell_scripts/run_sentence_dataset.sh"
-    echo "Or rerun with AUTO_BUILD_DATASET=1"
-    exit 1
-  fi
+  echo "Missing examples file: $EXAMPLES_PATH"
+  echo "Run dataset build first:"
+  echo "  GAME=$GAME MODEL_NAME=$MODEL_NAME /playpen-ssd/smerrill/deception2/Gridworld/shell_scripts/run_sentence_dataset.sh"
+  exit 1
 fi
 
 CMD=(
-  python "$SCRIPT"
+  "$PYTHON_BIN" "$SCRIPT"
   --game "$GAME"
   --examples_path "$EXAMPLES_PATH"
   --model_name "$MODEL_NAME"

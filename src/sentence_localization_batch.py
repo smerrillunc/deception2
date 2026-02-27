@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
-from vllm import LLM, SamplingParams
+from vllm import LLM
 
 SRC_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = SRC_ROOT.parent
@@ -25,7 +25,10 @@ from deception_dataset import (
     keep_record_for_label_filter,
     normalize_label_filter,
 )
-from utils import extract_json_with_reasoning, get_reasoning_model_output
+from utils import (
+    get_model_output,
+    prepare_messages_for_model,
+)
 
 
 SENTENCE_SPAN_RE = re.compile(r"[^.!?]+[.!?]?\s*")
@@ -268,47 +271,60 @@ def sample_actions_for_prefix(
     base_seed: int,
     use_reasoning_parser: bool,
 ):
-    sampling_params = SamplingParams(
-        n=n_samples,
+    combined_prompt = prompt + prefix_text
+    messages = [{"role": "user", "content": combined_prompt}]
+
+    parsed_outputs, _ = get_model_output(
+        llm=llm,
+        messages=messages,
+        is_reasoning_model=use_reasoning_parser,
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_new_tokens,
         repetition_penalty=repetition_penalty,
-        seed=base_seed,
+        num_responses=n_samples,
+        max_retries=3,
+        model_name=model_name,
+        seed_offset=base_seed,
     )
 
-    outputs = llm.generate(prompts=[prompt + prefix_text], sampling_params=sampling_params)
+    if not isinstance(parsed_outputs, list):
+        parsed_outputs = [parsed_outputs]
 
     num_truthful = 0
     num_valid = 0
     generations = []
 
-    for out in outputs:
-        for sample_out in out.outputs:
-            gen_text = sample_out.text
-            rec = {
-                "gen_text": gen_text,
-                "parsed": None,
-                "is_truthful": None,
-                "deceptive": None,
-                "parse_error": None,
-                "evaluation": None,
-            }
-            try:
-                parsed = get_reasoning_model_output(gen_text) if use_reasoning_parser else extract_json_with_reasoning(gen_text)
-                rec["parsed"] = parsed
+    for parsed in parsed_outputs:
+        rec = {
+            "gen_text": parsed.get("_raw_text", "") if isinstance(parsed, dict) else str(parsed),
+            "parsed": None,
+            "is_truthful": None,
+            "deceptive": None,
+            "parse_error": None,
+            "evaluation": None,
+        }
 
-                is_truthful, eval_info = evaluate_action(game, parsed, context)
-                rec["evaluation"] = eval_info
-                if is_truthful is not None:
-                    rec["is_truthful"] = bool(is_truthful)
-                    rec["deceptive"] = not bool(is_truthful)
-                    num_valid += 1
-                    if is_truthful:
-                        num_truthful += 1
-            except Exception as e:
-                rec["parse_error"] = str(e)
+        if not isinstance(parsed, dict):
+            rec["parse_error"] = "Unexpected non-dict parsed output."
             generations.append(rec)
+            continue
+
+        if parsed.get("Parse_fail", False):
+            rec["parse_error"] = parsed.get("error", "Parse_fail")
+            generations.append(rec)
+            continue
+
+        rec["parsed"] = parsed
+        is_truthful, eval_info = evaluate_action(game, parsed, context)
+        rec["evaluation"] = eval_info
+        if is_truthful is not None:
+            rec["is_truthful"] = bool(is_truthful)
+            rec["deceptive"] = not bool(is_truthful)
+            num_valid += 1
+            if is_truthful:
+                num_truthful += 1
+        generations.append(rec)
 
     deception_rate = 0.5 if num_valid == 0 else 1.0 - (num_truthful / num_valid)
     return deception_rate, num_truthful, num_valid, generations
@@ -789,9 +805,19 @@ def main(argv=None):
             skipped += 1
             continue
 
-        prompt = ex.get("prompt")
-        if not prompt and ex.get("messages"):
-            prompt = tokenizer.apply_chat_template(ex["messages"], tokenize=False, add_generation_prompt=True)
+        prompt = None
+        if ex.get("messages"):
+            try:
+                prepared_messages = prepare_messages_for_model(ex["messages"], model_name=args.model_name)
+                prompt = tokenizer.apply_chat_template(
+                    prepared_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                prompt = ex.get("prompt")
+        else:
+            prompt = ex.get("prompt")
         if not prompt:
             skipped += 1
             continue

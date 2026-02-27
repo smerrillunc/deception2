@@ -4,6 +4,18 @@ set -euo pipefail
 echo "Activating conda environment: deception"
 source /playpen-ssd/smerrill/miniconda/etc/profile.d/conda.sh
 conda activate deception
+hash -r
+
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  echo "ERROR: conda env not active after 'conda activate deception'."
+  exit 1
+fi
+PYTHON_BIN="$CONDA_PREFIX/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "ERROR: expected python not found at $PYTHON_BIN"
+  exit 1
+fi
+echo "Python in env: $PYTHON_BIN"
 
 GPU_IDS=(${GPU_IDS:-2 3 4 5 6 7})
 NUM_SHARDS=${NUM_SHARDS:-6}
@@ -12,79 +24,50 @@ if [[ ${#GPU_IDS[@]} -ne $NUM_SHARDS ]]; then
   echo "GPU_IDS count (${#GPU_IDS[@]}) must equal NUM_SHARDS ($NUM_SHARDS)."
   exit 1
 fi
-
+MODEL_NAME="mistralai/Ministral-3-8B-Reasoning-2512"
 echo "Launching $NUM_SHARDS shards across GPUs: ${GPU_IDS[*]}"
-export MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
+if [[ -z "${MODEL_NAME:-}" ]]; then
+  echo "MODEL_NAME is required."
+  echo "Example:"
+  echo "  MODEL_NAME=mistralai/Ministral-3-8B-Reasoning-2512 $0"
+  exit 1
+fi
+export MODEL_NAME
 RESULTS_ROOT="/playpen-ssd/smerrill/deception2/BS/Results"
 SENTENCE_ROOT="$RESULTS_ROOT/SentencePipeline/v1"
 MODEL_TAG_RAW="${MODEL_NAME//\//_}"
 MODEL_TAG_BASE="${MODEL_NAME##*/}"
-LABEL_FILTER="${LABEL_FILTER:-truthful_only}"
-TRUTHFUL_LIMIT="${TRUTHFUL_LIMIT:-3000}"
-if [[ "$LABEL_FILTER" != "all" && "$LABEL_FILTER" != "deceptive_only" && "$LABEL_FILTER" != "truthful_only" ]]; then
-  echo "Invalid LABEL_FILTER=$LABEL_FILTER. Expected one of: all, deceptive_only, truthful_only"
+LABEL_FILTER="all"
+
+if [[ -z "${DATA_DIR:-}" ]]; then
+  CAND_A="$SENTENCE_ROOT/${MODEL_TAG_BASE}"
+  CAND_B="$SENTENCE_ROOT/${MODEL_TAG_RAW}"
+  if [[ -d "$CAND_A" ]]; then
+    DATA_DIR="$CAND_A"
+  elif [[ -d "$CAND_B" ]]; then
+    DATA_DIR="$CAND_B"
+  else
+    DATA_DIR="$CAND_A"
+  fi
+fi
+
+EXAMPLES_PATH="${EXAMPLES_PATH:-$DATA_DIR/examples.jsonl}"
+if [[ ! -f "$EXAMPLES_PATH" ]]; then
+  echo "Missing examples file: $EXAMPLES_PATH"
+  echo "Run dataset build first:"
+  echo "  MODEL_NAME=$MODEL_NAME OUT_DIR=$DATA_DIR /playpen-ssd/smerrill/deception2/BS/shell_scripts/run_sentence_dataset.sh"
   exit 1
 fi
-AUTO_BUILD_DATASET="${AUTO_BUILD_DATASET:-}"
-if [[ -z "$AUTO_BUILD_DATASET" ]]; then
-  if [[ "$LABEL_FILTER" == "truthful_only" ]]; then
-    AUTO_BUILD_DATASET=1
-  else
-    AUTO_BUILD_DATASET=0
-  fi
-fi
-if [[ -z "${DATA_DIR:-}" ]]; then
-  if [[ "$LABEL_FILTER" == "truthful_only" ]]; then
-    CAND_A="$SENTENCE_ROOT/${MODEL_TAG_BASE}_truthful_${TRUTHFUL_LIMIT}"
-    CAND_B="$SENTENCE_ROOT/${MODEL_TAG_RAW}_truthful_${TRUTHFUL_LIMIT}"
-    if [[ -d "$CAND_A" ]]; then
-      export DATA_DIR="$CAND_A"
-    elif [[ -d "$CAND_B" ]]; then
-      export DATA_DIR="$CAND_B"
-    elif [[ -d "$SENTENCE_ROOT/$MODEL_TAG_BASE" ]]; then
-      export DATA_DIR="$CAND_A"
-    else
-      export DATA_DIR="$CAND_B"
-    fi
-  else
-    CAND_A="$SENTENCE_ROOT/${MODEL_TAG_BASE}"
-    CAND_B="$SENTENCE_ROOT/${MODEL_TAG_RAW}"
-    if [[ -d "$CAND_A" ]]; then
-      export DATA_DIR="$CAND_A"
-    elif [[ -d "$CAND_B" ]]; then
-      export DATA_DIR="$CAND_B"
-    else
-      export DATA_DIR="$CAND_A"
-    fi
-  fi
-fi
+
+export DATA_DIR
 export LABEL_FILTER
-export TRUTHFUL_LIMIT
-export AUTO_BUILD_DATASET
 export SKIP_GPU_LIST=1
 
 echo "Label filter: $LABEL_FILTER"
 echo "Model: $MODEL_NAME"
 echo "DATA_DIR: ${DATA_DIR:-}"
-echo "AUTO_BUILD_DATASET: $AUTO_BUILD_DATASET"
+echo "EXAMPLES_PATH: $EXAMPLES_PATH"
 
-EXAMPLES_PATH="$DATA_DIR/examples.jsonl"
-if [[ ! -f "$EXAMPLES_PATH" ]]; then
-  if [[ "$AUTO_BUILD_DATASET" == "1" ]]; then
-    echo "examples.jsonl not found at $EXAMPLES_PATH"
-    echo "Building sentence dataset once before launching shards..."
-    BUILD_LIMIT="${LIMIT:-0}"
-    if [[ "$LABEL_FILTER" == "truthful_only" && "$BUILD_LIMIT" == "0" ]]; then
-      BUILD_LIMIT="$TRUTHFUL_LIMIT"
-    fi
-    MODEL_NAME="$MODEL_NAME" OUT_DIR="$DATA_DIR" LABEL_FILTER="$LABEL_FILTER" LIMIT="$BUILD_LIMIT" \
-      /playpen-ssd/smerrill/deception2/BS/shell_scripts/run_sentence_dataset.sh
-  else
-    echo "Missing examples file: $EXAMPLES_PATH"
-    echo "Set AUTO_BUILD_DATASET=1 or build dataset first."
-    exit 1
-  fi
-fi
 
 pids=()
 for i in "${!GPU_IDS[@]}"; do

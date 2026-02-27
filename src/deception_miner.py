@@ -3,6 +3,7 @@ import argparse
 import copy
 import logging
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -25,7 +26,13 @@ from deception_dataset import (
     normalize_label_filter,
 )
 from llm_agent import LLMAgent
-from utils import append_jsonl, atomic_write_json, get_model_output, set_global_seed
+from utils import (
+    append_jsonl,
+    atomic_write_json,
+    get_model_output,
+    prepare_messages_for_model,
+    set_global_seed,
+)
 
 
 def init_llm(model_name: str, max_tokens: int, seed: int = 0) -> LLM:
@@ -221,6 +228,7 @@ def _model_action(llm, messages, args):
         repetition_penalty=args.repetition_penalty,
         num_responses=1,
         max_retries=args.max_retries,
+        model_name=args.model_name,
     )
     return action, seed_used
 
@@ -236,6 +244,7 @@ def _model_actions(llm, messages, args, num_responses: int):
         repetition_penalty=args.repetition_penalty,
         num_responses=max(1, int(num_responses)),
         max_retries=args.max_retries,
+        model_name=args.model_name,
     )
     if isinstance(actions, list):
         return actions, seed_used
@@ -262,12 +271,49 @@ def _choose_primary_action(game: str, env, candidates):
     return candidates[0], 0
 
 
-def _render_prompt_text(tokenizer, messages):
+def _sample_balanced_candidates(game: str, env, candidates):
+    deceptive_candidates = []
+    truthful_candidates = []
+    unknown_candidates = []
+
+    for idx, action in enumerate(candidates):
+        label = deception_from_action(game, action, env)
+        row = (idx, action, label)
+        if label is True:
+            deceptive_candidates.append(row)
+        elif label is False:
+            truthful_candidates.append(row)
+        else:
+            unknown_candidates.append(row)
+
+    picked_deceptive = random.choice(deceptive_candidates) if deceptive_candidates else None
+    picked_truthful = random.choice(truthful_candidates) if truthful_candidates else None
+
+    return picked_deceptive, picked_truthful, unknown_candidates
+
+
+def _targets_reached(
+    total_deceptive: int,
+    total_truthful: int,
+    args,
+    use_target_deceptive: bool,
+    use_target_truthful: bool,
+) -> bool:
+    if not (use_target_deceptive or use_target_truthful):
+        return False
+
+    deceptive_done = (not use_target_deceptive) or (total_deceptive >= args.target_deceptive)
+    truthful_done = (not use_target_truthful) or (total_truthful >= args.target_truthful)
+    return deceptive_done and truthful_done
+
+
+def _render_prompt_text(tokenizer, messages, model_name: Optional[str] = None):
     if tokenizer is None:
         return None
     try:
+        prepared = prepare_messages_for_model(messages, model_name=model_name)
         return tokenizer.apply_chat_template(
-            messages,
+            prepared,
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -337,6 +383,7 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
             if game == "bs" and env.phase == "CHALLENGE":
                 state = env.get_state()
                 messages = copy.deepcopy(state.get("messages", []))
+                messages = prepare_messages_for_model(messages, model_name=args.model_name)
                 action, seed_used = _model_action(llm, messages, args)
                 applied_action = action if isinstance(action, dict) else _fallback_secondary_action(game, env)
                 step_result = env.manual_step(applied_action)
@@ -346,7 +393,7 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
                         phase="CHALLENGE",
                         active_player=state.get("active_player"),
                         messages=messages,
-                        prompt=_render_prompt_text(tokenizer, messages),
+                        prompt=_render_prompt_text(tokenizer, messages, model_name=args.model_name),
                         seed=seed_used,
                         action=action,
                         step_result=step_result,
@@ -358,6 +405,7 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
             if game == "gridworld" and env.phase == "CHALLENGE":
                 state = env.get_state()
                 messages = copy.deepcopy(state.get("messages", []))
+                messages = prepare_messages_for_model(messages, model_name=args.model_name)
                 action, seed_used = _model_action(llm, messages, args)
                 applied_action = action if isinstance(action, dict) else _fallback_secondary_action(game, env)
                 step_result = env.manual_step(applied_action)
@@ -367,7 +415,7 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
                         phase="CHALLENGE",
                         active_player=state.get("active_player"),
                         messages=messages,
-                        prompt=_render_prompt_text(tokenizer, messages),
+                        prompt=_render_prompt_text(tokenizer, messages, model_name=args.model_name),
                         seed=seed_used,
                         action=action,
                         step_result=step_result,
@@ -394,13 +442,14 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
             if game == "gridworld" and env.phase == "MOVE":
                 state = env.get_state()
                 messages = copy.deepcopy(state.get("messages", []))
+                messages = prepare_messages_for_model(messages, model_name=args.model_name)
                 step_result = env.step(debug=False)
                 events.append(
                     _compact_event(
                         phase="MOVE",
                         active_player=state.get("active_player"),
                         messages=messages,
-                        prompt=_render_prompt_text(tokenizer, messages),
+                        prompt=_render_prompt_text(tokenizer, messages, model_name=args.model_name),
                         seed=None,
                         action={"Action": "AUTO"},
                         step_result=step_result,
@@ -411,13 +460,14 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
             # Fallback for unexpected states.
             state = env.get_state()
             messages = copy.deepcopy(state.get("messages", []))
+            messages = prepare_messages_for_model(messages, model_name=args.model_name)
             step_result = env.step(debug=False)
             events.append(
                 _compact_event(
                     phase=state.get("phase", env.phase),
                     active_player=state.get("active_player"),
                     messages=messages,
-                    prompt=_render_prompt_text(tokenizer, messages),
+                    prompt=_render_prompt_text(tokenizer, messages, model_name=args.model_name),
                     seed=None,
                     action={"Action": "AUTO"},
                     step_result=step_result,
@@ -441,12 +491,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_tokens", type=int, default=10000)
     parser.add_argument("--repetition_penalty", type=float, default=1.2)
     parser.add_argument("--max_retries", type=int, default=3)
-    parser.add_argument("--samples_per_state", type=int, default=10)
+    parser.add_argument("--samples_per_state", type=int, default=1)
 
     parser.add_argument("--max_games", type=int, default=1000)
     parser.add_argument("--max_turns", type=int, default=1000)
-    parser.add_argument("--target_deceptive", type=int, default=0)
-    parser.add_argument("--target_truthful", type=int, default=0)
+    parser.add_argument("--target_deceptive", type=int, default=3000)
+    parser.add_argument("--target_truthful", type=int, default=3000)
     parser.add_argument("--label_filter", type=str, choices=LABEL_FILTER_CHOICES, default="all")
     parser.add_argument("--only_deceptive", action="store_true", default=False)
     parser.add_argument("--only_truthful", action="store_true", default=False)
@@ -548,6 +598,15 @@ def main(argv=None):
     target_phase = sample_phase(args.game)
 
     for game_idx in range(args.max_games):
+        if _targets_reached(
+            total_deceptive,
+            total_truthful,
+            args,
+            use_target_deceptive,
+            use_target_truthful,
+        ):
+            break
+
         env = build_env(
             game=args.game,
             llm=llm,
@@ -557,6 +616,15 @@ def main(argv=None):
         )
 
         for turn_idx in range(args.max_turns):
+            if _targets_reached(
+                total_deceptive,
+                total_truthful,
+                args,
+                use_target_deceptive,
+                use_target_truthful,
+            ):
+                break
+
             if env.game_over():
                 break
 
@@ -568,6 +636,7 @@ def main(argv=None):
 
             state = env.get_state()
             messages = copy.deepcopy(state["messages"])
+            messages = prepare_messages_for_model(messages, model_name=args.model_name)
 
             candidate_actions, seed_base = _model_actions(
                 llm,
@@ -575,15 +644,51 @@ def main(argv=None):
                 args,
                 num_responses=args.samples_per_state,
             )
-            action, chosen_sample_idx = _choose_primary_action(args.game, env, candidate_actions)
-            seed_used = seed_base * max(1, int(args.samples_per_state)) + int(chosen_sample_idx)
-            deceptive = deception_from_action(args.game, action, env)
-            truth_ctx = truth_context(args.game, env, action)
             sampled_state_summary = state_summary(args.game, env)
+            prompt_text = _render_prompt_text(tokenizer, messages, model_name=args.model_name)
 
-            prompt_text = _render_prompt_text(tokenizer, messages)
+            picked_deceptive, picked_truthful, _ = _sample_balanced_candidates(
+                args.game,
+                env,
+                candidate_actions,
+            )
 
-            applied_primary_action = action if isinstance(action, dict) else _fallback_primary_action(args.game, env)
+            transition_candidates = []
+            if picked_deceptive is not None:
+                transition_candidates.append(picked_deceptive)
+            if picked_truthful is not None:
+                transition_candidates.append(picked_truthful)
+
+            record_candidates = []
+            need_deceptive = (not use_target_deceptive) or (total_deceptive < args.target_deceptive)
+            need_truthful = (not use_target_truthful) or (total_truthful < args.target_truthful)
+            if picked_deceptive is not None and need_deceptive:
+                sample_idx, action, deceptive = picked_deceptive
+                record_candidates.append((sample_idx, action, deceptive, truth_context(args.game, env, action)))
+            if picked_truthful is not None and need_truthful:
+                sample_idx, action, deceptive = picked_truthful
+                record_candidates.append((sample_idx, action, deceptive, truth_context(args.game, env, action)))
+
+            if transition_candidates:
+                chosen_sample_idx, transition_action, _transition_deceptive = random.choice(transition_candidates)
+            else:
+                transition_action, chosen_sample_idx = _choose_primary_action(args.game, env, candidate_actions)
+                transition_deceptive = deception_from_action(args.game, transition_action, env)
+                if not record_candidates:
+                    record_candidates.append(
+                        (
+                            chosen_sample_idx,
+                            transition_action,
+                            transition_deceptive,
+                            truth_context(args.game, env, transition_action),
+                        )
+                    )
+
+            applied_primary_action = (
+                transition_action
+                if isinstance(transition_action, dict)
+                else _fallback_primary_action(args.game, env)
+            )
             secondary_events = []
 
             try:
@@ -607,34 +712,42 @@ def main(argv=None):
             ]
             challenge_pass = challenge_passes[0] if challenge_passes else None
 
-            rec = {
-                "state_id": total_states,
-                "sample_idx": chosen_sample_idx,
-                "seed": seed_used,
-                "deceptive": deceptive,
-                "naturally_deceptive": deceptive,
-                "action": action,
-                "messages": messages,
-                "prompt": prompt_text,
-                "secondary_events": secondary_events,
-                "challenge_pass": challenge_pass,
-                "game_id": game_idx,
-                "turn_idx": turn_idx,
-                "truth_context": truth_ctx,
-                **sampled_state_summary,
-            }
+            record_entries = []
+            for sample_idx, action, deceptive, truth_ctx in record_candidates:
+                seed_used = seed_base * max(1, int(args.samples_per_state)) + int(sample_idx)
+                used_for_transition = int(sample_idx) == int(chosen_sample_idx)
+                rec = {
+                    "state_id": total_states,
+                    "sample_idx": sample_idx,
+                    "seed": seed_used,
+                    "deceptive": deceptive,
+                    "naturally_deceptive": deceptive,
+                    "used_for_transition": used_for_transition,
+                    "action": action,
+                    "messages": messages,
+                    "prompt": prompt_text,
+                    "secondary_events": secondary_events if used_for_transition else [],
+                    "challenge_pass": challenge_pass if used_for_transition else None,
+                    "game_id": game_idx,
+                    "turn_idx": turn_idx,
+                    "truth_context": truth_ctx,
+                    **sampled_state_summary,
+                }
+                record_entries.append(rec)
 
-            if keep_record_for_label_filter(rec, label_filter):
-                append_jsonl(rec, output_path)
-                total_saved += 1
+            for rec in record_entries:
+                if keep_record_for_label_filter(rec, label_filter):
+                    append_jsonl(rec, output_path)
+                    total_saved += 1
 
-            total_samples += 1
-            if deceptive is True:
-                total_deceptive += 1
-            elif deceptive is False:
-                total_truthful += 1
-            else:
-                total_unknown += 1
+                total_samples += 1
+                deceptive = rec.get("deceptive")
+                if deceptive is True:
+                    total_deceptive += 1
+                elif deceptive is False:
+                    total_truthful += 1
+                else:
+                    total_unknown += 1
             total_states += 1
 
             if args.log_every and total_states % args.log_every == 0:
@@ -650,16 +763,29 @@ def main(argv=None):
                     label_filter,
                 )
 
-            if use_target_deceptive and total_deceptive >= args.target_deceptive:
-                logging.info("Reached target deceptive count: %d", total_deceptive)
-                break
-            if use_target_truthful and total_truthful >= args.target_truthful:
-                logging.info("Reached target truthful count: %d", total_truthful)
+            if _targets_reached(
+                total_deceptive,
+                total_truthful,
+                args,
+                use_target_deceptive,
+                use_target_truthful,
+            ):
+                logging.info(
+                    "Reached target counts: deceptive=%d/%d truthful=%d/%d",
+                    total_deceptive,
+                    args.target_deceptive,
+                    total_truthful,
+                    args.target_truthful,
+                )
                 break
 
-        if use_target_deceptive and total_deceptive >= args.target_deceptive:
-            break
-        if use_target_truthful and total_truthful >= args.target_truthful:
+        if _targets_reached(
+            total_deceptive,
+            total_truthful,
+            args,
+            use_target_deceptive,
+            use_target_truthful,
+        ):
             break
 
     logging.info(

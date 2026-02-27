@@ -10,6 +10,33 @@ echo "Activating conda environment: deception"
 source /playpen-ssd/smerrill/miniconda/etc/profile.d/conda.sh
 conda activate deception
 
+hash -r
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+    echo "ERROR: conda env not active after 'conda activate deception'."
+    exit 1
+fi
+PYTHON_BIN="$CONDA_PREFIX/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "ERROR: expected python not found at $PYTHON_BIN"
+    exit 1
+fi
+
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    echo "Note: inherited VIRTUAL_ENV is set to: $VIRTUAL_ENV"
+    echo "Using conda python explicitly: $PYTHON_BIN"
+fi
+
+echo "Python in env: $PYTHON_BIN"
+"$PYTHON_BIN" - <<'PY'
+import sys
+print("Python executable:", sys.executable)
+try:
+    import vllm  # noqa: F401
+except Exception as e:
+    print("ERROR: could not import vllm in this environment:", repr(e))
+    raise
+PY
+
 echo "Available GPUs:"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 echo ""
@@ -93,7 +120,7 @@ echo "Launching worker on GPU $CUDA_VISIBLE_DEVICES"
 echo "Label filter: $LABEL_FILTER"
 echo ""
 
-python "$SCRIPT" \
+"$PYTHON_BIN" "$SCRIPT" \
     --game bs \
     --model_name "$MODEL_NAME" \
     $REASONING \
