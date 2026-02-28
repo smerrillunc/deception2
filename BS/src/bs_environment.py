@@ -494,18 +494,50 @@ Respond in JSON only using the following format:
 
     @staticmethod
     def is_truthful(action, rank):
-        if isinstance(action, list):
-            is_truth = all(int(x[0]) == rank for x in action)
-        elif isinstance(action, str):
-            if action == 'None':
-                is_truth = True
-            elif int(action[0]) == rank:
-                is_truth = True
-            else:
-                is_truth = False
-        elif action is None:
-            is_truth = True
-        else:
-            is_truth = f'UNKNOWN TYPE: {action}'
+        try:
+            rank = int(rank)
+        except Exception:
+            return f"UNKNOWN RANK: {rank}"
 
-        return is_truth
+        def _rank_from_card(card):
+            if card is None:
+                return None
+
+            if isinstance(card, (list, tuple)):
+                if not card:
+                    return None
+                card = card[0]
+
+            s = str(card).strip()
+            if not s:
+                return None
+            if s.lower() in {"none", "na", "n/a", "null"}:
+                return None
+
+            try:
+                return int(s[0])
+            except Exception:
+                return None
+
+        if isinstance(action, list):
+            if not action:
+                return True
+            parsed_ranks = [_rank_from_card(card) for card in action]
+            if any(val is None for val in parsed_ranks):
+                bad = [card for card, val in zip(action, parsed_ranks) if val is None]
+                return f"UNKNOWN CARD: {bad[0]}"
+            return all(val == rank for val in parsed_ranks)
+
+        if isinstance(action, str):
+            s = action.strip()
+            if s.lower() in {"none", "pass", ""}:
+                return True
+            parsed_rank = _rank_from_card(s)
+            if parsed_rank is None:
+                return f"UNKNOWN CARD: {action}"
+            return parsed_rank == rank
+
+        if action is None:
+            return True
+
+        return f"UNKNOWN TYPE: {action}"

@@ -220,9 +220,20 @@ def _evaluate_bs_action(parsed: Dict[str, Any], context: Dict[str, Any]) -> Tupl
         else:
             return None, {"reason": "missing_cards_played"}
 
-    is_truthful = BSEnvironment.is_truthful(action_cards, rank)
+    try:
+        is_truthful = BSEnvironment.is_truthful(action_cards, rank)
+    except Exception as exc:
+        return None, {
+            "reason": "truthfulness_eval_error",
+            "detail": str(exc),
+            "cards_played": action_cards,
+        }
     if isinstance(is_truthful, str):
-        return None, {"reason": "unknown_truthfulness", "detail": is_truthful}
+        return None, {
+            "reason": "unknown_truthfulness",
+            "detail": is_truthful,
+            "cards_played": action_cards,
+        }
 
     return bool(is_truthful), {
         "cards_played": action_cards,
@@ -721,6 +732,7 @@ def main(argv=None):
     parser.add_argument("--shard_id", type=int, default=0)
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--log_every", type=int, default=25)
+    parser.add_argument("--flush_every", type=int, default=1)
     parser.add_argument("--text_field", type=str, default="action_reasoning")
     if hasattr(argparse, "BooleanOptionalAction"):
         parser.add_argument("--is_reasoning_model", action=argparse.BooleanOptionalAction, default=None)
@@ -762,9 +774,9 @@ def main(argv=None):
     print(
         f"Shard {args.shard_id}/{args.num_shards}: {total_examples} examples "
         f"(label_filter={label_filter})"
-    )
+    , flush=True)
     if total_examples == 0:
-        print("No examples to process for this shard.")
+        print("No examples to process for this shard.", flush=True)
         return
 
     sentences_by_example = _load_sentences(args.sentences_path)
@@ -902,25 +914,27 @@ def main(argv=None):
             out_path.write_text(json.dumps(record, indent=2))
         if jsonl_fh:
             jsonl_fh.write(json.dumps(record) + "\n")
+            if args.flush_every and ((processed + 1) % args.flush_every == 0):
+                jsonl_fh.flush()
 
         processed += 1
         if args.log_every and (idx + 1) % args.log_every == 0:
             print(
                 f"Processed {idx + 1}/{total_examples} examples "
                 f"(shard {args.shard_id}, kept={processed}, skipped={skipped})"
-            )
+            , flush=True)
 
     if jsonl_fh:
         jsonl_fh.close()
 
     if out_dir and jsonl_path:
-        print(f"Batch localization complete. Outputs in {out_dir} and {jsonl_path}")
+        print(f"Batch localization complete. Outputs in {out_dir} and {jsonl_path}", flush=True)
     elif out_dir:
-        print(f"Batch localization complete. Outputs in {out_dir}")
+        print(f"Batch localization complete. Outputs in {out_dir}", flush=True)
     elif jsonl_path:
-        print(f"Batch localization complete. Output in {jsonl_path}")
+        print(f"Batch localization complete. Output in {jsonl_path}", flush=True)
     else:
-        print("Batch localization complete.")
+        print("Batch localization complete.", flush=True)
 
 
 if __name__ == "__main__":

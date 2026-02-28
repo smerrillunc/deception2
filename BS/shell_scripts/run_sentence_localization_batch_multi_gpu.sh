@@ -62,11 +62,18 @@ fi
 export DATA_DIR
 export LABEL_FILTER
 export SKIP_GPU_LIST=1
+export LIMIT="${LIMIT:-0}"
+export N_SAMPLES="${N_SAMPLES:-50}"
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-10000}"
+export COARSE_ITERS="${COARSE_ITERS:-8}"
+export REFINEMENT_ITERS="${REFINEMENT_ITERS:-8}"
+export LOG_EVERY="${LOG_EVERY:-25}"
 
 echo "Label filter: $LABEL_FILTER"
 echo "Model: $MODEL_NAME"
 echo "DATA_DIR: ${DATA_DIR:-}"
 echo "EXAMPLES_PATH: $EXAMPLES_PATH"
+echo "LIMIT: ${LIMIT:-0}"
 
 
 pids=()

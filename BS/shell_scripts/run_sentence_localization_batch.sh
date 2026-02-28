@@ -4,6 +4,18 @@ set -euo pipefail
 echo "Activating conda environment: deception"
 source /playpen-ssd/smerrill/miniconda/etc/profile.d/conda.sh
 conda activate deception
+hash -r
+
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  echo "ERROR: conda env not active after 'conda activate deception'."
+  exit 1
+fi
+PYTHON_BIN="$CONDA_PREFIX/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "ERROR: expected python not found at $PYTHON_BIN"
+  exit 1
+fi
+echo "Python in env: $PYTHON_BIN"
 
 if [[ -z "${SKIP_GPU_LIST:-}" ]]; then
   echo "Available GPUs:"
@@ -28,25 +40,10 @@ else
 fi
 
 if [[ -z "${MODEL_NAME:-}" ]]; then
-  if [[ ! -t 0 ]]; then
-    # Non-interactive: pick a reasonable default to avoid hanging
-    MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-  else
-    echo "Select a model:"
-    echo "  1) deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-    echo "  2) deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-    echo "  3) deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
-    echo ""
-
-    read -p "Enter model number (1–3): " MODEL_CHOICE
-
-    case "$MODEL_CHOICE" in
-        1) MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" ;;
-        2) MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B" ;;
-        3) MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" ;;
-        *) echo "❌ Invalid model selection: $MODEL_CHOICE"; exit 1 ;;
-    esac
-  fi
+  echo "MODEL_NAME is required."
+  echo "Example:"
+  echo "  MODEL_NAME=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B $0"
+  exit 1
 fi
 
 GAME="bs"
@@ -54,12 +51,8 @@ RESULTS_ROOT="/playpen-ssd/smerrill/deception2/BS/Results"
 SENTENCE_ROOT="$RESULTS_ROOT/SentencePipeline/v1"
 MODEL_TAG_RAW="${MODEL_NAME//\//_}"
 MODEL_TAG_BASE="${MODEL_NAME##*/}"
-LABEL_FILTER="${LABEL_FILTER:-deceptive_only}"
-ONLY_DECEPTIVE="${ONLY_DECEPTIVE:-0}"
-ONLY_TRUTHFUL="${ONLY_TRUTHFUL:-0}"
-TRUTHFUL_LIMIT="${TRUTHFUL_LIMIT:-3000}"
+LABEL_FILTER="all"
 DATA_DIR="${DATA_DIR:-}"
-AUTO_BUILD_DATASET="${AUTO_BUILD_DATASET:-0}"
 
 N_SAMPLES="${N_SAMPLES:-50}"
 TEMPERATURE="${TEMPERATURE:-0.5}"
@@ -68,48 +61,23 @@ REPETITION_PENALTY="${REPETITION_PENALTY:-1.2}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-10000}"
 METHOD="${METHOD:-adaptive}"
 MODE="${MODE:-prefix}"
+COARSE_ITERS="${COARSE_ITERS:-8}"
+REFINEMENT_ITERS="${REFINEMENT_ITERS:-8}"
+MIN_VALID="${MIN_VALID:-3}"
 SHARD_ID="${SHARD_ID:-0}"
 NUM_SHARDS="${NUM_SHARDS:-1}"
 LOG_EVERY="${LOG_EVERY:-25}"
-
-if [[ "$ONLY_DECEPTIVE" == "1" && "$ONLY_TRUTHFUL" == "1" ]]; then
-  echo "Cannot set both ONLY_DECEPTIVE=1 and ONLY_TRUTHFUL=1"
-  exit 1
-fi
-if [[ "$ONLY_DECEPTIVE" == "1" ]]; then
-  LABEL_FILTER="deceptive_only"
-fi
-if [[ "$ONLY_TRUTHFUL" == "1" ]]; then
-  LABEL_FILTER="truthful_only"
-fi
-if [[ "$LABEL_FILTER" != "all" && "$LABEL_FILTER" != "deceptive_only" && "$LABEL_FILTER" != "truthful_only" ]]; then
-  echo "Invalid LABEL_FILTER=$LABEL_FILTER. Expected one of: all, deceptive_only, truthful_only"
-  exit 1
-fi
+LIMIT="${LIMIT:-0}"
 
 if [[ -z "$DATA_DIR" ]]; then
-  if [[ "$LABEL_FILTER" == "truthful_only" ]]; then
-    CAND_A="$SENTENCE_ROOT/${MODEL_TAG_BASE}_truthful_${TRUTHFUL_LIMIT}"
-    CAND_B="$SENTENCE_ROOT/${MODEL_TAG_RAW}_truthful_${TRUTHFUL_LIMIT}"
-    if [[ -d "$CAND_A" ]]; then
-      DATA_DIR="$CAND_A"
-    elif [[ -d "$CAND_B" ]]; then
-      DATA_DIR="$CAND_B"
-    elif [[ -d "$SENTENCE_ROOT/$MODEL_TAG_BASE" ]]; then
-      DATA_DIR="$CAND_A"
-    else
-      DATA_DIR="$CAND_B"
-    fi
+  CAND_A="$SENTENCE_ROOT/${MODEL_TAG_BASE}"
+  CAND_B="$SENTENCE_ROOT/${MODEL_TAG_RAW}"
+  if [[ -d "$CAND_A" ]]; then
+    DATA_DIR="$CAND_A"
+  elif [[ -d "$CAND_B" ]]; then
+    DATA_DIR="$CAND_B"
   else
-    CAND_A="$SENTENCE_ROOT/${MODEL_TAG_BASE}"
-    CAND_B="$SENTENCE_ROOT/${MODEL_TAG_RAW}"
-    if [[ -d "$CAND_A" ]]; then
-      DATA_DIR="$CAND_A"
-    elif [[ -d "$CAND_B" ]]; then
-      DATA_DIR="$CAND_B"
-    else
-      DATA_DIR="$CAND_A"
-    fi
+    DATA_DIR="$CAND_A"
   fi
 fi
 
@@ -121,25 +89,14 @@ JSONL_PATH="${JSONL_PATH:-$DATA_DIR/localization.jsonl}"
 SCRIPT="/playpen-ssd/smerrill/deception2/src/sentence_localization_batch.py"
 
 if [[ ! -f "$EXAMPLES_PATH" ]]; then
-  if [[ "$AUTO_BUILD_DATASET" == "1" ]]; then
-    echo "examples.jsonl not found. Auto-building sentence dataset first..."
-    BUILD_LIMIT="${LIMIT:-0}"
-    if [[ "$LABEL_FILTER" == "truthful_only" && "$BUILD_LIMIT" == "0" ]]; then
-      BUILD_LIMIT="$TRUTHFUL_LIMIT"
-    fi
-    MODEL_NAME="$MODEL_NAME" OUT_DIR="$DATA_DIR" LABEL_FILTER="$LABEL_FILTER" LIMIT="$BUILD_LIMIT" \
-      /playpen-ssd/smerrill/deception2/BS/shell_scripts/run_sentence_dataset.sh
-  else
-    echo "Missing examples file: $EXAMPLES_PATH"
-    echo "Run dataset build first:"
-    echo "  MODEL_NAME=$MODEL_NAME /playpen-ssd/smerrill/deception2/BS/shell_scripts/run_sentence_dataset.sh"
-    echo "Or rerun with AUTO_BUILD_DATASET=1"
-    exit 1
-  fi
+  echo "Missing examples file: $EXAMPLES_PATH"
+  echo "Run dataset build first:"
+  echo "  MODEL_NAME=$MODEL_NAME /playpen-ssd/smerrill/deception2/BS/shell_scripts/run_sentence_dataset.sh"
+  exit 1
 fi
 
 CMD=(
-  python "$SCRIPT"
+  "$PYTHON_BIN" "$SCRIPT"
   --game "$GAME"
   --examples_path "$EXAMPLES_PATH"
   --model_name "$MODEL_NAME"
@@ -151,6 +108,9 @@ CMD=(
   --max_new_tokens "$MAX_NEW_TOKENS"
   --method "$METHOD"
   --mode "$MODE"
+  --coarse_iters "$COARSE_ITERS"
+  --refinement_iters "$REFINEMENT_ITERS"
+  --min_valid "$MIN_VALID"
   --label_filter "$LABEL_FILTER"
   --shard_id "$SHARD_ID"
   --num_shards "$NUM_SHARDS"
@@ -163,6 +123,9 @@ fi
 if [[ "$OUT_DIR" != "none" ]]; then
   mkdir -p "$OUT_DIR"
   CMD+=(--out_dir "$OUT_DIR")
+fi
+if [[ "$LIMIT" != "0" ]]; then
+  CMD+=(--limit "$LIMIT")
 fi
 
 echo "GAME: $GAME"
@@ -178,6 +141,7 @@ if [[ "$OUT_DIR" != "none" ]]; then
   echo "OUT_DIR: $OUT_DIR"
 fi
 echo "LABEL_FILTER: $LABEL_FILTER"
+echo "LIMIT: $LIMIT"
 
 echo "Running localization..."
 "${CMD[@]}"
