@@ -24,6 +24,11 @@ METHOD="adaptive"    # adaptive | full
 MODE="prefix"        # prefix | sentence_only
 LIMIT=0              # 0 means no limit.
 LOG_EVERY=25
+# Sharding:
+# - NUM_SHARDS is total shard count.
+# - SHARD_ID defaults to SLURM_ARRAY_TASK_ID (if using --array), else 0.
+NUM_SHARDS="${NUM_SHARDS:-1}"
+SHARD_ID="${SHARD_ID:-${SLURM_ARRAY_TASK_ID:-0}}"
 
 # ---------------- End parameters -----------------
 
@@ -53,6 +58,19 @@ EXAMPLES_PATH="$DATA_DIR/examples.jsonl"
 SENTENCES_PATH="$DATA_DIR/sentences.jsonl"
 OUT_DIR="$DATA_DIR/localization"
 
+if ! [[ "$NUM_SHARDS" =~ ^[0-9]+$ ]] || [[ "$NUM_SHARDS" -lt 1 ]]; then
+  echo "NUM_SHARDS must be a positive integer. Got: $NUM_SHARDS"
+  exit 1
+fi
+if ! [[ "$SHARD_ID" =~ ^[0-9]+$ ]]; then
+  echo "SHARD_ID must be a non-negative integer. Got: $SHARD_ID"
+  exit 1
+fi
+if [[ "$SHARD_ID" -ge "$NUM_SHARDS" ]]; then
+  echo "SHARD_ID ($SHARD_ID) must be in [0, NUM_SHARDS) with NUM_SHARDS=$NUM_SHARDS"
+  exit 1
+fi
+
 if [[ ! -f "$EXAMPLES_PATH" ]]; then
   echo "Missing examples file: $EXAMPLES_PATH"
   echo "Build sentence data first (deceptive_only) and rerun."
@@ -72,8 +90,8 @@ CMD=(
   --method "$METHOD"
   --mode "$MODE"
   --label_filter all
-  --shard_id 0
-  --num_shards 1
+  --shard_id "$SHARD_ID"
+  --num_shards "$NUM_SHARDS"
   --log_every "$LOG_EVERY"
   --out_dir "$OUT_DIR"
 )
@@ -87,6 +105,7 @@ fi
 echo "Command to run:"
 printf '%q ' "${CMD[@]}"
 echo
+echo "Running shard $SHARD_ID of $NUM_SHARDS"
 
 "${CMD[@]}"
 
