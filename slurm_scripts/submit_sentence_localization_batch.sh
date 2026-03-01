@@ -23,4 +23,10 @@ fi
 echo "Submitting $N shard jobs (array 0-$((N-1)))"
 echo "Using run script: $RUN_SCRIPT"
 
-sbatch --array=0-$((N-1)) --export=ALL,NUM_SHARDS="$N" "$RUN_SCRIPT"
+ARRAY_JOB_ID="$(sbatch --parsable --array=0-$((N-1)) --export=ALL,NUM_SHARDS="$N" "$RUN_SCRIPT")"
+
+echo "Submitted array job: $ARRAY_JOB_ID"
+echo "Array tasks: ${ARRAY_JOB_ID}_[0-$((N-1))]"
+echo "Check tasks:"
+echo "  squeue -j $ARRAY_JOB_ID -r"
+echo "  scontrol show job $ARRAY_JOB_ID"
