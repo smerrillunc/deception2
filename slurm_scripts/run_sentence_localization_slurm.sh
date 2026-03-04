@@ -14,7 +14,6 @@ set -euo pipefail
 
 # ---------------- User parameters ----------------
 CONDA_ENV="deception"
-MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 N_SAMPLES=50
 TEMPERATURE=0.5
 TOP_P=0.5
@@ -38,16 +37,12 @@ conda activate "$CONDA_ENV"
 PROJECT_ROOT="/work/users/s/m/smerrill/deception2"
 SRC_ROOT="$PROJECT_ROOT/src"
 
-GAME="bs"
-# DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-14B_deceptive" # complete
-DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-14B_truthful" # 33005650
-# DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-7B_deceptive" # complete
-# DATA_DIR="/work/users/s/m/smerrill/deception2/BS/Results/SentencePipeline/v1/DeepSeek-R1-Distill-Qwen-7B_truthful" # running
 
-# GAME="gridworld"
-# DATA_DIR="/work/users/s/m/smerrill/deception2/Gridworld/Results/SentencePipeline/v1/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B_deceptive" # complete
-# DATA_DIR="/work/users/s/m/smerrill/deception2/Gridworld/Results/SentencePipeline/v1/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B_truthful" # JOB 33005216
-
+GAME='gridworld'
+GAME_CASE = 'Gridworld'
+MODEL_NAME="mistralai/Ministral-3-8B-Reasoning-2512"
+MODEL_TAIL="${MODEL_NAME##*/}"
+DATA_DIR="/work/users/s/m/smerrill/deception2/$GAME_CASE/Results/SentencePipeline/v1/$MODEL_TAIL"
 
 if [[ -z "${DATA_DIR:-}" ]]; then
   echo "DATA_DIR is not set. Set DATA_DIR near the top of this script."
