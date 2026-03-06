@@ -77,6 +77,7 @@ def _write_examples(
     truthful_written = 0
     use_target_deceptive = target_deceptive > 0 and label_filter != "truthful_only"
     use_target_truthful = target_truthful > 0 and label_filter != "deceptive_only"
+    use_any_target = use_target_deceptive or use_target_truthful
 
     with out_path.open("w", encoding="utf-8") as f:
         for rec in records:
@@ -114,11 +115,12 @@ def _write_examples(
             elif deceptive_label is False:
                 truthful_written += 1
 
-            if (
-                ((not use_target_deceptive) or deceptive_written >= target_deceptive)
-                and ((not use_target_truthful) or truthful_written >= target_truthful)
-            ):
-                break
+            if use_any_target:
+                if (
+                    ((not use_target_deceptive) or deceptive_written >= target_deceptive)
+                    and ((not use_target_truthful) or truthful_written >= target_truthful)
+                ):
+                    break
 
             if limit and written >= limit:
                 break

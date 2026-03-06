@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import re
 import tempfile
@@ -738,6 +737,7 @@ def _compute_token_and_attention_features(
     if logits is None:
         return {}
     logits = logits[0].to(torch.float32)  # [T, V]
+    compute_device = logits.device
     attn_layers = getattr(out, "attentions", None)
     hidden_states = getattr(out, "hidden_states", None) or ()
     if logits.shape[0] != t:
@@ -751,7 +751,7 @@ def _compute_token_and_attention_features(
     logit_std_tok = np.full(t, np.nan, dtype=np.float64)
 
     logits_next = logits[:-1, :]
-    targets = input_ids[1:].to(device)
+    targets = input_ids[1:].to(compute_device)
     nll = F.cross_entropy(logits_next, targets, reduction="none").detach().cpu().numpy()
     nll_tok[1:] = nll
 
@@ -835,8 +835,8 @@ def _compute_token_and_attention_features(
 
         if act_layers:
             valid_mask = token_sent >= 0
-            valid_idx_t = torch.nonzero(torch.tensor(valid_mask, device=device), as_tuple=True)[0]
-            sent_ids_t = torch.tensor(token_sent[valid_mask], device=device, dtype=torch.long)
+            valid_idx_t = torch.nonzero(torch.tensor(valid_mask, device=compute_device), as_tuple=True)[0]
+            sent_ids_t = torch.tensor(token_sent[valid_mask], device=compute_device, dtype=torch.long)
             counts = torch.bincount(sent_ids_t, minlength=n_sent).to(torch.float32)
             counts_safe = torch.clamp(counts, min=1.0)
 
@@ -858,7 +858,8 @@ def _compute_token_and_attention_features(
                             if np.isfinite(vals[s]):
                                 rows[s][col] = float(vals[s])
 
-                sum_emb = torch.zeros((n_sent, h.shape[-1]), device=device, dtype=torch.float32)
+                h = h.to(device=compute_device, dtype=torch.float32)
+                sum_emb = torch.zeros((n_sent, h.shape[-1]), device=compute_device, dtype=torch.float32)
                 if valid_idx_t.numel() > 0:
                     sum_emb.index_add_(0, sent_ids_t, h[valid_idx_t])
                 emb = sum_emb / counts_safe.view(-1, 1)
@@ -914,13 +915,13 @@ def _compute_token_and_attention_features(
     if not layer_ids:
         layer_ids = [l_total - 1]
 
-    token_sent_t = torch.tensor(token_sent, device=device, dtype=torch.long)
+    token_sent_t = torch.tensor(token_sent, device=compute_device, dtype=torch.long)
 
-    last = attn_layers[layer_ids[-1]][0].to(torch.float32)
+    last = attn_layers[layer_ids[-1]][0].to(device=compute_device, dtype=torch.float32)
     m_rawmean = _sentence_attention_matrix(last.mean(dim=0), token_sent_t, n_sent).detach().cpu().numpy()
     m_rawmax = _sentence_attention_matrix(last.max(dim=0).values, token_sent_t, n_sent).detach().cpu().numpy()
 
-    roll_layers = [attn_layers[i][0].detach() for i in layer_ids]
+    roll_layers = [attn_layers[i][0].detach().to(device=compute_device, dtype=torch.float32) for i in layer_ids]
     m_roll = _sentence_attention_matrix(_attention_rollout_safe(roll_layers, add_residual=True), token_sent_t, n_sent)
     m_roll = m_roll.detach().cpu().numpy()
 
@@ -994,23 +995,34 @@ def run_extract(cfg: ExtractConfig) -> pd.DataFrame:
     example_ids = sorted(example_ids)
     print(f"[extract] selected examples={len(example_ids)}", flush=True)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "7")
-
     print(f"[extract] loading model/tokenizer: {cfg.model_name}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model_name,
         use_fast=True,
         trust_remote_code=cfg.trust_remote_code,
     )
+    use_auto_device_map = bool(cfg.device.startswith("cuda") and torch.cuda.is_available() and torch.cuda.device_count() > 1)
+    model_kwargs: Dict[str, Any] = {
+        "torch_dtype": torch.float32,
+        "low_cpu_mem_usage": True,
+        "attn_implementation": "eager",
+        "trust_remote_code": cfg.trust_remote_code,
+    }
+    if use_auto_device_map:
+        model_kwargs["device_map"] = "auto"
+        print(
+            f"[extract] using device_map=auto across {torch.cuda.device_count()} visible CUDA devices",
+            flush=True,
+        )
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-        attn_implementation="eager",
-        trust_remote_code=cfg.trust_remote_code,
+        **model_kwargs,
     )
-    model = model.to(dtype=torch.float32).to(cfg.device)
+    if not use_auto_device_map:
+        model = model.to(cfg.device)
     model.eval()
+    model_input_device = str(next(model.parameters()).device)
+    print(f"[extract] model input device: {model_input_device}", flush=True)
     param_dtypes = {p.dtype for p in model.parameters()}
     tok_fp32_enforced = bool(param_dtypes == {torch.float32})
     if not tok_fp32_enforced:
@@ -1049,7 +1061,7 @@ def run_extract(cfg: ExtractConfig) -> pd.DataFrame:
                         sentence_spans,
                         tokenizer=tokenizer,
                         model=model,
-                        device=cfg.device,
+                        device=model_input_device,
                         max_tokens=cur_max_tokens,
                         topk_vocab=cfg.topk_vocab,
                         min_dist_list=cfg.min_dist_list,
@@ -1446,8 +1458,8 @@ def _add_extract_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--examples-path", type=Path, required=True)
     ap.add_argument("--sentences-path", type=Path, required=True)
     ap.add_argument("--localization-path", type=Path, required=True)
-    ap.add_argument("--model-name", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
-    ap.add_argument("--num-examples", type=int, default=10000)
+    ap.add_argument("--model-name", type=str, required=True)
+    ap.add_argument("--num-examples", type=int, default=100000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--only-localized", action="store_true", default=True)
     ap.add_argument("--max-tokens", type=int, default=10000)
