@@ -39,8 +39,9 @@ SRC_ROOT="$PROJECT_ROOT/src"
 
 
 GAME='gridworld'
-GAME_CASE = 'Gridworld'
-MODEL_NAME="mistralai/Ministral-3-8B-Reasoning-2512"
+GAME_CASE='Gridworld'
+#MODEL_NAME="mistralai/Ministral-3-8B-Reasoning-2512"
+MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 MODEL_TAIL="${MODEL_NAME##*/}"
 DATA_DIR="/work/users/s/m/smerrill/deception2/$GAME_CASE/Results/SentencePipeline/v1/$MODEL_TAIL"
 

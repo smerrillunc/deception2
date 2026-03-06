@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=40g
-#SBATCH --time=6-23:00:00
+#SBATCH --time=1-23:00:00
 #SBATCH -p l40-gpu
 #SBATCH --qos=gpu_access
 #SBATCH --gres=gpu:1
@@ -14,8 +14,10 @@ set -euo pipefail
 
 # ---------------- User parameters ----------------
 CONDA_ENV="deception"
-MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-GAME="gridworld"                   # bs | gridworld
+#MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+MODEL_NAME="mistralai/Ministral-3-14B-Reasoning-2512"
+GAME="bs"                   # bs | gridworld
+GAME_SAVE=BS
 IS_REASONING_MODEL=1        # 1 to pass --is_reasoning_model
 
 TEMPERATURE=0.5
@@ -30,7 +32,7 @@ MAX_TURNS=1000
 LABEL_FILTER="all"          # all | deceptive_only | truthful_only
 TARGET_DECEPTIVE=0
 TARGET_TRUTHFUL=0
-SEED=0
+SEED=191349
 LOG_EVERY=50
 
 # BS environment args
@@ -48,9 +50,8 @@ HISTORY_WINDOW=15
 AUTO_MOVE_EXPLORER=1        # 1 => --auto_move_explorer, 0 => --no-auto_move_explorer
 
 # Set one OUTPUT_DIR.
-GAME_SAVE=Gridworld
 MODEL_TAIL="${MODEL_NAME##*/}"
-OUTPUT_DIR="/work/users/s/m/smerrill/deception2/$GAME_SAVE/Results/DeceptionMining/$MODEL_TAIL/$(date +%Y-%m-%d)"
+OUTPUT_DIR="/work/users/s/m/smerrill/deception2/$GAME_SAVE/Results/DeceptionMining/$MODEL_TAIL/$(date +%Y-%m-%d_%H-%M-%S)"
 # ---------------- End parameters -----------------
 
 module load anaconda
