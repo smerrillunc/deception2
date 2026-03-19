@@ -116,6 +116,27 @@ def _extract_run_info(samples_path: Path, root_dir: Path) -> Dict[str, Optional[
     }
 
 
+def _extract_reasoning_from_raw_text(text: Any) -> Optional[str]:
+    if not isinstance(text, str):
+        return None
+    for pattern in (r"(?is).*?</think>", r"(?is).*?\[/think\]"):
+        match = re.search(pattern, text)
+        if match:
+            reasoning = match.group(0).strip()
+            if reasoning:
+                return reasoning
+    return None
+
+
+def _synthesize_action_raw_text(action: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(action, dict) or not action:
+        return None
+    try:
+        return json.dumps(action, ensure_ascii=False, indent=2)
+    except Exception:
+        return None
+
+
 def iter_deception_records(
     root_dir: str | Path,
     *,
@@ -179,10 +200,19 @@ def iter_deception_records(
                 out["action_type"] = action.get("Action")
                 out["cards_played"] = action.get("Cards_played")
                 out["action_parse_fail"] = action.get("Parse_fail")
-                if "reasoning" in action:
-                    out["action_reasoning"] = action.get("reasoning")
-                if "_raw_text" in action:
-                    out["action_raw_text"] = action.get("_raw_text")
+                raw_text = action.get("_raw_text")
+                if not (isinstance(raw_text, str) and raw_text.strip()):
+                    raw_text = _synthesize_action_raw_text(action)
+
+                action_reasoning = action.get("reasoning")
+                if not (isinstance(action_reasoning, str) and action_reasoning.strip()):
+                    action_reasoning = action.get("Reasoning")
+                if not (isinstance(action_reasoning, str) and action_reasoning.strip()):
+                    action_reasoning = _extract_reasoning_from_raw_text(raw_text)
+                if isinstance(action_reasoning, str) and action_reasoning.strip():
+                    out["action_reasoning"] = action_reasoning
+                if isinstance(raw_text, str) and raw_text.strip():
+                    out["action_raw_text"] = raw_text
                 if isinstance(action.get("Cards_played"), list):
                     out["cards_played_len"] = len(action["Cards_played"])
 
