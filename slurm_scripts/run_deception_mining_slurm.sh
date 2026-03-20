@@ -1,121 +1,56 @@
 #!/bin/bash
-#SBATCH --job-name=deception_miner
-#SBATCH --output=deception_miner_%j.out
-#SBATCH --error=deception_miner_%j.err
+#SBATCH --job-name=mine_pipeline
+#SBATCH --output=mine_pipeline_%j.out
+#SBATCH --error=mine_pipeline_%j.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=40g
-#SBATCH --time=1-23:00:00
-#SBATCH -p l40-gpu
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96g
+#SBATCH --time=2-00:00:00
+#SBATCH -p a100-gpu,l40-gpu
 #SBATCH --qos=gpu_access
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 
 set -euo pipefail
 
-# ---------------- User parameters ----------------
-CONDA_ENV="deception"
-#MODEL_NAME="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-MODEL_NAME="mistralai/Ministral-3-14B-Reasoning-2512"
-GAME="bs"                   # bs | gridworld
-GAME_SAVE=BS
-IS_REASONING_MODEL=1        # 1 to pass --is_reasoning_model
-
-TEMPERATURE=0.5
-TOP_P=0.5
-MAX_TOKENS=10000
-REPETITION_PENALTY=1.2
-MAX_RETRIES=3
-SAMPLES_PER_STATE=10
-
-MAX_GAMES=1000
-MAX_TURNS=1000
-LABEL_FILTER="all"          # all | deceptive_only | truthful_only
-TARGET_DECEPTIVE=0
-TARGET_TRUTHFUL=0
-SEED=191349
-LOG_EVERY=50
-
-# BS environment args
-NUM_PLAYERS=4
-CARDS_PER_PLAYER=5
-
-# Gridworld environment args
-GRID_WIDTH=9
-GRID_HEIGHT=9
-WALL_PROB=0.18
-MAX_TRIES=200
-MAX_STEPS=60
-VIEW_RADIUS=2
-HISTORY_WINDOW=15
-AUTO_MOVE_EXPLORER=1        # 1 => --auto_move_explorer, 0 => --no-auto_move_explorer
-
-# Set one OUTPUT_DIR.
-MODEL_TAIL="${MODEL_NAME##*/}"
-OUTPUT_DIR="/work/users/s/m/smerrill/deception2/$GAME_SAVE/Results/DeceptionMining/$MODEL_TAIL/$(date +%Y-%m-%d_%H-%M-%S)"
-# ---------------- End parameters -----------------
+if [[ -z "${MODEL_NAME:-}" ]]; then
+  echo "Set MODEL_NAME when submitting this job. ENVIRONMENT defaults to all." >&2
+  echo 'Example: sbatch --export=ALL,MODEL_NAME=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B slurm_scripts/run_deception_mining_slurm.sh' >&2
+  exit 1
+fi
 
 module load anaconda
-conda activate "$CONDA_ENV"
+# shellcheck disable=SC1091
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV:-deception}"
 
-PROJECT_ROOT="/work/users/s/m/smerrill/deception2"
-SRC_ROOT="$PROJECT_ROOT/src"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [[ -z "${OUTPUT_DIR:-}" ]]; then
-  echo "OUTPUT_DIR is not set. Set OUTPUT_DIR near the top of this script."
-  exit 1
+NUM_GPUS="${NUM_GPUS:-${SLURM_GPUS_ON_NODE:-1}}"
+if ! [[ "$NUM_GPUS" =~ ^[0-9]+$ ]]; then
+  NUM_GPUS=1
 fi
-mkdir -p "$OUTPUT_DIR"
-
-CMD=(
-  conda run -n "$CONDA_ENV" python "$SRC_ROOT/deception_miner.py"
-  --game "$GAME"
-  --model_name "$MODEL_NAME"
-  --temperature "$TEMPERATURE"
-  --top_p "$TOP_P"
-  --max_tokens "$MAX_TOKENS"
-  --repetition_penalty "$REPETITION_PENALTY"
-  --max_retries "$MAX_RETRIES"
-  --samples_per_state "$SAMPLES_PER_STATE"
-  --max_games "$MAX_GAMES"
-  --max_turns "$MAX_TURNS"
-  --label_filter "$LABEL_FILTER"
-  --target_deceptive "$TARGET_DECEPTIVE"
-  --target_truthful "$TARGET_TRUTHFUL"
-  --output_dir "$OUTPUT_DIR"
-  --seed "$SEED"
-  --log_every "$LOG_EVERY"
-)
-
-if [[ "$IS_REASONING_MODEL" == "1" ]]; then
-  CMD+=(--is_reasoning_model)
+if (( NUM_GPUS < 1 )); then
+  NUM_GPUS=1
 fi
 
-if [[ "$GAME" == "bs" ]]; then
-  CMD+=(--num_players "$NUM_PLAYERS" --cards_per_player "$CARDS_PER_PLAYER")
-elif [[ "$GAME" == "gridworld" ]]; then
-  CMD+=(
-    --grid_width "$GRID_WIDTH"
-    --grid_height "$GRID_HEIGHT"
-    --wall_prob "$WALL_PROB"
-    --max_tries "$MAX_TRIES"
-    --max_steps "$MAX_STEPS"
-    --view_radius "$VIEW_RADIUS"
-    --history_window "$HISTORY_WINDOW"
-  )
-  if [[ "$AUTO_MOVE_EXPLORER" == "1" ]]; then
-    CMD+=(--auto_move_explorer)
+GPU_IDS=""
+for ((i = 0; i < NUM_GPUS; i++)); do
+  if [[ -z "$GPU_IDS" ]]; then
+    GPU_IDS="$i"
   else
-    CMD+=(--no-auto_move_explorer)
+    GPU_IDS="$GPU_IDS $i"
   fi
-else
-  echo "Invalid GAME=$GAME. Expected bs or gridworld."
-  exit 1
-fi
+done
 
-echo "Command to run:"
-printf '%q ' "${CMD[@]}"
-echo
+export GPU_IDS
+export PYTHON_BIN="$CONDA_PREFIX/bin/python"
 
-"${CMD[@]}"
+echo "MODEL_NAME: $MODEL_NAME"
+echo "ENVIRONMENT: ${ENVIRONMENT:-all}"
+echo "GPU_IDS: $GPU_IDS"
 
-echo "Deception mining complete."
+"$REPO_ROOT/shell_scripts/run_targeted_localization_pipeline.sh" \
+  --model_name "$MODEL_NAME" \
+  --env "${ENVIRONMENT:-all}" \
+  --mine_only

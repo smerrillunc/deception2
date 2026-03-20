@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Build reduced temporal features with consistent naming:
-  - before_{feature_name}_{stat}
-  - at_{feature_name}
-  - after_{feature_name}_{stat}
+Build sentence-level deception features.
 
 Design goals:
-  1) Keep a reduced set of high-signal features across structural/lexical,
-     entropy-logit, activation, and attention families.
-  2) Emit a consistent temporal schema for all families.
-  3) Run raw extraction and temporal reduction end-to-end in one script.
+  1) Keep each output row at the sentence level, keyed by example_id and sentence_idx.
+  2) Emit only sentence-level aggregates from the current sentence.
+  3) Keep structural/lexical, entropy-logit, activation, and attention families in one pass.
+  4) Leave before/after windowing to downstream scripts.
 """
 
 from __future__ import annotations
@@ -18,7 +15,6 @@ import argparse
 import json
 import random
 import re
-import tempfile
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -149,6 +145,97 @@ def text_features(text: str) -> Dict[str, Any]:
     }
 
 
+def think_close_span_from_text(text: Any) -> Optional[Tuple[int, int]]:
+    if not isinstance(text, str):
+        return None
+    close_tag = "</think>"
+    close_start = text.find(close_tag)
+    if close_start < 0:
+        return None
+    return close_start, close_start + len(close_tag)
+
+
+def trim_text_after_think(text: Any) -> Tuple[Any, Optional[Tuple[int, int]]]:
+    close_span = think_close_span_from_text(text)
+    if close_span is None or not isinstance(text, str):
+        return text, close_span
+    return text[: close_span[1]], close_span
+
+
+def think_close_span(record: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
+    raw_text = record.get("raw_text") or ""
+    return think_close_span_from_text(raw_text)
+
+
+def trim_sentences_after_think(
+    raw_text: str,
+    sentences: Sequence[Mapping[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]], Optional[Tuple[int, int]]]:
+    trimmed_text, close_span = trim_text_after_think(raw_text)
+    if close_span is None or not isinstance(trimmed_text, str):
+        return raw_text, [dict(s) for s in sentences], close_span
+
+    _, close_end = close_span
+    trimmed_sentences: List[Dict[str, Any]] = []
+    for sent in sentences:
+        try:
+            start = int(sent.get("start"))
+            end = int(sent.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if start >= close_end:
+            continue
+
+        new_end = min(end, close_end)
+        if new_end <= start:
+            continue
+
+        trimmed_sent = dict(sent)
+        trimmed_sent["start"] = start
+        trimmed_sent["end"] = new_end
+        if end > close_end or not isinstance(trimmed_sent.get("sentence_text"), str):
+            trimmed_sent["sentence_text"] = trimmed_text[start:new_end]
+        trimmed_sentences.append(trimmed_sent)
+
+    return trimmed_text, trimmed_sentences, close_span
+
+
+def trim_history_after_think(record: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    close_span = think_close_span(record)
+    history = list(record.get("history") or [])
+    if close_span is None:
+        return history
+
+    _, close_end = close_span
+    trimmed: List[Dict[str, Any]] = []
+    for item in history:
+        span = item.get("char_span")
+        if isinstance(span, (list, tuple)) and len(span) == 2 and span[1] is not None:
+            try:
+                span_end = int(span[1])
+            except (TypeError, ValueError):
+                trimmed.append(item)
+                continue
+            if span_end <= close_end:
+                trimmed.append(item)
+        else:
+            trimmed.append(item)
+    return trimmed
+
+
+def trim_result_after_think(record: Mapping[str, Any]) -> Dict[str, Any]:
+    trimmed_history = trim_history_after_think(record)
+    trimmed = dict(record)
+    raw_text, close_span = trim_text_after_think(trimmed.get("raw_text"))
+    if isinstance(raw_text, str):
+        trimmed["raw_text"] = raw_text
+    trimmed["history"] = trimmed_history
+    trimmed["full_score"] = trimmed_history[-1] if trimmed_history else None
+    trimmed["think_close_span"] = close_span
+    trimmed["dropped_probe_count"] = len(record.get("history") or []) - len(trimmed_history)
+    return trimmed
+
+
 def load_localization_history(loc_source: Optional[str]) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """
     Returns: {example_id: {sentence_idx: history_entry}}
@@ -196,6 +283,7 @@ def load_localization_history(loc_source: Optional[str]) -> Dict[str, Dict[int, 
                     data = json.loads(line)
                 except Exception:
                     continue
+                data = trim_result_after_think(data)
                 example_id = data.get("example_id")
                 history = data.get("history") or []
                 if not example_id:
@@ -213,6 +301,7 @@ def load_localization_history(loc_source: Optional[str]) -> Dict[str, Dict[int, 
             data = json.loads(fp.read_text(encoding="utf-8"))
         except Exception:
             continue
+        data = trim_result_after_think(data)
         example_id = data.get("example_id")
         history = data.get("history") or []
         if not example_id:
@@ -290,22 +379,22 @@ DEFAULT_ACTIVATION_BASE = [
 ]
 
 DEFAULT_ATTENTION_BASE = [
-    "attn_rawmean__d1__in_long_mass",
-    "attn_rawmean__d1__out_long_mass",
-    "attn_rawmean__d1__anchor_ratio",
-    "attn_rawmean__d2__in_long_entropy",
-    "attn_rawmean__d2__out_long_entropy",
-    "attn_roll__d1__in_long_mass",
-    "attn_roll__d1__out_long_mass",
-    "attn_roll__d1__anchor_ratio",
-    "attn_roll__d2__in_long_entropy",
-    "attn_roll__d2__out_long_entropy",
+    "attn_d1_in_long_mass_mean",
+    "attn_d1_out_long_mass_mean",
+    "attn_d1_anchor_ratio_mean",
+    "attn_d2_in_long_entropy_mean",
+    "attn_d2_out_long_entropy_mean",
+    "attn_d1_in_long_mass_roll",
+    "attn_d1_out_long_mass_roll",
+    "attn_d1_anchor_ratio_roll",
+    "attn_d2_in_long_entropy_roll",
+    "attn_d2_out_long_entropy_roll",
 ]
 
 FAMILY_ORDER = ["structural", "lexical", "entropy", "activation", "attention"]
 DEFAULT_SENTENCE_LEVEL_STATS = ("mean", "max", "min", "std")
-DEFAULT_TEMPORAL_AGG_STATS = ("mean", "max", "min", "std")
 VALID_STATS = {"mean", "max", "min", "std"}
+HEAD_LONG_RANGE_MASS_THRESHOLD = 0.10
 
 
 def _parse_cols_arg(raw: str | None, default: Sequence[str]) -> List[str]:
@@ -494,25 +583,6 @@ def _lexicon_fraction(text: str, lexicon: set[str]) -> float:
     return float(hits / len(toks))
 
 
-def _rolling_nan_mean_var(arr: np.ndarray, radius: int) -> Tuple[np.ndarray, np.ndarray]:
-    arr = np.asarray(arr, dtype=np.float64)
-    n = arr.size
-    out_mean = np.full(n, np.nan, dtype=np.float64)
-    out_var = np.full(n, np.nan, dtype=np.float64)
-    if n == 0:
-        return out_mean, out_var
-    for i in range(n):
-        lo = max(0, i - radius)
-        hi = min(n, i + radius + 1)
-        vals = arr[lo:hi]
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            continue
-        out_mean[i] = float(vals.mean())
-        out_var[i] = float(vals.var())
-    return out_mean, out_var
-
-
 def _sentence_attention_matrix(attn_tt: "torch.Tensor", token_sent: "torch.Tensor", n_sent: int) -> "torch.Tensor":
     import torch
 
@@ -536,6 +606,48 @@ def _sentence_attention_matrix(attn_tt: "torch.Tensor", token_sent: "torch.Tenso
     m = torch.zeros((n_sent, n_sent), device=attn_tt.device, dtype=torch.float32)
     m.index_add_(0, sent_ids, vq)
     m = m / counts_safe.view(-1, 1)
+    return m
+
+
+def _sentence_attention_tensor_by_head(
+    attn_htt: "torch.Tensor",
+    token_sent: "torch.Tensor",
+    n_sent: int,
+) -> "torch.Tensor":
+    import torch
+
+    valid = token_sent >= 0
+    if valid.sum().item() == 0:
+        return torch.zeros(
+            (attn_htt.shape[0], n_sent, n_sent),
+            device=attn_htt.device,
+            dtype=torch.float32,
+        )
+
+    valid_idx = torch.nonzero(valid, as_tuple=True)[0]
+    sent_ids = token_sent[valid]
+
+    counts = torch.bincount(sent_ids, minlength=n_sent).to(torch.float32)
+    counts_safe = counts.clone()
+    counts_safe[counts_safe == 0] = 1.0
+
+    a_valid = attn_htt[:, :, valid_idx].to(torch.float32)
+    v = torch.zeros(
+        (attn_htt.shape[0], attn_htt.shape[1], n_sent),
+        device=attn_htt.device,
+        dtype=torch.float32,
+    )
+    v.index_add_(2, sent_ids, a_valid)
+    v = v / counts_safe.view(1, 1, -1)
+
+    vq = v[:, valid_idx, :]
+    m = torch.zeros(
+        (attn_htt.shape[0], n_sent, n_sent),
+        device=attn_htt.device,
+        dtype=torch.float32,
+    )
+    m.index_add_(1, sent_ids, vq)
+    m = m / counts_safe.view(1, -1, 1)
     return m
 
 
@@ -563,6 +675,61 @@ def _attention_rollout_safe(attn_layers: Sequence["torch.Tensor"], add_residual:
 
     r = r / (r.sum(dim=-1, keepdim=True) + eps)
     return torch.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _reduce_stat_stack(values: np.ndarray, stat: str) -> np.ndarray:
+    if values.ndim != 2:
+        raise ValueError(f"Expected 2D stack, got shape {values.shape}")
+    if stat == "mean":
+        return np.nanmean(values, axis=0)
+    if stat == "max":
+        return np.nanmax(values, axis=0)
+    if stat == "min":
+        return np.nanmin(values, axis=0)
+    if stat == "std":
+        return np.nanstd(values, axis=0)
+    raise ValueError(f"Unsupported stat: {stat}")
+
+
+def _summarize_head_metric_matrix(
+    values: np.ndarray,
+    *,
+    long_range_threshold: float | None = None,
+) -> Dict[str, np.ndarray]:
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError(f"Expected [heads, sentences], got {values.shape}")
+
+    n_heads = max(int(values.shape[0]), 1)
+    mean = np.nanmean(values, axis=0)
+    centered = values - mean[None, :]
+
+    out = {
+        "var": np.nanvar(values, axis=0),
+        "max_anom": np.nanmax(np.abs(centered), axis=0),
+        "norm": np.linalg.norm(np.nan_to_num(values, nan=0.0), axis=0) / np.sqrt(float(n_heads)),
+    }
+
+    pos_vals = np.clip(np.nan_to_num(values, nan=0.0), 0.0, None)
+    entropy = np.zeros(values.shape[1], dtype=np.float64)
+    top2_share = np.zeros(values.shape[1], dtype=np.float64)
+    for sent_idx in range(values.shape[1]):
+        head_vals = pos_vals[:, sent_idx]
+        total = float(head_vals.sum())
+        if total <= 0.0:
+            continue
+        p = head_vals / total
+        entropy[sent_idx] = _safe_entropy_from_probs(p)
+        topk = min(2, head_vals.size)
+        top2_share[sent_idx] = float(np.sort(head_vals)[-topk:].sum() / total)
+
+    out["entropy"] = entropy
+    out["top2_share"] = top2_share
+
+    if long_range_threshold is not None:
+        out["frac_long"] = np.nanmean(values > float(long_range_threshold), axis=0)
+
+    return out
 
 
 def _mine_sentence_matrix(m: np.ndarray, min_dist: int, topk: int = 3) -> Dict[str, np.ndarray]:
@@ -682,6 +849,34 @@ def _aggregate_tok_by_sentence(values: np.ndarray, sent_idx: np.ndarray, n_sent:
     return out
 
 
+def _normalize_feature_name(name: str) -> str:
+    out = str(name)
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out
+
+
+def _make_attention_feature_name(channel: str, distance: int, feature_name: str) -> str:
+    suffix_lookup = {
+        "attn_rawmean": "mean",
+        "attn_rawmax": "max",
+        "attn_roll": "roll",
+    }
+    suffix = suffix_lookup[channel]
+    return _normalize_feature_name(f"attn_d{int(distance)}_{feature_name}_{suffix}")
+
+
+def _make_head_attention_feature_name(
+    distance: int,
+    metric_name: str,
+    head_stat: str,
+    layer_stat: str,
+) -> str:
+    return _normalize_feature_name(
+        f"attn_head_d{int(distance)}_{metric_name}_{head_stat}_{layer_stat}"
+    )
+
+
 def _compute_token_and_attention_features(
     raw_text: str,
     sentence_spans: List[Dict[str, Any]],
@@ -787,8 +982,6 @@ def _compute_token_and_attention_features(
         ent_delta[2:] = d
         ent_posdiff[2:] = np.maximum(d, 0.0)
 
-    roll_mean, roll_var = _rolling_nan_mean_var(ent_tok, radius=3)
-
     rows: Dict[int, Dict[str, Any]] = {i: {} for i in range(n_sent)}
     mapped = tok_to_sent >= 0
     token_sent = tok_to_sent.copy()
@@ -810,8 +1003,6 @@ def _compute_token_and_attention_features(
         "tok_logit_std": logit_std_tok,
         "tok_entropy_delta": ent_delta,
         "tok_entropy_posdiff": ent_posdiff,
-        "tok_entropy_roll_mean": roll_mean,
-        "tok_entropy_roll_var": roll_var,
     }
 
     for name, arr in metrics.items():
@@ -936,9 +1127,52 @@ def _compute_token_and_attention_features(
         for d in min_dist_list:
             mined = _mine_sentence_matrix(mm, min_dist=int(d), topk=3)
             for feat, arr in mined.items():
-                col = f"{chan}__d{int(d)}__{feat}"
+                col = _make_attention_feature_name(chan, int(d), feat)
                 for s in range(n_sent):
                     rows[s][col] = float(arr[s])
+
+    head_feature_layers: Dict[Tuple[int, str, str], List[np.ndarray]] = defaultdict(list)
+    head_metrics = (
+        "in_long_mass",
+        "out_long_mass",
+        "anchor_ratio",
+        "in_long_entropy",
+        "out_long_entropy",
+    )
+    for idx in layer_ids:
+        layer_attn = attn_layers[idx][0].detach().to(device=compute_device, dtype=torch.float32)
+        head_sentence = _sentence_attention_tensor_by_head(layer_attn, token_sent_t, n_sent)
+        head_sentence = torch.nan_to_num(head_sentence, nan=0.0, posinf=0.0, neginf=0.0)
+        head_sentence_np = head_sentence.detach().cpu().numpy()
+
+        for d in min_dist_list:
+            per_metric_heads: Dict[str, List[np.ndarray]] = {name: [] for name in head_metrics}
+            for head_idx in range(head_sentence_np.shape[0]):
+                mined = _mine_sentence_matrix(head_sentence_np[head_idx], min_dist=int(d), topk=3)
+                for metric_name in head_metrics:
+                    per_metric_heads[metric_name].append(mined[metric_name])
+
+            for metric_name, values_by_head in per_metric_heads.items():
+                if not values_by_head:
+                    continue
+                stacked = np.stack(values_by_head, axis=0)
+                summary = _summarize_head_metric_matrix(
+                    stacked,
+                    long_range_threshold=HEAD_LONG_RANGE_MASS_THRESHOLD
+                    if metric_name.endswith("long_mass")
+                    else None,
+                )
+                for head_stat, arr in summary.items():
+                    head_feature_layers[(int(d), metric_name, head_stat)].append(arr)
+
+    for (distance, metric_name, head_stat), layer_values in head_feature_layers.items():
+        stacked = np.stack(layer_values, axis=0)
+        for stat in DEFAULT_SENTENCE_LEVEL_STATS:
+            agg = _reduce_stat_stack(stacked, stat)
+            col = _make_head_attention_feature_name(distance, metric_name, head_stat, stat)
+            for s in range(n_sent):
+                if np.isfinite(agg[s]):
+                    rows[s][col] = float(agg[s])
 
     return rows
 
@@ -1047,7 +1281,8 @@ def run_extract(cfg: ExtractConfig) -> pd.DataFrame:
             continue
 
         raw_text = ex.get("action_reasoning") or ex.get("action_raw_text") or ""
-        sentence_spans = [{"start": s.get("start"), "end": s.get("end")} for s in sents]
+        raw_text, sents_trimmed, _ = trim_sentences_after_think(raw_text, sents)
+        sentence_spans = [{"start": s.get("start"), "end": s.get("end")} for s in sents_trimmed]
 
         mined = {}
         cur_max_tokens = int(runtime_max_tokens)
@@ -1106,8 +1341,8 @@ def run_extract(cfg: ExtractConfig) -> pd.DataFrame:
                 print(f"[extract] warning ex={ex_id} failed: {type(e).__name__}", flush=True)
             continue
 
-        total_sent = len(sents)
-        for s in sents:
+        total_sent = len(sents_trimmed)
+        for s in sents_trimmed:
             sidx = int(s.get("sentence_idx", 0))
             rate = rates.get(sidx)
             if cfg.only_localized and rate is None:
@@ -1151,56 +1386,7 @@ def run_extract(cfg: ExtractConfig) -> pd.DataFrame:
             f"median_tok_count={float(tok_count.median()):.2f}",
             flush=True,
         )
-
-    attn_cols = [c for c in df.columns if c.startswith("attn_")]
-    z_data: Dict[str, pd.Series] = {}
-    for c in attn_cols:
-        g = df.groupby("example_id")[c]
-        mu = g.transform("mean")
-        sd = g.transform("std")
-        z_data[c + "__z"] = (pd.to_numeric(df[c], errors="coerce") - mu) / (sd + 1e-8)
-    if z_data:
-        df = pd.concat([df, pd.DataFrame(z_data, index=df.index)], axis=1)
-
-    cfg.out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(cfg.out_path, index=False)
-    print(f"[extract] wrote {cfg.out_path} shape={df.shape}", flush=True)
     return df
-
-
-def _rolling_stat_grouped(
-    source: pd.Series,
-    groups: pd.Series,
-    *,
-    window: int,
-    stat: str,
-    reverse: bool = False,
-) -> pd.Series:
-    if window <= 0:
-        return pd.Series(np.nan, index=source.index, dtype=float)
-
-    s = source
-    g = groups
-    if reverse:
-        s = s.iloc[::-1]
-        g = g.iloc[::-1]
-
-    min_periods = 2 if stat == "std" else 1
-    rolling = s.groupby(g, sort=False).rolling(window=window, min_periods=min_periods)
-    if stat == "mean":
-        out = rolling.mean().reset_index(level=0, drop=True)
-    elif stat == "min":
-        out = rolling.min().reset_index(level=0, drop=True)
-    elif stat == "max":
-        out = rolling.max().reset_index(level=0, drop=True)
-    elif stat == "std":
-        out = rolling.std().reset_index(level=0, drop=True)
-    else:
-        raise ValueError(f"Unsupported rolling stat: {stat}")
-
-    if reverse:
-        out = out.iloc[::-1]
-    return out.reindex(source.index)
 
 
 _STAT_SUFFIX_RE = re.compile(r"^(.*)_(mean|max|min|std)$")
@@ -1213,94 +1399,38 @@ def _base_name_from_col(col: str) -> Tuple[str, str | None]:
     return m.group(1), m.group(2)
 
 
-def _build_sentence_level_feature_frame(
+def _expand_sentence_feature_columns(
     df: pd.DataFrame,
     cols: Sequence[str],
     *,
     sentence_level_stats: Sequence[str],
-) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Build sentence-level stat features per base feature so every base has
-    *_mean/*_max/*_min/*_std representation.
-    """
-    out = pd.DataFrame(index=df.index)
-    built_cols: List[str] = []
-    seen = set()
+) -> List[str]:
+    expanded: List[str] = []
+    seen: set[str] = set()
 
     for col in cols:
         if col not in df.columns:
             continue
 
         base_name, detected_stat = _base_name_from_col(col)
-        src_raw = pd.to_numeric(df[col], errors="coerce")
+        candidates: List[str]
+        if detected_stat is not None:
+            candidates = [
+                f"{base_name}_{stat}"
+                for stat in sentence_level_stats
+                if f"{base_name}_{stat}" in df.columns
+            ]
+            if not candidates:
+                candidates = [col]
+        else:
+            candidates = [col]
 
-        for st in sentence_level_stats:
-            out_col = f"{base_name}_{st}"
-            if out_col in seen:
-                continue
+        for candidate in candidates:
+            if candidate not in seen:
+                expanded.append(candidate)
+                seen.add(candidate)
 
-            sibling = f"{base_name}_{st}"
-            if sibling in df.columns:
-                src = pd.to_numeric(df[sibling], errors="coerce")
-            elif detected_stat == st:
-                src = src_raw
-            elif st in ("mean", "max", "min"):
-                # For scalar sentence-level features, reuse the scalar value.
-                src = src_raw
-            else:
-                # std fallback for scalar sentence-level features.
-                src = pd.Series(0.0, index=df.index, dtype=float)
-
-            out[out_col] = src.astype(float)
-            built_cols.append(out_col)
-            seen.add(out_col)
-
-    return out, built_cols
-
-
-def _temporalize_column(
-    df: pd.DataFrame,
-    col: str,
-    *,
-    before_window: int,
-    after_window: int,
-    include_diff: bool,
-    temporal_agg_stats: Sequence[str],
-) -> pd.DataFrame:
-    vals = pd.to_numeric(df[col], errors="coerce")
-    groups = df["example_id"].astype(str)
-    grp = vals.groupby(groups, sort=False)
-
-    before_src = grp.shift(1)
-    after_src = grp.shift(-1)
-
-    out = pd.DataFrame(index=df.index)
-    out[f"at_{col}"] = vals.astype(float)
-
-    for stat in temporal_agg_stats:
-        out[f"before_{col}_{stat}"] = _rolling_stat_grouped(
-            before_src,
-            groups,
-            window=before_window,
-            stat=stat,
-            reverse=False,
-        )
-        out[f"after_{col}_{stat}"] = _rolling_stat_grouped(
-            after_src,
-            groups,
-            window=after_window,
-            stat=stat,
-            reverse=True,
-        )
-
-    if include_diff:
-        out[f"before_{col}_mean_minus_at"] = out[f"before_{col}_mean"] - out[f"at_{col}"]
-        out[f"after_{col}_mean_minus_at"] = out[f"after_{col}_mean"] - out[f"at_{col}"]
-        out[f"after_{col}_mean_minus_before_mean"] = (
-            out[f"after_{col}_mean"] - out[f"before_{col}_mean"]
-        )
-
-    return out
+    return expanded
 
 
 def _resolve_bases(
@@ -1342,15 +1472,11 @@ def _build_feature_sets(generated_by_family: Mapping[str, Sequence[str]]) -> Ord
     return feature_sets
 
 
-def build_temporal_reduced_features(
+def build_sentence_feature_outputs(
     df: pd.DataFrame,
     *,
     base_by_family: Mapping[str, Sequence[str]],
-    before_window: int,
-    after_window: int,
-    include_diff: bool,
     sentence_level_stats: Sequence[str],
-    temporal_agg_stats: Sequence[str],
 ) -> Tuple[pd.DataFrame, OrderedDict, Dict[str, List[str]], Dict[str, List[str]]]:
     if "example_id" not in df.columns:
         raise ValueError("Input DataFrame must contain example_id.")
@@ -1365,37 +1491,33 @@ def build_temporal_reduced_features(
     work = work.sort_values(["example_id", "sentence_idx"], kind="stable").reset_index(drop=True)
 
     available, missing = _resolve_bases(work, base_by_family)
-
-    meta_cols = [
-        c
-        for c in ["example_id", "sentence_idx", "deception_rate", "sentence_position", "total_sentences"]
-        if c in work.columns
-    ]
-
-    out_frames = [work[meta_cols].copy()]
     generated_by_family: Dict[str, List[str]] = {fam: [] for fam in FAMILY_ORDER}
 
     for fam in FAMILY_ORDER:
         cols = available.get(fam, [])
-        sentence_df, sentence_cols = _build_sentence_level_feature_frame(
+        sentence_cols = _expand_sentence_feature_columns(
             work,
             cols,
             sentence_level_stats=sentence_level_stats,
         )
-        fam_df = pd.concat([work[["example_id"]], sentence_df], axis=1)
-        for col in sentence_cols:
-            tdf = _temporalize_column(
-                fam_df,
-                col,
-                before_window=before_window,
-                after_window=after_window,
-                include_diff=include_diff,
-                temporal_agg_stats=temporal_agg_stats,
-            )
-            out_frames.append(tdf)
-            generated_by_family[fam].extend(tdf.columns.tolist())
+        generated_by_family[fam].extend(sentence_cols)
 
-    out_df = pd.concat(out_frames, axis=1)
+    key_cols = [
+        c
+        for c in [
+            "example_id",
+            "sentence_idx",
+            "deception_rate",
+            "sentence_position",
+            "total_sentences",
+            "tok_max_tokens_used",
+            "tok_oom_retries",
+            "tok_fp32_enforced",
+        ]
+        if c in work.columns
+    ]
+    other_cols = [col for col in work.columns if col not in key_cols]
+    out_df = work[key_cols + other_cols]
     feature_sets = _build_feature_sets(generated_by_family)
     return out_df, feature_sets, generated_by_family, missing
 
@@ -1406,14 +1528,53 @@ def _write_json(path: Path, payload: object) -> None:
         json.dump(payload, f, indent=2, sort_keys=False)
 
 
+def _write_sentence_feature_tables(
+    df: pd.DataFrame,
+    *,
+    out_path: Path,
+    raw_out_path: Path | None,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(out_path, index=False)
+    print(f"[extract-build] wrote sentence features: {out_path} shape={df.shape}", flush=True)
+
+    if raw_out_path is not None and raw_out_path != out_path:
+        raw_out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(raw_out_path, index=False)
+        print(f"[extract-build] wrote duplicate raw output: {raw_out_path}", flush=True)
+
+
+def _derive_attention_base_columns(df: pd.DataFrame) -> Tuple[List[str], Dict[str, object]]:
+    base_cols = [c for c in DEFAULT_ATTENTION_BASE if c in df.columns]
+    head_cols = sorted(c for c in df.columns if c.startswith("attn_head_"))
+    selected = _unique(base_cols + head_cols)
+    if not selected:
+        selected = sorted(c for c in df.columns if c.startswith("attn_"))
+
+    meta = {
+        "attention_base_source": "default_plus_head_summaries" if head_cols else "default",
+        "head_summary_feature_count": len(head_cols),
+        "selected_attention_feature_count": len(selected),
+    }
+    return selected, meta
+
+
 def _build_base_by_family_from_args(
     args: argparse.Namespace,
     df: pd.DataFrame,
-) -> Tuple[Dict[str, List[str]], Dict[str, object]]:
+) -> Tuple[Dict[str, List[str]], Dict[str, object], Dict[str, object]]:
     structural = _parse_cols_arg(args.structural_cols, DEFAULT_STRUCTURAL_BASE)
     lexical = _parse_cols_arg(args.lexical_cols, DEFAULT_LEXICAL_BASE)
     entropy = _parse_cols_arg(args.entropy_cols, DEFAULT_ENTROPY_BASE)
-    attention = _parse_cols_arg(args.attention_cols, DEFAULT_ATTENTION_BASE)
+    if args.attention_cols is not None:
+        attention = _parse_cols_arg(args.attention_cols, DEFAULT_ATTENTION_BASE)
+        attention_meta: Dict[str, object] = {
+            "attention_base_source": "explicit_cols",
+            "head_summary_feature_count": int(sum(col.startswith("attn_head_") for col in attention)),
+            "selected_attention_feature_count": len(attention),
+        }
+    else:
+        attention, attention_meta = _derive_attention_base_columns(df)
 
     if args.activation_cols is not None:
         activation = _parse_cols_arg(args.activation_cols, DEFAULT_ACTIVATION_BASE)
@@ -1436,15 +1597,11 @@ def _build_base_by_family_from_args(
         "activation": activation,
         "attention": attention,
     }
-    return base_by_family, activation_meta
+    return base_by_family, activation_meta, attention_meta
 
 
-def _add_temporal_args(ap: argparse.ArgumentParser) -> None:
-    ap.add_argument("--before-window", type=int, default=3)
-    ap.add_argument("--after-window", type=int, default=3)
+def _add_feature_catalog_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--sentence-level-stats", type=str, default="mean,max,min,std")
-    ap.add_argument("--temporal-agg-stats", type=str, default="mean,max,min,std")
-    ap.add_argument("--no-diff", action="store_true", default=False)
     ap.add_argument("--structural-cols", type=str, default=None)
     ap.add_argument("--lexical-cols", type=str, default=None)
     ap.add_argument("--entropy-cols", type=str, default=None)
@@ -1461,8 +1618,8 @@ def _add_extract_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--model-name", type=str, required=True)
     ap.add_argument("--num-examples", type=int, default=100000)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--only-localized", action="store_true", default=True)
-    ap.add_argument("--max-tokens", type=int, default=10000)
+    ap.add_argument("--only-localized", action="store_true", default=False)
+    ap.add_argument("--max-tokens", type=int, default=3000)
     ap.add_argument("--topk-vocab", type=int, default=32)
     ap.add_argument("--min-dist-list", type=str, default="1,2,4")
     ap.add_argument("--attention-layer-offsets", type=str, default="-1,-2,-3")
@@ -1484,13 +1641,8 @@ def _add_extract_args(ap: argparse.ArgumentParser) -> None:
 
 
 def _run_extract_build(args: argparse.Namespace) -> None:
-    raw_out_path: Path
-    if args.raw_out_path is not None:
-        raw_out_path = args.raw_out_path
-        raw_out_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        tmpdir = Path(tempfile.mkdtemp(prefix="temporal_reduced_raw_"))
-        raw_out_path = tmpdir / "raw_features.parquet"
+    out_path: Path = args.out_path
+    raw_out_path = args.raw_out_path
 
     min_dist_list = _parse_int_tuple(args.min_dist_list, "min-dist-list")
     layer_offsets = _parse_int_tuple(args.attention_layer_offsets, "attention-layer-offsets")
@@ -1529,7 +1681,7 @@ def _run_extract_build(args: argparse.Namespace) -> None:
         examples_path=args.examples_path,
         sentences_path=args.sentences_path,
         localization_path=args.localization_path,
-        out_path=raw_out_path,
+        out_path=out_path,
         model_name=args.model_name,
         num_examples=args.num_examples,
         seed=args.seed,
@@ -1547,45 +1699,37 @@ def _run_extract_build(args: argparse.Namespace) -> None:
         token_min_tokens=args.token_min_tokens,
     )
 
-    print("[extract-build] running raw extraction...", flush=True)
+    print("[extract-build] running sentence-level extraction...", flush=True)
     raw_df = run_extract(cfg)
-    print(f"[extract-build] raw extraction complete shape={raw_df.shape}", flush=True)
+    print(f"[extract-build] extraction complete shape={raw_df.shape}", flush=True)
 
-    # Reuse build path from in-memory DataFrame.
-    base_by_family, activation_meta = _build_base_by_family_from_args(args, df=raw_df)
-    include_diff = not args.no_diff
+    base_by_family, activation_meta, attention_meta = _build_base_by_family_from_args(args, df=raw_df)
     sentence_level_stats = _parse_stats_arg(args.sentence_level_stats, "sentence-level-stats")
-    temporal_agg_stats = _parse_stats_arg(args.temporal_agg_stats, "temporal-agg-stats")
-    out_df, feature_sets, generated_by_family, missing = build_temporal_reduced_features(
+    out_df, feature_sets, generated_by_family, missing = build_sentence_feature_outputs(
         raw_df,
         base_by_family=base_by_family,
-        before_window=args.before_window,
-        after_window=args.after_window,
-        include_diff=include_diff,
         sentence_level_stats=sentence_level_stats,
-        temporal_agg_stats=temporal_agg_stats,
     )
-
-    out_path: Path = args.out_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_parquet(out_path, index=False)
-    print(f"[extract-build] wrote temporal features: {out_path} shape={out_df.shape}", flush=True)
 
     feature_sets_out = args.feature_sets_out or out_path.with_name(out_path.stem + "_feature_sets.json")
     manifest_out = args.manifest_out or out_path.with_name(out_path.stem + "_manifest.json")
+    _write_sentence_feature_tables(
+        out_df,
+        out_path=out_path,
+        raw_out_path=raw_out_path,
+    )
     _write_json(feature_sets_out, feature_sets)
     manifest = {
-        "raw_output_path": str(raw_out_path),
+        "output_mode": "sentence_level",
+        "row_keys": ["example_id", "sentence_idx"],
+        "raw_output_path": str(raw_out_path or out_path),
         "output_features": str(out_path),
-        "before_window": int(args.before_window),
-        "after_window": int(args.after_window),
-        "include_diff": bool(include_diff),
         "sentence_level_stats": list(sentence_level_stats),
-        "temporal_agg_stats": list(temporal_agg_stats),
         "requested_base_features": base_by_family,
         "missing_base_features": missing,
         "activation_extraction": act_layer_meta,
         "activation_selection": activation_meta,
+        "attention_selection": attention_meta,
         "generated_feature_counts": {k: len(v) for k, v in generated_by_family.items()},
         "generated_feature_sets": {k: len(v) for k, v in feature_sets.items()},
     }
@@ -1595,10 +1739,10 @@ def _run_extract_build(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Build sentence-level deception features.")
     ap.add_argument("--out-path", type=Path, required=True)
     _add_extract_args(ap)
-    _add_temporal_args(ap)
+    _add_feature_catalog_args(ap)
     args = ap.parse_args()
     _run_extract_build(args)
 

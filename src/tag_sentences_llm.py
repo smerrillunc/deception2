@@ -16,9 +16,6 @@ try:
     from utils import extract_json_with_reasoning
 except Exception:
     def extract_json_with_reasoning(text: str) -> dict:
-        """
-        Lightweight fallback parser so this script doesn't hard-require vLLM.
-        """
         match = re.search(r"\{[\s\S]*?\}", text)
         if not match:
             raise ValueError("No JSON object found in text.")
@@ -32,6 +29,7 @@ except Exception:
         reasoning = (text[:match.start()] + text[match.end():]).strip()
         data["reasoning"] = reasoning
         return data
+
 
 SYSTEM_PROMPT = "You are a sentence classifier. Output JSON only."
 
@@ -370,12 +368,12 @@ def main(argv=None):
             if args.limit and count >= args.limit:
                 break
             count += 1
-            sentence = rec.get("sentence_text", "")
-            prompt = build_sentence_prompt(sentence, taxonomy)
+            prompt = build_sentence_prompt(rec.get("sentence_text", ""), taxonomy)
             parsed = _call_model(prompt)
+            print(parsed)
             yield _to_out_record(rec, parsed)
 
-    write_jsonl(_records(), args.out_path)
+    write_jsonl(args.out_path, _records())
     print(f"Wrote tags: {args.out_path}")
 
 

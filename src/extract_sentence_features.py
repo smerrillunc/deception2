@@ -4,12 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 from collections import defaultdict
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sentence_pipeline import read_jsonl, write_jsonl
 
@@ -55,9 +54,6 @@ def text_features(text: str) -> Dict[str, Any]:
 
 
 def load_localization_history(loc_source: Optional[str]) -> Dict[str, Dict[int, Dict[str, Any]]]:
-    """
-    Returns: {example_id: {sentence_idx: history_entry}}
-    """
     if not loc_source:
         return {}
 
@@ -80,11 +76,11 @@ def load_localization_history(loc_source: Optional[str]) -> Dict[str, Dict[int, 
 
     def _history_map(history: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
         mapped: Dict[int, Dict[str, Any]] = {}
-        for h in history:
-            idx = _history_idx(h)
+        for item in history:
+            idx = _history_idx(item)
             if idx is None:
                 continue
-            mapped[idx] = h
+            mapped[idx] = item
         return mapped
 
     loc_map: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -135,16 +131,12 @@ def _map_tokens_to_sentences(
     offsets: List[Tuple[int, int]],
     sentence_spans: List[Dict[str, Any]],
 ) -> List[int]:
-    """
-    Map each token to a sentence index using token character offsets.
-    Returns a list of length len(offsets) with sentence indices or -1 for unmapped tokens.
-    """
     token_to_sentence: List[int] = [-1] * len(offsets)
     if not offsets or not sentence_spans:
         return token_to_sentence
 
     sent_idx = 0
-    for i, (start, end) in enumerate(offsets):
+    for idx, (start, end) in enumerate(offsets):
         if start == end:
             continue
         mid = (start + end) / 2.0
@@ -153,7 +145,7 @@ def _map_tokens_to_sentences(
         if sent_idx >= len(sentence_spans):
             break
         if sentence_spans[sent_idx]["start"] <= mid < sentence_spans[sent_idx]["end"]:
-            token_to_sentence[i] = sent_idx
+            token_to_sentence[idx] = sent_idx
     return token_to_sentence
 
 
@@ -204,19 +196,9 @@ def _compute_downstream_attention_features(
     add_special_tokens: bool = False,
     min_sentence_distance: int = 4,
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
-    """
-    Compute per-sentence attention features inspired by "Thought Anchors":
-    For each layer/head, average token-token attention into a sentence-sentence matrix
-    and measure the mean of columns below the diagonal (downstream attention received),
-    only considering sentence pairs at least `min_sentence_distance` apart.
-    Returns:
-      - dict: {sentence_idx: feature_dict}
-      - meta: info about tokenization/truncation
-    """
     if not raw_text or not sentence_spans:
         return {}, {"attn_truncated": False, "attn_num_tokens": 0}
 
-    # Lazy import to keep script usable without transformers/torch unless enabled.
     import torch
 
     enc = tokenizer(
@@ -285,54 +267,48 @@ def _compute_downstream_attention_features(
     count_last = torch.zeros(num_sentences, device=device, dtype=torch.long)
     max_last = torch.full((num_sentences,), float("-inf"), device=device, dtype=torch.float32)
     total_heads = 0
-    last_layer_heads = 0
     head_kurtosis_all: List[float] = []
     head_kurtosis_last: List[float] = []
 
     for layer_idx, layer_attn in enumerate(attn_layers):
-        # layer_attn: [batch, heads, T, T]
         layer_attn = layer_attn[0].to(dtype=torch.float32)
         num_heads = layer_attn.shape[0]
         total_heads += num_heads
         is_last = layer_idx == (num_layers - 1)
-        if is_last:
-            last_layer_heads = num_heads
 
-        # Aggregate per-head downstream attention.
-        for h in range(num_heads):
-            A_h = layer_attn[h]
-            A_h_valid = A_h[:, valid_token_idx]
-            V_h = torch.zeros((A_h.shape[0], num_sentences), device=device, dtype=torch.float32)
-            V_h.index_add_(1, valid_sent_ids, A_h_valid)
-            V_h = V_h / token_counts_safe.to(dtype=torch.float32)
-            # Aggregate query tokens into sentence rows to form the sentence-sentence matrix.
-            M_h = torch.zeros((num_sentences, num_sentences), device=device, dtype=torch.float32)
-            V_h_valid = V_h[valid_token_idx]
-            M_h.index_add_(0, valid_sent_ids, V_h_valid)
-            M_h = M_h / token_counts_safe.to(dtype=torch.float32).view(-1, 1)
+        for head_idx in range(num_heads):
+            attn = layer_attn[head_idx]
+            attn_valid = attn[:, valid_token_idx]
+            sentence_matrix = torch.zeros((attn.shape[0], num_sentences), device=device, dtype=torch.float32)
+            sentence_matrix.index_add_(1, valid_sent_ids, attn_valid)
+            sentence_matrix = sentence_matrix / token_counts_safe.to(dtype=torch.float32)
+
+            sentence_sentence = torch.zeros((num_sentences, num_sentences), device=device, dtype=torch.float32)
+            sentence_matrix_valid = sentence_matrix[valid_token_idx]
+            sentence_sentence.index_add_(0, valid_sent_ids, sentence_matrix_valid)
+            sentence_sentence = sentence_sentence / token_counts_safe.to(dtype=torch.float32).view(-1, 1)
 
             downstream = torch.full((num_sentences,), float("nan"), device=device, dtype=torch.float32)
             for col in range(num_sentences):
                 if downstream_sentence_counts[col] == 0:
                     continue
-                downstream[col] = M_h[downstream_rows[col], col].mean()
+                downstream[col] = sentence_sentence[downstream_rows[col], col].mean()
 
-            valid_mask = torch.isfinite(downstream)
-            if valid_mask.any():
-                sum_all[valid_mask] += downstream[valid_mask]
-                count_all[valid_mask] += 1
-                max_all[valid_mask] = torch.maximum(max_all[valid_mask], downstream[valid_mask])
-                head_kurt = _kurtosis(downstream[valid_mask].tolist())
+            finite_mask = torch.isfinite(downstream)
+            if finite_mask.any():
+                sum_all[finite_mask] += downstream[finite_mask]
+                count_all[finite_mask] += 1
+                max_all[finite_mask] = torch.maximum(max_all[finite_mask], downstream[finite_mask])
+                head_kurt = _kurtosis(downstream[finite_mask].tolist())
                 if head_kurt is not None:
                     head_kurtosis_all.append(head_kurt)
-            if is_last:
-                if valid_mask.any():
-                    sum_last[valid_mask] += downstream[valid_mask]
-                    count_last[valid_mask] += 1
-                    max_last[valid_mask] = torch.maximum(max_last[valid_mask], downstream[valid_mask])
-                    head_kurt = _kurtosis(downstream[valid_mask].tolist())
-                    if head_kurt is not None:
-                        head_kurtosis_last.append(head_kurt)
+            if is_last and finite_mask.any():
+                sum_last[finite_mask] += downstream[finite_mask]
+                count_last[finite_mask] += 1
+                max_last[finite_mask] = torch.maximum(max_last[finite_mask], downstream[finite_mask])
+                head_kurt = _kurtosis(downstream[finite_mask].tolist())
+                if head_kurt is not None:
+                    head_kurtosis_last.append(head_kurt)
 
     if total_heads == 0:
         return {}, {"attn_truncated": truncated, "attn_num_tokens": int(input_ids.shape[1])}
@@ -345,12 +321,12 @@ def _compute_downstream_attention_features(
         mean_last = sum_last / torch.clamp(count_last.to(dtype=torch.float32), min=1.0)
 
     features_by_sentence: Dict[int, Dict[str, Any]] = {}
-    for s_idx in range(num_sentences):
-        tok_count = int(token_counts[s_idx].item())
-        down_token_count = downstream_token_counts[s_idx]
-        down_sent_count = downstream_sentence_counts[s_idx]
+    for sent_idx in range(num_sentences):
+        tok_count = int(token_counts[sent_idx].item())
+        down_token_count = downstream_token_counts[sent_idx]
+        down_sent_count = downstream_sentence_counts[sent_idx]
         if tok_count == 0 or down_sent_count == 0:
-            features_by_sentence[s_idx] = {
+            features_by_sentence[sent_idx] = {
                 "attn_token_count": tok_count,
                 "attn_downstream_token_count": down_token_count,
                 "attn_downstream_sentence_count": down_sent_count,
@@ -360,11 +336,11 @@ def _compute_downstream_attention_features(
                 "attn_downstream_last_layer_max": None,
             }
             continue
-        mean_val = mean_all[s_idx].item() if torch.isfinite(mean_all[s_idx]) else None
-        last_val = mean_last[s_idx].item() if torch.isfinite(mean_last[s_idx]) else None
-        max_val = max_all[s_idx].item() if torch.isfinite(max_all[s_idx]) else None
-        max_last_val = max_last[s_idx].item() if torch.isfinite(max_last[s_idx]) else None
-        features_by_sentence[s_idx] = {
+        mean_val = mean_all[sent_idx].item() if torch.isfinite(mean_all[sent_idx]) else None
+        last_val = mean_last[sent_idx].item() if torch.isfinite(mean_last[sent_idx]) else None
+        max_val = max_all[sent_idx].item() if torch.isfinite(max_all[sent_idx]) else None
+        max_last_val = max_last[sent_idx].item() if torch.isfinite(max_last[sent_idx]) else None
+        features_by_sentence[sent_idx] = {
             "attn_token_count": tok_count,
             "attn_downstream_token_count": down_token_count,
             "attn_downstream_sentence_count": down_sent_count,
@@ -386,16 +362,10 @@ def _compute_downstream_attention_features(
         "attn_head_kurtosis_min": head_stats["min"],
         "attn_head_kurtosis_max": head_stats["max"],
         "attn_head_kurtosis_count": head_stats["count"],
-        "attn_head_kurtosis_excess_mean": (
-            (head_stats["mean"] - 3.0) if head_stats["mean"] is not None else None
-        ),
+        "attn_head_kurtosis_excess_mean": ((head_stats["mean"] - 3.0) if head_stats["mean"] is not None else None),
         "attn_head_kurtosis_excess_std": head_stats["std"],
-        "attn_head_kurtosis_excess_min": (
-            (head_stats["min"] - 3.0) if head_stats["min"] is not None else None
-        ),
-        "attn_head_kurtosis_excess_max": (
-            (head_stats["max"] - 3.0) if head_stats["max"] is not None else None
-        ),
+        "attn_head_kurtosis_excess_min": ((head_stats["min"] - 3.0) if head_stats["min"] is not None else None),
+        "attn_head_kurtosis_excess_max": ((head_stats["max"] - 3.0) if head_stats["max"] is not None else None),
         "attn_head_kurtosis_last_layer_mean": head_last_stats["mean"],
         "attn_head_kurtosis_last_layer_std": head_last_stats["std"],
         "attn_head_kurtosis_last_layer_min": head_last_stats["min"],
@@ -423,19 +393,26 @@ def main(argv=None):
     parser.add_argument("--localization_path", type=str, default=None, help="JSON file or directory of sentence localization outputs.")
     parser.add_argument("--out_path", type=str, required=True)
     parser.add_argument("--context_window", type=int, default=1)
-    parser.add_argument("--label_strategy", type=str, default="delta_threshold",
-                        choices=["delta_threshold", "rate_threshold", "top_k", "none"])
+    parser.add_argument(
+        "--label_strategy",
+        type=str,
+        default="delta_threshold",
+        choices=["delta_threshold", "rate_threshold", "top_k", "none"],
+    )
     parser.add_argument("--delta_threshold", type=float, default=0.1)
     parser.add_argument("--rate_threshold", type=float, default=0.6)
     parser.add_argument("--top_k", type=int, default=1)
-    parser.add_argument("--localization_mode", type=str, default="auto",
-                        choices=["auto", "full", "adaptive"])
+    parser.add_argument("--localization_mode", type=str, default="auto", choices=["auto", "full", "adaptive"])
     parser.add_argument("--only_localized", action="store_true", default=False)
     parser.add_argument("--enable_attention_features", action="store_true", default=False)
     parser.add_argument("--attention_model_name", type=str, default=None)
     parser.add_argument("--attention_device", type=str, default=None)
-    parser.add_argument("--attention_dtype", type=str, default="auto",
-                        choices=["auto", "float16", "bfloat16", "float32"])
+    parser.add_argument(
+        "--attention_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "float16", "bfloat16", "float32"],
+    )
     parser.add_argument("--attention_max_tokens", type=int, default=0)
     parser.add_argument("--attention_min_sentence_distance", type=int, default=4)
     parser.add_argument("--attention_add_special_tokens", action="store_true", default=False)
@@ -445,17 +422,17 @@ def main(argv=None):
     examples = {ex["example_id"]: ex for ex in read_jsonl(args.examples_path) if "example_id" in ex}
 
     sentences_by_example: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for s in read_jsonl(args.sentences_path):
-        if "example_id" in s:
-            sentences_by_example[s["example_id"]].append(s)
-    for ex_id, items in sentences_by_example.items():
+    for sentence in read_jsonl(args.sentences_path):
+        if "example_id" in sentence:
+            sentences_by_example[sentence["example_id"]].append(sentence)
+    for _, items in sentences_by_example.items():
         items.sort(key=lambda x: x.get("sentence_idx", 0))
 
     tags_by_sentence: Dict[str, Dict[str, Any]] = {}
     if args.tags_path:
-        for t in read_jsonl(args.tags_path):
-            if "sentence_id" in t:
-                tags_by_sentence[t["sentence_id"]] = t
+        for tag in read_jsonl(args.tags_path):
+            if "sentence_id" in tag:
+                tags_by_sentence[tag["sentence_id"]] = tag
 
     loc_by_example = load_localization_history(args.localization_path)
 
@@ -463,23 +440,17 @@ def main(argv=None):
     attention_tokenizer = None
     attention_device = None
     if args.enable_attention_features:
-        # Lazy imports to avoid unnecessary dependencies when not needed.
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         attention_model_name = args.attention_model_name
         if not attention_model_name:
-            names = {
-                _pick_model_name(ex)
-                for ex in examples.values()
-                if _pick_model_name(ex)
-            }
+            names = {_pick_model_name(ex) for ex in examples.values() if _pick_model_name(ex)}
             if len(names) == 1:
                 attention_model_name = next(iter(names))
             else:
                 raise ValueError(
-                    "Could not infer a single model name. "
-                    "Please pass --attention_model_name explicitly."
+                    "Could not infer a single model name. Please pass --attention_model_name explicitly."
                 )
 
         if args.attention_device:
@@ -537,10 +508,9 @@ def main(argv=None):
         total_sentences = len(sentences)
         loc_map = loc_by_example.get(ex_id, {})
 
-        # Precompute localization rates and deltas
         deception_rates = {}
-        for s in sentences:
-            idx = int(s.get("sentence_idx", 0))
+        for sentence in sentences:
+            idx = int(sentence.get("sentence_idx", 0))
             hist = loc_map.get(idx)
             if hist:
                 deception_rates[idx] = hist.get("deception_rate")
@@ -565,8 +535,8 @@ def main(argv=None):
                 loc_mode = "full"
 
         deltas = {}
-        for s in sentences:
-            idx = int(s.get("sentence_idx", 0))
+        for sentence in sentences:
+            idx = int(sentence.get("sentence_idx", 0))
             rate = deception_rates.get(idx)
             if rate is None:
                 deltas[idx] = None
@@ -587,15 +557,11 @@ def main(argv=None):
 
             deltas[idx] = (rate - prev_rate) if prev_rate is not None else None
 
-        # Optional attention-based features (per example)
         attn_features = {}
         attn_meta: Dict[str, Any] = {}
         if attention_model is not None:
             raw_text = example.get("action_reasoning") if example else None
-            sentence_spans = [
-                {"start": s.get("start"), "end": s.get("end")}
-                for s in sentences
-            ]
+            sentence_spans = [{"start": s.get("start"), "end": s.get("end")} for s in sentences]
             attn_features, attn_meta = _compute_downstream_attention_features(
                 raw_text,
                 sentence_spans,
@@ -607,40 +573,36 @@ def main(argv=None):
                 min_sentence_distance=args.attention_min_sentence_distance,
             )
 
-        # Build per-sentence features
         start_row_idx = len(all_rows)
         example_rows_added = 0
-        for i, s in enumerate(sentences):
-            sentence_id = s.get("sentence_id")
-            sentence_text = s.get("sentence_text", "")
+        for idx, sentence in enumerate(sentences):
+            sentence_id = sentence.get("sentence_id")
+            sentence_text = sentence.get("sentence_text", "")
             feats = {
                 "sentence_id": sentence_id,
                 "example_id": ex_id,
-                "sentence_idx": s.get("sentence_idx"),
+                "sentence_idx": sentence.get("sentence_idx"),
                 "sentence_text": sentence_text,
-                "start": s.get("start"),
-                "end": s.get("end"),
+                "start": sentence.get("start"),
+                "end": sentence.get("end"),
                 "total_sentences": total_sentences,
-                "sentence_position": (i / (total_sentences - 1)) if total_sentences > 1 else 0.0,
+                "sentence_position": (idx / (total_sentences - 1)) if total_sentences > 1 else 0.0,
             }
 
             feats.update(text_features(sentence_text))
 
-            # Example-level metadata
             for key in ("deceptive", "current_rank", "model_name", "seed", "run_id"):
                 if key in example:
                     feats[f"example_{key}"] = example[key]
 
-            # Tag features
             tag = tags_by_sentence.get(sentence_id)
             if tag:
                 feats["tag_id"] = tag.get("label_id")
                 feats["tag_name"] = tag.get("label_name")
                 feats["tag_confidence"] = tag.get("confidence")
 
-            # Localization features
-            idx = int(s.get("sentence_idx", 0))
-            hist = loc_map.get(idx)
+            sent_idx = int(sentence.get("sentence_idx", 0))
+            hist = loc_map.get(sent_idx)
             if hist:
                 feats["deception_rate"] = hist.get("deception_rate")
                 feats["num_truthful"] = hist.get("num_truthful")
@@ -648,23 +610,23 @@ def main(argv=None):
                 feats["ci_low"] = hist.get("ci_low")
                 feats["ci_high"] = hist.get("ci_high")
 
-            is_localized = idx in deception_rates
+            is_localized = sent_idx in deception_rates
             feats["is_localized"] = is_localized
             feats["localization_mode"] = loc_mode
 
-            feats["delta_deception_rate"] = deltas.get(idx)
+            feats["delta_deception_rate"] = deltas.get(sent_idx)
             if loc_mode == "full":
-                if idx == 0:
+                if sent_idx == 0:
                     feats["prev_deception_rate"] = 0.0
                     feats["prev_localized_idx"] = None
                 else:
-                    feats["prev_deception_rate"] = deception_rates.get(idx - 1)
-                    feats["prev_localized_idx"] = idx - 1 if (idx - 1) in deception_rates else None
-                feats["next_deception_rate"] = deception_rates.get(idx + 1)
-                feats["next_localized_idx"] = idx + 1 if (idx + 1) in deception_rates else None
+                    feats["prev_deception_rate"] = deception_rates.get(sent_idx - 1)
+                    feats["prev_localized_idx"] = sent_idx - 1 if (sent_idx - 1) in deception_rates else None
+                feats["next_deception_rate"] = deception_rates.get(sent_idx + 1)
+                feats["next_localized_idx"] = sent_idx + 1 if (sent_idx + 1) in deception_rates else None
             else:
-                prev_loc_idx = prev_localized_idx_map.get(idx)
-                next_loc_idx = next_localized_idx_map.get(idx)
+                prev_loc_idx = prev_localized_idx_map.get(sent_idx)
+                next_loc_idx = next_localized_idx_map.get(sent_idx)
                 feats["prev_localized_idx"] = prev_loc_idx
                 feats["next_localized_idx"] = next_loc_idx
                 if prev_loc_idx is None:
@@ -674,23 +636,21 @@ def main(argv=None):
                 feats["next_deception_rate"] = deception_rates.get(next_loc_idx) if next_loc_idx is not None else None
 
             if feats.get("prev_localized_idx") is not None:
-                feats["localized_gap"] = idx - int(feats["prev_localized_idx"])
+                feats["localized_gap"] = sent_idx - int(feats["prev_localized_idx"])
             else:
                 feats["localized_gap"] = None
 
-            # Attention features
             if attn_meta:
                 feats.update(attn_meta)
             if attn_features:
-                feats.update(attn_features.get(idx, {}))
+                feats.update(attn_features.get(sent_idx, {}))
 
-            # Context window features
             if args.context_window > 0:
-                prev_items = sentences[max(0, i - args.context_window):i]
-                next_items = sentences[i + 1:i + 1 + args.context_window]
+                prev_items = sentences[max(0, idx - args.context_window):idx]
+                next_items = sentences[idx + 1:idx + 1 + args.context_window]
 
-                prev_lengths = [len(p.get("sentence_text", "")) for p in prev_items]
-                next_lengths = [len(n.get("sentence_text", "")) for n in next_items]
+                prev_lengths = [len(item.get("sentence_text", "")) for item in prev_items]
+                next_lengths = [len(item.get("sentence_text", "")) for item in next_items]
                 feats["prev_char_mean"] = _safe_mean(prev_lengths)
                 feats["next_char_mean"] = _safe_mean(next_lengths)
 
@@ -706,23 +666,21 @@ def main(argv=None):
             all_rows.append(feats)
             example_rows_added += 1
 
-        # Apply top_k labeling per example if requested
         if args.label_strategy == "top_k":
             deltas_sorted = sorted(
-                ((idx, d) for idx, d in deltas.items() if d is not None),
+                ((idx, delta) for idx, delta in deltas.items() if delta is not None),
                 key=lambda x: x[1],
                 reverse=True,
             )
             top_ids = {idx for idx, _ in deltas_sorted[: args.top_k]}
             example_rows = all_rows[start_row_idx:start_row_idx + example_rows_added]
             for row in example_rows:
-                idx = int(row.get("sentence_idx", 0))
+                sent_idx = int(row.get("sentence_idx", 0))
                 if row.get("delta_deception_rate") is None:
                     row["is_deceptive_sentence"] = None
                 else:
-                    row["is_deceptive_sentence"] = idx in top_ids
+                    row["is_deceptive_sentence"] = sent_idx in top_ids
 
-    # Apply threshold labeling if requested
     if args.label_strategy == "delta_threshold":
         for row in all_rows:
             delta = row.get("delta_deception_rate")

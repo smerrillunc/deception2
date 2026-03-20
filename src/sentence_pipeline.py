@@ -1,34 +1,91 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
-SENTENCE_SPAN_RE = re.compile(r"[^.!?]+[.!?]?\s*")
+SENTENCE_BOUNDARY_CHARS = ".!?"
+SENTENCE_TRAILING_CLOSERS = "\"')}]"
+COMMON_ABBREVIATIONS = {
+    "dr",
+    "etc",
+    "fig",
+    "jr",
+    "mr",
+    "mrs",
+    "ms",
+    "prof",
+    "sr",
+    "st",
+    "vs",
+}
+
+
+def _is_decimal_point(text: str, idx: int) -> bool:
+    return (
+        text[idx] == "."
+        and idx > 0
+        and idx + 1 < len(text)
+        and text[idx - 1].isdigit()
+        and text[idx + 1].isdigit()
+    )
+
+
+def _is_common_abbreviation(text: str, idx: int) -> bool:
+    if text[idx] != ".":
+        return False
+    start = idx
+    while start > 0 and text[start - 1].isalpha():
+        start -= 1
+    token = text[start:idx].lower()
+    return token in COMMON_ABBREVIATIONS
+
+
+def _iter_sentence_bounds(text: str) -> Iterator[tuple[int, int]]:
+    n_chars = len(text)
+    start = 0
+    while start < n_chars and text[start].isspace():
+        start += 1
+    if start >= n_chars:
+        return
+
+    idx = start
+    while idx < n_chars:
+        char = text[idx]
+        if char in SENTENCE_BOUNDARY_CHARS and not _is_decimal_point(text, idx) and not _is_common_abbreviation(text, idx):
+            end = idx + 1
+            while end < n_chars and text[end] in SENTENCE_TRAILING_CLOSERS:
+                end += 1
+            yield start, end
+            start = end
+            while start < n_chars and text[start].isspace():
+                start += 1
+            idx = start
+            continue
+        idx += 1
+
+    if start < n_chars:
+        end = n_chars
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if end > start:
+            yield start, end
 
 
 def split_sentences(text: Any) -> List[str]:
     if not isinstance(text, str) or not text.strip():
         return []
     cleaned = " ".join(text.strip().split())
-    return [s for s in SENTENCE_SPLIT_RE.split(cleaned) if s]
+    return [span["text"] for span in split_sentence_spans(cleaned)]
 
 
 def split_sentence_spans(text: Any) -> List[Dict[str, Any]]:
     if not isinstance(text, str) or not text.strip():
         return []
     spans = []
-    for match in SENTENCE_SPAN_RE.finditer(text):
-        span_text = match.group(0)
-        if not span_text.strip():
-            continue
-        start, end = match.span()
-        while end > start and text[end - 1].isspace():
-            end -= 1
+    for start, end in _iter_sentence_bounds(text):
         spans.append(
             {
                 "start": start,
