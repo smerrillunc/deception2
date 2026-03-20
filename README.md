@@ -1,6 +1,6 @@
 # Deception2
 
-This repository contains BS and Werewolf deception mining environments plus the sentence‑level localization pipeline.
+This repository contains deception mining environments plus the sentence-level localization pipeline.
 
 ## Quick Start
 See the main pipeline docs here:
@@ -8,6 +8,9 @@ See the main pipeline docs here:
 
 ## Layout
 - `BS/`: BS environment + sentence localization pipeline
+- `Gridworld/`: guide/explorer maze deception environment
+- `Negotiation/`: one-item negotiation deception environment
+- `ResourceAllocation/`: multiplayer resource allocation deception environment
 - `Werewolf/`: standalone Werewolf environment, miner, and demo notebook
 
 

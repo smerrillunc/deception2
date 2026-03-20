@@ -9,7 +9,7 @@ End-to-end pipeline for mining deceptive BS examples, splitting into sentences, 
 - `Results/`: outputs
 
 ## Pipeline Overview
-1. Mine deceptive examples from real game flows with `bs_deception_miner.py`
+1. Mine deceptive examples from real game flows with the universal miner (`../src/deception_miner.py --game bs`)
 2. Build sentence dataset from `action_reasoning`
 3. LLM-tag each sentence using the taxonomy
 4. Run sentence-level localization debug on a chosen example
@@ -89,7 +89,7 @@ This shards examples by index across GPUs using `SHARD_ID/NUM_SHARDS`.
 
 To merge shards into one JSONL:
 ```bash
-python /playpen-ssd/smerrill/deception2/BS/src/merge_localization_jsonl.py \
+python /playpen-ssd/smerrill/deception2/src/merge_localization_jsonl.py \
   --input /playpen-ssd/smerrill/deception2/BS/Results/SentencePipeline/v1/localization.jsonl.shard*.jsonl \
   --out_path /playpen-ssd/smerrill/deception2/BS/Results/SentencePipeline/v1/localization.merged.jsonl \
   --dedupe
@@ -103,14 +103,16 @@ Output:
 - `Results/SentencePipeline/v1/sentence_features.jsonl`
 
 ## Core Scripts
-- `src/bs_deception_miner.py`: mines deceptive BS examples
-- `src/build_sentence_dataset.py`: builds `examples.jsonl` + `sentences.jsonl`
-- `src/tag_sentences_llm.py`: tags sentences using taxonomy
-- `src/sentence_localization_debug.py`: runs sentence-level deception localization
-- `src/sentence_localization_batch.py`: runs batch sentence-level localization
-- `src/merge_localization_jsonl.py`: merges shard JSONL outputs
-- `src/extract_sentence_features.py`: builds a modeling dataset with text + localization features
-- `src/sentence_pipeline.py`: shared sentence utilities + taxonomy support
+- `../src/deception_miner.py`: universal deception miner (`--game bs`)
+- `../src/build_sentence_dataset.py`: universal sentence dataset builder
+- `../src/tag_sentences_llm.py`: universal sentence tagger
+- `../src/sentence_localization_debug.py`: universal single-example localization debug entrypoint
+- `../src/sentence_localization_batch.py`: universal batch sentence localization
+- `../src/merge_localization_jsonl.py`: universal shard JSONL merger
+- `../src/extract_sentence_features.py`: universal sentence feature extraction
+- `../src/sentence_pipeline.py`: shared sentence utilities + taxonomy support
+- `src/bs_environment.py`: BS environment implementation
+- `src/deck.py`: BS deck implementation
 
 For Werewolf docs, see `../Werewolf/README.md`.
 
