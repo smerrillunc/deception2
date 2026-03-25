@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-/playpen-ssd/smerrill/conda_envs/deception/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 REPO_ROOT="/playpen-ssd/smerrill/deception2"
 MINER_SCRIPT="$REPO_ROOT/src/deception_miner.py"
 DEFAULT_CONVERSATIONS_PATH="$REPO_ROOT/Interview/Data/interview_conversation_seeds.jsonl"
@@ -66,6 +66,35 @@ How work is shared:
 - shard 1 processes conversation indices 1, N+1, 2N+1, ...
 - and so on, where N = number of GPUs / shards
 EOF
+}
+
+resolve_python_bin() {
+  if [[ -n "${PYTHON_BIN:-}" && -x "${PYTHON_BIN:-}" ]]; then
+    printf '%s\n' "$PYTHON_BIN"
+    return
+  fi
+
+  if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    printf '%s\n' "${CONDA_PREFIX}/bin/python"
+    return
+  fi
+
+  if [[ -x "/playpen-ssd/smerrill/conda_envs/deception/bin/python" ]]; then
+    printf '%s\n' "/playpen-ssd/smerrill/conda_envs/deception/bin/python"
+    return
+  fi
+
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return
+  fi
+
+  return 1
 }
 
 quota_for_shard() {
@@ -196,6 +225,12 @@ done
 if [[ -z "$MODEL_NAME" ]]; then
   echo "--model_name is required." >&2
   usage >&2
+  exit 1
+fi
+
+if ! PYTHON_BIN="$(resolve_python_bin)"; then
+  echo "Could not find a usable python interpreter." >&2
+  echo "Set PYTHON_BIN explicitly or activate the desired conda environment first." >&2
   exit 1
 fi
 
