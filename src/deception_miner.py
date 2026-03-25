@@ -652,6 +652,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=50)
+    parser.add_argument("--shard_index", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
 
     # BS options
     parser.add_argument("--num_players", type=int, default=4)
@@ -696,6 +698,10 @@ def main(argv=None):
     )
     use_target_deceptive = args.target_deceptive > 0 and label_filter != "truthful_only"
     use_target_truthful = args.target_truthful > 0 and label_filter != "deceptive_only"
+    if int(args.num_shards) <= 0:
+        raise ValueError("--num_shards must be positive.")
+    if int(args.shard_index) < 0 or int(args.shard_index) >= int(args.num_shards):
+        raise ValueError("--shard_index must satisfy 0 <= shard_index < num_shards.")
 
     os.makedirs(args.output_dir, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -732,6 +738,8 @@ def main(argv=None):
         "save_all": args.save_all,
         "save_only_deceptive": args.save_only_deceptive,
         "resume": args.resume,
+        "shard_index": args.shard_index,
+        "num_shards": args.num_shards,
         "seed": args.seed,
         "strategy": "game_flow",
         "timestamp": time.time(),
@@ -778,6 +786,8 @@ def main(argv=None):
                 )
 
     for game_idx in range(max_game_slots):
+        if game_idx % int(args.num_shards) != int(args.shard_index):
+            continue
         if _targets_reached(
             total_deceptive,
             total_truthful,
