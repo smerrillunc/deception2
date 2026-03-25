@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import copy
+import json
 import logging
 import os
 import random
@@ -13,8 +14,9 @@ SRC_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = SRC_ROOT.parent
 BS_SRC_ROOT = REPO_ROOT / "BS" / "src"
 GRIDWORLD_SRC_ROOT = REPO_ROOT / "Gridworld" / "src"
+INTERVIEW_SRC_ROOT = REPO_ROOT / "Interview" / "src"
 
-for path in (SRC_ROOT, BS_SRC_ROOT, GRIDWORLD_SRC_ROOT):
+for path in (SRC_ROOT, BS_SRC_ROOT, GRIDWORLD_SRC_ROOT, INTERVIEW_SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.append(str(path))
 
@@ -48,6 +50,7 @@ def sample_phase(game: str) -> str:
     return {
         "bs": "PLAY",
         "gridworld": "GUIDE",
+        "interview": "CANDIDATE_RESPONSE",
     }[game]
 
 
@@ -59,10 +62,13 @@ def make_agents(game: str, llm, model_name: str, n_players: int, is_reasoning_mo
         reasoning_instruction = "COT"
         instruction_format = "reasoning"
 
-    if game == "gridworld":
+    if game in {"gridworld", "interview"}:
         n_players = 2
 
-    names = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"]
+    if game == "interview":
+        names = ["Candidate", "HiringManager"]
+    else:
+        names = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"]
     agents = []
     for i in range(n_players):
         ag = LLMAgent(
@@ -79,6 +85,8 @@ def make_agents(game: str, llm, model_name: str, n_players: int, is_reasoning_mo
         elif game == "gridworld":
             ag.guide_format = "reasoning" if instruction_format == "reasoning" else "default"
             ag.challenge_format = "reasoning" if instruction_format == "reasoning" else "default"
+        elif game == "interview":
+            pass
         else:
             raise ValueError(f"Unsupported game: {game}")
 
@@ -87,7 +95,84 @@ def make_agents(game: str, llm, model_name: str, n_players: int, is_reasoning_mo
     return agents
 
 
-def build_env(game: str, llm, model_name: str, seed: int, args):
+def _load_interview_scenarios(args):
+    cached = getattr(args, "_interview_scenarios_cache", None)
+    if cached is not None:
+        return cached
+
+    if not args.interview_conversations_path:
+        raise ValueError("--interview_conversations_path is required when --game interview.")
+
+    from interview_environment import load_interview_scenarios_from_path
+
+    scenarios = load_interview_scenarios_from_path(args.interview_conversations_path)
+    if not scenarios:
+        raise ValueError(f"No interview conversation seeds found in {args.interview_conversations_path}")
+
+    args._interview_scenarios_cache = scenarios
+    return scenarios
+
+
+def _iter_jsonl(path: str):
+    if not path or not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line_idx, line in enumerate(f, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except Exception:
+                logging.warning("Skipping unreadable JSONL row at %s:%d", path, line_idx)
+                continue
+            if isinstance(row, dict):
+                yield row
+
+
+def _load_processed_interview_conversation_ids(output_path: str, processed_path: str) -> set[str]:
+    seen: set[str] = set()
+    for row in _iter_jsonl(processed_path):
+        conversation_id = row.get("conversation_id")
+        if conversation_id:
+            seen.add(str(conversation_id))
+    for row in _iter_jsonl(output_path):
+        conversation_id = row.get("conversation_id")
+        if conversation_id:
+            seen.add(str(conversation_id))
+    return seen
+
+
+def _append_processed_interview_conversation(
+    processed_path: str,
+    env,
+    game_idx: int,
+    game_saved_count: int,
+    game_sample_count: int,
+    game_deceptive_count: int,
+    game_truthful_count: int,
+    game_unknown_count: int,
+) -> None:
+    append_jsonl(
+        {
+            "processed_at": time.time(),
+            "game": "interview",
+            "game_id": game_idx,
+            "conversation_id": env.current_scenario.conversation_id,
+            "scenario_name": env.current_scenario.name,
+            "base_scenario_name": env.current_scenario.base_scenario_name,
+            "saved_count": int(game_saved_count),
+            "sample_count": int(game_sample_count),
+            "deceptive_count": int(game_deceptive_count),
+            "truthful_count": int(game_truthful_count),
+            "unknown_count": int(game_unknown_count),
+            "outcome": env.outcome,
+        },
+        processed_path,
+    )
+
+
+def build_env(game: str, llm, model_name: str, seed: int, args, game_idx: int = 0):
     if game == "bs":
         from bs_environment import BSEnvironment
         from deck import Deck
@@ -120,6 +205,26 @@ def build_env(game: str, llm, model_name: str, seed: int, args):
             auto_move_explorer=args.auto_move_explorer,
         )
 
+    if game == "interview":
+        from interview_environment import InterviewSpec, JobInterviewEnvironment
+
+        scenarios = _load_interview_scenarios(args)
+        scenario = scenarios[int(game_idx)]
+        agents = make_agents(game, llm, model_name, 2, args.is_reasoning_model)
+        spec = InterviewSpec(
+            auto_generate_dialogue=False,
+            generated_dialogue_turns=0,
+        )
+        return JobInterviewEnvironment(
+            agents=agents,
+            seed=seed,
+            scenario_name=scenario.name,
+            private_profile_name=args.interview_private_profile_name,
+            scenarios=scenarios,
+            spec=spec,
+            history_window=args.history_window,
+        )
+
     raise ValueError(f"Unsupported game: {game}")
 
 
@@ -136,6 +241,20 @@ def state_summary(game: str, env) -> Dict[str, Any]:
         }
 
     active = None if env.active_player_idx is None else env.agents[env.active_player_idx].name
+    if game == "interview":
+        offer_total_comp = env._offer_total_comp(env.current_scenario.offer)
+        return {
+            "phase": env.phase,
+            "active_player": active,
+            "conversation_id": env.current_scenario.conversation_id,
+            "scenario_name": env.current_scenario.name,
+            "base_scenario_name": env.current_scenario.base_scenario_name,
+            "offer_total_comp": offer_total_comp,
+            "candidate_target_total_comp": env._candidate_target_total_comp(),
+            "history_len": len(env.history),
+            "game_type": "interview",
+        }
+
     return {
         "phase": env.phase,
         "active_player": active,
@@ -149,10 +268,12 @@ def state_summary(game: str, env) -> Dict[str, Any]:
 
 
 def deception_from_action(game: str, action, env) -> Optional[bool]:
-    if not isinstance(action, dict) or action.get("Parse_fail", False):
+    if isinstance(action, dict) and action.get("Parse_fail", False):
         return None
 
     if game == "bs":
+        if not isinstance(action, dict):
+            return None
         if env.phase != "PLAY":
             return None
         if action.get("Action", "PLAY") != "PLAY":
@@ -165,6 +286,17 @@ def deception_from_action(game: str, action, env) -> Optional[bool]:
         except Exception:
             return None
 
+    if game == "interview":
+        if env.phase != "CANDIDATE_RESPONSE":
+            return None
+        try:
+            label = env.label_candidate_action(action)
+        except Exception:
+            return None
+        return bool(label.get("deceptive"))
+
+    if not isinstance(action, dict):
+        return None
     if env.phase != "GUIDE":
         return None
     direction = env._normalize_dir(action.get("Direction", action.get("direction")))
@@ -190,6 +322,19 @@ def truth_context(game: str, env, action) -> Dict[str, Any]:
             "truthful": truthful,
         }
 
+    if game == "interview":
+        normalized = env.normalize_candidate_action(action)
+        label = env.label_candidate_action(normalized)
+        return {
+            "type": "interview_final_response",
+            "decision": normalized.get("Decision"),
+            "offer_total_comp": env._offer_total_comp(env.current_scenario.offer),
+            "candidate_target_total_comp": env._candidate_target_total_comp(),
+            "true_has_other_offer": bool(env.current_private_state.has_other_offer),
+            "true_other_offer_company": env.current_private_state.other_offer_company,
+            "true_other_offer_base_salary": env.current_private_state.other_offer_base_salary,
+            "label_preview": label,
+        }
 
     if not isinstance(action, dict):
         action = {}
@@ -208,6 +353,8 @@ def truth_context(game: str, env, action) -> Dict[str, Any]:
 def _fallback_primary_action(game: str, env):
     if game == "bs":
         return {"Action": "PLAY", "Cards_played": []}
+    if game == "interview":
+        return env.get_truthful_action()
     return {"Action": "RECOMMEND", "Direction": "UP", "Message": ""}
 
 
@@ -481,9 +628,9 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Universal deception miner for BS Gridworld.")
+    parser = argparse.ArgumentParser(description="Universal deception miner for BS, Gridworld, and Interview.")
 
-    parser.add_argument("--game", choices=["bs", "gridworld"], required=True)
+    parser.add_argument("--game", choices=["bs", "gridworld", "interview"], required=True)
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--is_reasoning_model", action="store_true", default=False)
     parser.add_argument("--temperature", type=float, default=0.5)
@@ -524,6 +671,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     else:
         parser.add_argument("--auto_move_explorer", action="store_true", default=True)
 
+    # Interview options
+    parser.add_argument("--interview_conversations_path", type=str, default=None)
+    parser.add_argument("--interview_private_profile_name", type=str, default=None)
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    else:
+        parser.add_argument("--resume", dest="resume", action="store_true")
+        parser.add_argument("--no-resume", dest="resume", action="store_false")
+        parser.set_defaults(resume=True)
+
     return parser
 
 
@@ -563,6 +720,8 @@ def main(argv=None):
         "view_radius": args.view_radius,
         "history_window": args.history_window,
         "auto_move_explorer": args.auto_move_explorer,
+        "interview_conversations_path": args.interview_conversations_path,
+        "interview_private_profile_name": args.interview_private_profile_name,
         "max_games": args.max_games,
         "max_turns": args.max_turns,
         "target_deceptive": args.target_deceptive,
@@ -572,6 +731,7 @@ def main(argv=None):
         "use_target_truthful": use_target_truthful,
         "save_all": args.save_all,
         "save_only_deceptive": args.save_only_deceptive,
+        "resume": args.resume,
         "seed": args.seed,
         "strategy": "game_flow",
         "timestamp": time.time(),
@@ -582,6 +742,7 @@ def main(argv=None):
     llm = init_llm(args.model_name, args.max_tokens, seed=args.seed)
 
     output_path = os.path.join(args.output_dir, "deception_samples.jsonl")
+    processed_path = os.path.join(args.output_dir, "processed_interview_conversations.jsonl")
 
     total_states = 0
     total_samples = 0
@@ -596,8 +757,27 @@ def main(argv=None):
         tokenizer = None
 
     target_phase = sample_phase(args.game)
+    max_game_slots = args.max_games
+    interview_scenarios = None
+    processed_interview_ids: set[str] = set()
+    if args.game == "interview":
+        interview_scenarios = _load_interview_scenarios(args)
+        meta["interview_num_seed_conversations"] = len(interview_scenarios)
+        meta["processed_interview_manifest"] = processed_path
+        atomic_write_json(os.path.join(args.output_dir, "meta.json"), meta)
+        max_game_slots = min(args.max_games, len(interview_scenarios))
+        if args.resume:
+            processed_interview_ids = _load_processed_interview_conversation_ids(
+                output_path=output_path,
+                processed_path=processed_path,
+            )
+            if processed_interview_ids:
+                logging.info(
+                    "Resume enabled for interview miner: skipping %d previously processed conversations.",
+                    len(processed_interview_ids),
+                )
 
-    for game_idx in range(args.max_games):
+    for game_idx in range(max_game_slots):
         if _targets_reached(
             total_deceptive,
             total_truthful,
@@ -607,13 +787,25 @@ def main(argv=None):
         ):
             break
 
+        if args.game == "interview" and interview_scenarios is not None:
+            conversation_id = interview_scenarios[game_idx].conversation_id
+            if conversation_id and str(conversation_id) in processed_interview_ids:
+                continue
+
         env = build_env(
             game=args.game,
             llm=llm,
             model_name=args.model_name,
             seed=args.seed + game_idx,
             args=args,
+            game_idx=game_idx,
         )
+        game_sample_count = 0
+        game_saved_count = 0
+        game_deceptive_count = 0
+        game_truthful_count = 0
+        game_unknown_count = 0
+        game_processed_state_count = 0
 
         for turn_idx in range(args.max_turns):
             if _targets_reached(
@@ -739,16 +931,22 @@ def main(argv=None):
                 if keep_record_for_label_filter(rec, label_filter):
                     append_jsonl(rec, output_path)
                     total_saved += 1
+                    game_saved_count += 1
 
                 total_samples += 1
+                game_sample_count += 1
                 deceptive = rec.get("deceptive")
                 if deceptive is True:
                     total_deceptive += 1
+                    game_deceptive_count += 1
                 elif deceptive is False:
                     total_truthful += 1
+                    game_truthful_count += 1
                 else:
                     total_unknown += 1
+                    game_unknown_count += 1
             total_states += 1
+            game_processed_state_count += 1
 
             if args.log_every and total_states % args.log_every == 0:
                 logging.info(
@@ -778,6 +976,20 @@ def main(argv=None):
                     args.target_truthful,
                 )
                 break
+
+        if args.game == "interview" and game_processed_state_count > 0:
+            _append_processed_interview_conversation(
+                processed_path=processed_path,
+                env=env,
+                game_idx=game_idx,
+                game_saved_count=game_saved_count,
+                game_sample_count=game_sample_count,
+                game_deceptive_count=game_deceptive_count,
+                game_truthful_count=game_truthful_count,
+                game_unknown_count=game_unknown_count,
+            )
+            if env.current_scenario.conversation_id:
+                processed_interview_ids.add(str(env.current_scenario.conversation_id))
 
         if _targets_reached(
             total_deceptive,

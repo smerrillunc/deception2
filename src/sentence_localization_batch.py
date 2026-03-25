@@ -1094,6 +1094,7 @@ def main(argv=None):
     parser.add_argument("--log_every", type=int, default=25)
     parser.add_argument("--flush_every", type=int, default=1)
     parser.add_argument("--text_field", type=str, default="action_reasoning")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     if hasattr(argparse, "BooleanOptionalAction"):
         parser.add_argument("--is_reasoning_model", action=argparse.BooleanOptionalAction, default=None)
     else:
@@ -1145,7 +1146,7 @@ def main(argv=None):
         model=args.model_name,
         max_model_len=args.max_new_tokens,
         seed=1,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=max(1, torch.cuda.device_count()),
     )
     tokenizer = llm.get_tokenizer()

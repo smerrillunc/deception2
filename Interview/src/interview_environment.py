@@ -22,7 +22,8 @@ import inspect
 import json
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
@@ -52,6 +53,8 @@ class InterviewScenario:
     seeded_dialogue: Tuple[Tuple[str, str], ...]
     alternative_companies: Tuple[str, ...]
     employer_hiring_value: int
+    base_scenario_name: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +208,156 @@ DEFAULT_SCENARIOS: Sequence[InterviewScenario] = (
         employer_hiring_value=268_000,
     ),
 )
+
+
+def _coerce_dialogue_turns(raw_turns: Any) -> Tuple[Tuple[str, str], ...]:
+    if not isinstance(raw_turns, (list, tuple)):
+        raise ValueError("seeded_dialogue must be a list or tuple of dialogue turns.")
+
+    turns: List[Tuple[str, str]] = []
+    for idx, raw_turn in enumerate(raw_turns):
+        speaker: Optional[str] = None
+        message: Optional[str] = None
+
+        if isinstance(raw_turn, dict):
+            speaker = raw_turn.get("speaker") or raw_turn.get("name") or raw_turn.get("role")
+            message = raw_turn.get("message") or raw_turn.get("content")
+        elif isinstance(raw_turn, (list, tuple)) and len(raw_turn) >= 2:
+            speaker = raw_turn[0]
+            message = raw_turn[1]
+        else:
+            raise ValueError(f"Invalid dialogue turn at index {idx}: {raw_turn!r}")
+
+        speaker_text = "" if speaker is None else str(speaker).strip()
+        message_text = "" if message is None else str(message).strip()
+        if not speaker_text or not message_text:
+            raise ValueError(f"Dialogue turn at index {idx} is missing speaker or message text.")
+        turns.append((speaker_text, message_text))
+
+    if not turns:
+        raise ValueError("seeded_dialogue must contain at least one turn.")
+    return tuple(turns)
+
+
+def _default_scenario_lookup(
+    base_scenarios: Optional[Sequence[InterviewScenario]] = None,
+) -> Dict[str, InterviewScenario]:
+    scenarios = list(base_scenarios) if base_scenarios is not None else list(DEFAULT_SCENARIOS)
+    return {scenario.name: scenario for scenario in scenarios}
+
+
+def build_interview_scenarios_from_records(
+    records: Sequence[Dict[str, Any]],
+    base_scenarios: Optional[Sequence[InterviewScenario]] = None,
+) -> List[InterviewScenario]:
+    lookup = _default_scenario_lookup(base_scenarios=base_scenarios)
+    variants: List[InterviewScenario] = []
+
+    for idx, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f"Conversation record at index {idx} must be a JSON object.")
+
+        nested_scenario = record.get("scenario")
+        nested_scenario = nested_scenario if isinstance(nested_scenario, dict) else {}
+
+        base_name = (
+            record.get("base_scenario_name")
+            or record.get("scenario_name")
+            or nested_scenario.get("base_scenario_name")
+            or nested_scenario.get("name")
+        )
+        if not base_name:
+            raise ValueError(
+                f"Conversation record at index {idx} is missing base_scenario_name or scenario_name."
+            )
+        if base_name not in lookup:
+            valid = ", ".join(sorted(lookup))
+            raise ValueError(
+                f"Unknown base scenario {base_name!r} in conversation record {idx}. Available: {valid}"
+            )
+
+        raw_turns = (
+            record.get("seeded_dialogue")
+            or record.get("dialogue")
+            or record.get("conversation")
+            or record.get("dialogue_history")
+            or nested_scenario.get("seeded_dialogue")
+        )
+        turns = _coerce_dialogue_turns(raw_turns)
+
+        base = lookup[str(base_name)]
+        conversation_id = (
+            record.get("conversation_id")
+            or record.get("id")
+            or nested_scenario.get("conversation_id")
+            or f"{base.name}__conversation_{idx:05d}"
+        )
+        variant_name = (
+            record.get("scenario_variant_name")
+            or record.get("variant_name")
+            or nested_scenario.get("scenario_variant_name")
+            or str(conversation_id)
+        )
+
+        variants.append(
+            replace(
+                base,
+                name=str(variant_name),
+                seeded_dialogue=turns,
+                base_scenario_name=base.name,
+                conversation_id=str(conversation_id),
+            )
+        )
+
+    return variants
+
+
+def load_interview_scenarios_from_path(
+    path: str | Path,
+    base_scenarios: Optional[Sequence[InterviewScenario]] = None,
+) -> List[InterviewScenario]:
+    src = Path(path)
+    if not src.exists():
+        raise FileNotFoundError(f"Conversation seed file not found: {src}")
+
+    if src.suffix.lower() == ".json":
+        payload = json.loads(src.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("JSON conversation seed file must contain a top-level list of records.")
+        records = payload
+    else:
+        records = []
+        for line_idx, line in enumerate(src.read_text(encoding="utf-8").splitlines(), start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                records.append(json.loads(text))
+            except Exception as exc:
+                raise ValueError(f"Failed to parse JSONL record on line {line_idx} of {src}") from exc
+
+    return build_interview_scenarios_from_records(records, base_scenarios=base_scenarios)
+
+
+def make_interview_conversation_record(
+    base_scenario_name: str,
+    seeded_dialogue: Sequence[Any],
+    conversation_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    turns = _coerce_dialogue_turns(seeded_dialogue)
+    convo_id = conversation_id or f"{str(base_scenario_name).strip()}__conversation"
+    record = {
+        "conversation_id": str(convo_id),
+        "base_scenario_name": str(base_scenario_name).strip(),
+        "seeded_dialogue": [
+            {"speaker": speaker, "message": message}
+            for speaker, message in turns
+        ],
+    }
+    if metadata:
+        record["metadata"] = copy.deepcopy(metadata)
+    return record
 
 
 class JobInterviewEnvironment:
@@ -596,6 +749,8 @@ class JobInterviewEnvironment:
             "interviewer_utility": int(self.interviewer_utility),
             "scenario": {
                 "name": self.current_scenario.name,
+                "base_scenario_name": self.current_scenario.base_scenario_name,
+                "conversation_id": self.current_scenario.conversation_id,
                 "title": self.current_scenario.title,
                 "summary": self.current_scenario.summary,
                 "company_name": self.current_scenario.company_name,
@@ -628,6 +783,13 @@ class JobInterviewEnvironment:
 
     def game_over(self) -> bool:
         return self.done
+
+    def normalize_candidate_action(self, action: Any) -> Dict[str, Any]:
+        return copy.deepcopy(self._coerce_candidate_action(action))
+
+    def label_candidate_action(self, action: Any) -> Dict[str, Any]:
+        normalized = self._coerce_candidate_action(action)
+        return copy.deepcopy(self._label_candidate_response(normalized))
 
     def get_truthful_action(self) -> Dict[str, Any]:
         if self.done:

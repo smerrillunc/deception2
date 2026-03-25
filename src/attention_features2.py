@@ -77,7 +77,8 @@ CHANGE_TARGET_METRIC_NAMES = (
     "herfindahl_full",
 )
 CHANGE_TARGET_AGG_NAMES = ("mean", "std")
-MEAN_NORM_METRIC_NAMES = BASE_METRIC_NAMES
+WITHIN_TRACE_NORM_METRIC_NAMES = BASE_METRIC_NAMES
+WITHIN_TRACE_NORM_AGG_NAMES = LAYER_AGG_NAMES
 
 ACTIVATION_GROUNDING_METRIC_NAMES = (
     "act_cos_prev",
@@ -317,13 +318,14 @@ def build_change_feature_columns(num_layers: int) -> list[str]:
 def build_normalized_feature_columns(num_layers: int) -> list[str]:
     columns: list[str] = []
     for layer_idx in range(int(num_layers)):
-        for metric_name in MEAN_NORM_METRIC_NAMES:
-            columns.extend(
-                [
-                    f"z_{metric_name}_mean_l{layer_idx}",
-                    f"pct_{metric_name}_mean_l{layer_idx}",
-                ]
-            )
+        for metric_name in WITHIN_TRACE_NORM_METRIC_NAMES:
+            for agg_name in WITHIN_TRACE_NORM_AGG_NAMES:
+                columns.extend(
+                    [
+                        f"z_{metric_name}_{agg_name}_l{layer_idx}",
+                        f"pct_{metric_name}_{agg_name}_l{layer_idx}",
+                    ]
+                )
     return columns
 
 
@@ -911,11 +913,12 @@ def add_within_trace_normalization(
     new_columns: dict[str, pd.Series] = {}
 
     for layer_idx in range(int(num_layers)):
-        for metric_name in MEAN_NORM_METRIC_NAMES:
-            column = f"{metric_name}_mean_l{layer_idx}"
-            values = pd.to_numeric(df[column], errors="coerce").astype(float).to_numpy(dtype=float)
-            new_columns[f"z_{metric_name}_mean_l{layer_idx}"] = pd.Series(_causal_zscore(values), index=df.index)
-            new_columns[f"pct_{metric_name}_mean_l{layer_idx}"] = pd.Series(_causal_percentile(values), index=df.index)
+        for metric_name in WITHIN_TRACE_NORM_METRIC_NAMES:
+            for agg_name in WITHIN_TRACE_NORM_AGG_NAMES:
+                column = f"{metric_name}_{agg_name}_l{layer_idx}"
+                values = pd.to_numeric(df[column], errors="coerce").astype(float).to_numpy(dtype=float)
+                new_columns[f"z_{metric_name}_{agg_name}_l{layer_idx}"] = pd.Series(_causal_zscore(values), index=df.index)
+                new_columns[f"pct_{metric_name}_{agg_name}_l{layer_idx}"] = pd.Series(_causal_percentile(values), index=df.index)
 
     return pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
