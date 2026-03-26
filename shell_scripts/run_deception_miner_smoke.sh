@@ -21,10 +21,10 @@ EXTRA_ARGS=()
 usage() {
   cat <<'EOF'
 Usage:
-  run_deception_miner_smoke.sh --env {bs|gridworld|advisor_audit} --model_name MODEL [options] [-- extra args]
+  run_deception_miner_smoke.sh --env {bs|gridworld|car_sales|advisor_audit} --model_name MODEL [options] [-- extra args]
 
 Options:
-  --env ENV                     One of: bs, gridworld, advisor_audit
+  --env ENV                     One of: bs, gridworld, car_sales, advisor_audit
   --model_name MODEL            Hugging Face / vLLM model name
   --gpu GPU                     Optional single GPU id; otherwise uses existing CUDA_VISIBLE_DEVICES
   --output_dir PATH             Optional explicit output dir
@@ -139,7 +139,7 @@ if [[ -z "$ENVIRONMENT" || -z "$MODEL_NAME" ]]; then
 fi
 
 case "$ENVIRONMENT" in
-  bs|gridworld|advisor_audit)
+  bs|gridworld|car_sales|advisor_audit)
     ;;
   *)
     echo "Unsupported --env: $ENVIRONMENT" >&2
@@ -197,6 +197,8 @@ else
   )
   if [[ "$ENVIRONMENT" == "gridworld" ]]; then
     CMD+=(--max_steps 25 --history_window 10)
+  elif [[ "$ENVIRONMENT" == "car_sales" ]]; then
+    CMD+=(--car_sales_max_rounds 4 --history_window 12)
   fi
 fi
 

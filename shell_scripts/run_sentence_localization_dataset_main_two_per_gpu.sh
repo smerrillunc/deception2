@@ -9,11 +9,14 @@ ENVIRONMENT=""
 MODEL_NAME=""
 GPU_IDS_STR="${GPU_IDS:-}"
 
-N_SAMPLES="${N_SAMPLES:-50}"
+INSTANCES_PER_GPU="${INSTANCES_PER_GPU:-2}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.5}"
+
+N_SAMPLES="${N_SAMPLES:-100}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.9}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.1}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-10000}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-5000}"
 BASE_SEED_START="${BASE_SEED_START:-1234}"
 METHOD="${METHOD:-adaptive}"
 MODE="${MODE:-prefix}"
@@ -29,12 +32,11 @@ MIN_SPACING="${MIN_SPACING:-1}"
 OVERWRITE="${OVERWRITE:-0}"
 WRITE_JSONL="${WRITE_JSONL:-0}"
 JSONL_BASENAME="${JSONL_BASENAME:-localization.jsonl}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  run_sentence_localization_dataset_main_multi_gpu.sh --env ENV --model_name MODEL --gpu_ids "2 3 4 5"
+  run_sentence_localization_dataset_main_two_per_gpu.sh --env ENV --model_name MODEL --gpu_ids "2 3 4 5"
 
 Required:
   --env ENV                  One of: bs, gridworld, advisor_audit
@@ -43,8 +45,9 @@ Required:
 
 Optional:
   --dataset_root DIR         Default: /playpen-ssd/smerrill/deception2/DatasetMain
+  --instances_per_gpu N      Default: 2
+  --gpu_memory_utilization F Default: 0.45
   --text_field FIELD         Default: action_reasoning
-  --gpu_memory_utilization F Default: 0.9
   --method adaptive|full     Default: adaptive
   --mode prefix|sentence_only
   --limit N                  Optional example limit
@@ -72,12 +75,16 @@ while [[ $# -gt 0 ]]; do
       DATASET_ROOT="$2"
       shift 2
       ;;
-    --text_field)
-      TEXT_FIELD="$2"
+    --instances_per_gpu)
+      INSTANCES_PER_GPU="$2"
       shift 2
       ;;
     --gpu_memory_utilization)
       GPU_MEMORY_UTILIZATION="$2"
+      shift 2
+      ;;
+    --text_field)
+      TEXT_FIELD="$2"
       shift 2
       ;;
     --method)
@@ -131,12 +138,18 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+if ! [[ "$INSTANCES_PER_GPU" =~ ^[0-9]+$ ]] || [[ "$INSTANCES_PER_GPU" -lt 1 ]]; then
+  echo "INSTANCES_PER_GPU must be a positive integer. Got: $INSTANCES_PER_GPU" >&2
+  exit 1
+fi
+
 GPU_IDS_ARRAY=($GPU_IDS_STR)
-NUM_SHARDS=${#GPU_IDS_ARRAY[@]}
-if [[ "$NUM_SHARDS" -lt 1 ]]; then
+NUM_GPUS=${#GPU_IDS_ARRAY[@]}
+if [[ "$NUM_GPUS" -lt 1 ]]; then
   echo "No GPUs provided." >&2
   exit 1
 fi
+NUM_SHARDS=$(( NUM_GPUS * INSTANCES_PER_GPU ))
 
 MODEL_TAIL="${MODEL_NAME##*/}"
 DATA_DIR="$DATASET_ROOT/$ENVIRONMENT/$MODEL_TAIL"
@@ -159,63 +172,76 @@ echo "Environment: $ENVIRONMENT"
 echo "Model: $MODEL_NAME"
 echo "Dataset dir: $DATA_DIR"
 echo "GPUs: ${GPU_IDS_ARRAY[*]}"
+echo "Instances per GPU: $INSTANCES_PER_GPU"
+echo "Total shards: $NUM_SHARDS"
+echo "GPU memory utilization per process: $GPU_MEMORY_UTILIZATION"
 echo "Localization dir: $OUT_DIR"
 
 pids=()
-pid_gpus=()
-for idx in "${!GPU_IDS_ARRAY[@]}"; do
-  gpu="${GPU_IDS_ARRAY[$idx]}"
-  (
-    export CUDA_VISIBLE_DEVICES="$gpu"
-    cmd=(
-      "$PYTHON_BIN" "$REPO_ROOT/src/sentence_localization_batch.py"
-      --game "$ENVIRONMENT"
-      --examples_path "$EXAMPLES_PATH"
-      --sentences_path "$SENTENCES_PATH"
-      --model_name "$MODEL_NAME"
-      --out_dir "$OUT_DIR"
-      --n_samples "$N_SAMPLES"
-      --temperature "$TEMPERATURE"
-      --top_p "$TOP_P"
-      --repetition_penalty "$REPETITION_PENALTY"
-      --max_new_tokens "$MAX_NEW_TOKENS"
-      --base_seed "$((BASE_SEED_START + idx * 100000))"
-      --method "$METHOD"
-      --mode "$MODE"
-      --coarse_iters "$COARSE_ITERS"
-      --refinement_iters "$REFINEMENT_ITERS"
-      --min_valid "$MIN_VALID"
-      --min_step_size "$MIN_STEP_SIZE"
-      --min_spacing "$MIN_SPACING"
-      --label_filter "$LABEL_FILTER"
-      --text_field "$TEXT_FIELD"
-      --shard_id "$idx"
-      --num_shards "$NUM_SHARDS"
-      --log_every "$LOG_EVERY"
-      --gpu_memory_utilization "$GPU_MEMORY_UTILIZATION"
-    )
-    if [[ "$LIMIT" -gt 0 ]]; then
-      cmd+=(--limit "$LIMIT")
-    fi
-    if [[ "$OVERWRITE" == "1" ]]; then
-      cmd+=(--overwrite)
-    fi
-    if [[ "$WRITE_JSONL" == "1" ]]; then
-      cmd+=(--jsonl_path "$DATA_DIR/$JSONL_BASENAME")
-    fi
-    "${cmd[@]}" > "$OUT_DIR/run_gpu_$gpu.log" 2>&1
-  ) &
-  pids+=("$!")
-  pid_gpus+=("$gpu")
+pid_names=()
+for gpu_idx in "${!GPU_IDS_ARRAY[@]}"; do
+  gpu="${GPU_IDS_ARRAY[$gpu_idx]}"
+  for slot in $(seq 0 $((INSTANCES_PER_GPU - 1))); do
+    shard_id=$(( gpu_idx * INSTANCES_PER_GPU + slot ))
+    (
+      export CUDA_VISIBLE_DEVICES="$gpu"
+      cmd=(
+        "$PYTHON_BIN" "$REPO_ROOT/src/sentence_localization_batch.py"
+        --game "$ENVIRONMENT"
+        --examples_path "$EXAMPLES_PATH"
+        --sentences_path "$SENTENCES_PATH"
+        --model_name "$MODEL_NAME"
+        --out_dir "$OUT_DIR"
+        --n_samples "$N_SAMPLES"
+        --temperature "$TEMPERATURE"
+        --top_p "$TOP_P"
+        --repetition_penalty "$REPETITION_PENALTY"
+        --max_new_tokens "$MAX_NEW_TOKENS"
+        --base_seed "$((BASE_SEED_START + shard_id * 100000))"
+        --method "$METHOD"
+        --mode "$MODE"
+        --coarse_iters "$COARSE_ITERS"
+        --refinement_iters "$REFINEMENT_ITERS"
+        --min_valid "$MIN_VALID"
+        --min_step_size "$MIN_STEP_SIZE"
+        --min_spacing "$MIN_SPACING"
+        --label_filter "$LABEL_FILTER"
+        --text_field "$TEXT_FIELD"
+        --shard_id "$shard_id"
+        --num_shards "$NUM_SHARDS"
+        --log_every "$LOG_EVERY"
+        --gpu_memory_utilization "$GPU_MEMORY_UTILIZATION"
+      )
+      if [[ "$LIMIT" -gt 0 ]]; then
+        cmd+=(--limit "$LIMIT")
+      fi
+      if [[ "$OVERWRITE" == "1" ]]; then
+        cmd+=(--overwrite)
+      fi
+      if [[ "$WRITE_JSONL" == "1" ]]; then
+        cmd+=(--jsonl_path "$DATA_DIR/$JSONL_BASENAME")
+      fi
+      "${cmd[@]}" > "$OUT_DIR/run_gpu_${gpu}_slot_${slot}.log" 2>&1
+    ) &
+    pids+=("$!")
+    pid_names+=("gpu=${gpu},slot=${slot},shard=${shard_id}")
+  done
 done
 
 failed=0
 for idx in "${!pids[@]}"; do
   if ! wait "${pids[$idx]}"; then
     failed=$((failed + 1))
-    gpu="${pid_gpus[$idx]}"
-    echo "Localization worker failed on GPU $gpu. Tail of log:"
-    tail -n 60 "$OUT_DIR/run_gpu_$gpu.log" || true
+    ident="${pid_names[$idx]}"
+    log_path="$OUT_DIR/run_$(echo "$ident" | sed 's/[=,]/_/g').log"
+    echo "Localization worker failed ($ident)."
+    case "$ident" in
+      gpu=*,slot=*,shard=*)
+        gpu="$(echo "$ident" | sed -E 's/gpu=([0-9]+),slot=([0-9]+),shard=.*/\1/')"
+        slot="$(echo "$ident" | sed -E 's/gpu=([0-9]+),slot=([0-9]+),shard=.*/\2/')"
+        tail -n 60 "$OUT_DIR/run_gpu_${gpu}_slot_${slot}.log" || true
+        ;;
+    esac
   fi
 done
 

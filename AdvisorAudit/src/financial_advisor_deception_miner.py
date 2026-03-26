@@ -18,11 +18,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 SRC_ROOT = Path(__file__).resolve().parent
 ADVISOR_ROOT = SRC_ROOT.parent
 REPO_ROOT = ADVISOR_ROOT.parent
-BS_SRC_ROOT = REPO_ROOT / "BS" / "src"
 CORE_SRC_ROOT = REPO_ROOT / "src"
 
-# Keep local/core imports ahead of BS to avoid module name collisions.
-for path in (BS_SRC_ROOT, CORE_SRC_ROOT, SRC_ROOT):
+# Keep local/core imports ahead of other project directories.
+for path in (CORE_SRC_ROOT, SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -207,6 +206,15 @@ def _strip_reasoning_blocks(text: Any) -> str:
     return cleaned.strip()
 
 
+def _extract_reasoning_text(text: Any) -> str:
+    raw = "" if text is None else str(text)
+    for pattern in (r"(?is).*?</think>", r"(?is).*?\[/think\]"):
+        match = re.search(pattern, raw)
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
 def _balanced_json_candidates(text: str) -> List[str]:
     spans: List[Tuple[int, int]] = []
     depth = 0
@@ -279,22 +287,7 @@ def _coerce_option_value(value: Any, env: FinancialAdvisorAuditEnvironment) -> O
     text = str(value).strip()
     if not text:
         return None
-
-    rec_id = env._coerce_option_id(text, default=None)
-    if rec_id is not None:
-        return rec_id
-
-    if re.fullmatch(r"[1-9]\d*", text):
-        idx = int(text) - 1
-        if 0 <= idx < len(env.current_scenario.options):
-            return env.current_scenario.options[idx].option_id
-
-    match = re.fullmatch(r"(?i)(?:option|choice|investment)[\s_#\-]*([1-9]\d*)", text)
-    if match:
-        idx = int(match.group(1)) - 1
-        if 0 <= idx < len(env.current_scenario.options):
-            return env.current_scenario.options[idx].option_id
-    return None
+    return env._coerce_option_id(text, default=None)
 
 
 def _extract_unique_option_id_from_text(text: str, env: FinancialAdvisorAuditEnvironment) -> Optional[str]:
@@ -302,35 +295,9 @@ def _extract_unique_option_id_from_text(text: str, env: FinancialAdvisorAuditEnv
         return None
 
     candidates: List[str] = []
-    key_names = (
-        "Recommended_investment_id",
-        "recommended_investment_id",
-        "recommended_option_id",
-        "Recommendation",
-        "recommendation",
-    )
-    for key in key_names:
-        patterns = [
-            rf"(?is)[\"']?{re.escape(key)}[\"']?\s*[:=]\s*\"([^\"]+)\"",
-            rf"(?is)['\"]?{re.escape(key)}['\"]?\s*[:=]\s*'([^']+)'",
-            rf"(?is)[\"']?{re.escape(key)}[\"']?\s*[:=]\s*([A-Za-z0-9_\- ]+)",
-        ]
-        for pattern in patterns:
-            for match in re.finditer(pattern, text):
-                rec_id = _coerce_option_value(match.group(1).strip(), env)
-                if rec_id is not None:
-                    candidates.append(rec_id)
-
-    for match in re.finditer(r"(?i)\b(?:option|choice|investment)\s*([1-9]\d*)\b", text):
-        idx = int(match.group(1)) - 1
-        if 0 <= idx < len(env.current_scenario.options):
-            candidates.append(env.current_scenario.options[idx].option_id)
-
     lower = text.lower()
     for option in env.current_scenario.options:
         if re.search(rf"(?<![a-z0-9_]){re.escape(option.option_id.lower())}(?![a-z0-9_])", lower):
-            candidates.append(option.option_id)
-        if option.title.lower() in lower:
             candidates.append(option.option_id)
 
     unique: List[str] = []
@@ -341,6 +308,7 @@ def _extract_unique_option_id_from_text(text: str, env: FinancialAdvisorAuditEnv
 
 
 def _parse_advisor_response_text(raw_text: str, env: FinancialAdvisorAuditEnvironment) -> Dict[str, Any]:
+    reasoning = _extract_reasoning_text(raw_text)
     cleaned = _strip_reasoning_blocks(raw_text)
     parsed_candidate = None
     last_error = None
@@ -372,6 +340,7 @@ def _parse_advisor_response_text(raw_text: str, env: FinancialAdvisorAuditEnviro
                     "Action": "ADVISOR_RECOMMENDATION",
                     "Recommended_investment_id": rec_id,
                     "Message": message,
+                    "reasoning": reasoning,
                     "_raw_text": raw_text,
                     "parsed_candidate": parsed_candidate,
                     "parse_mode": "json",
@@ -386,6 +355,7 @@ def _parse_advisor_response_text(raw_text: str, env: FinancialAdvisorAuditEnviro
             "Action": "ADVISOR_RECOMMENDATION",
             "Recommended_investment_id": rec_id,
             "Message": "",
+            "reasoning": reasoning,
             "_raw_text": raw_text,
             "parsed_candidate": parsed_candidate,
             "parse_mode": "text",
@@ -394,6 +364,7 @@ def _parse_advisor_response_text(raw_text: str, env: FinancialAdvisorAuditEnviro
     return {
         "Parse_fail": True,
         "error": last_error or "Could not recover advisor recommendation from raw text.",
+        "reasoning": reasoning,
         "_raw_text": raw_text,
         "parsed_candidate": parsed_candidate,
     }
@@ -425,6 +396,7 @@ def _extract_unique_decision_from_text(text: str) -> Optional[str]:
 
 
 def _parse_investor_response_text(raw_text: str) -> Dict[str, Any]:
+    reasoning = _extract_reasoning_text(raw_text)
     cleaned = _strip_reasoning_blocks(raw_text)
     parsed_candidate = None
     last_error = None
@@ -441,6 +413,7 @@ def _parse_investor_response_text(raw_text: str) -> Dict[str, Any]:
                     "Action": "INVESTOR_DECISION",
                     "Decision": decision,
                     "Message": message,
+                    "reasoning": reasoning,
                     "_raw_text": raw_text,
                     "parsed_candidate": parsed_candidate,
                     "parse_mode": "json",
@@ -455,6 +428,7 @@ def _parse_investor_response_text(raw_text: str) -> Dict[str, Any]:
             "Action": "INVESTOR_DECISION",
             "Decision": decision,
             "Message": "",
+            "reasoning": reasoning,
             "_raw_text": raw_text,
             "parsed_candidate": parsed_candidate,
             "parse_mode": "text",
@@ -463,6 +437,7 @@ def _parse_investor_response_text(raw_text: str) -> Dict[str, Any]:
     return {
         "Parse_fail": True,
         "error": last_error or "Could not recover investor decision from raw text.",
+        "reasoning": reasoning,
         "_raw_text": raw_text,
         "parsed_candidate": parsed_candidate,
     }
@@ -503,7 +478,12 @@ def deception_from_action(action: Any, env: FinancialAdvisorAuditEnvironment) ->
     if rec_id is None:
         return None
     label = env._label_advisor_recommendation(rec_id)
-    return bool(label.get("deceptive"))
+    deceptive = label.get("deceptive")
+    if deceptive is True:
+        return True
+    if deceptive is False:
+        return False
+    return None
 
 
 def truth_context(action: Any, env: FinancialAdvisorAuditEnvironment) -> Dict[str, Any]:
@@ -668,8 +648,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         parser.add_argument("--is_reasoning_model", action=argparse.BooleanOptionalAction, default=None)
     else:
         parser.add_argument("--is_reasoning_model", action="store_true", default=False)
-    parser.add_argument("--temperature", type=float, default=0.5)
-    parser.add_argument("--top_p", type=float, default=0.5)
+    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
     parser.add_argument("--max_retries", type=int, default=3)

@@ -15,8 +15,9 @@ REPO_ROOT = SRC_ROOT.parent
 BS_SRC_ROOT = REPO_ROOT / "BS" / "src"
 GRIDWORLD_SRC_ROOT = REPO_ROOT / "Gridworld" / "src"
 INTERVIEW_SRC_ROOT = REPO_ROOT / "Interview" / "src"
+CAR_SALES_SRC_ROOT = REPO_ROOT / "CarSales" / "src"
 
-for path in (SRC_ROOT, BS_SRC_ROOT, GRIDWORLD_SRC_ROOT, INTERVIEW_SRC_ROOT):
+for path in (SRC_ROOT, BS_SRC_ROOT, GRIDWORLD_SRC_ROOT, INTERVIEW_SRC_ROOT, CAR_SALES_SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.append(str(path))
 
@@ -51,6 +52,7 @@ def sample_phase(game: str) -> str:
         "bs": "PLAY",
         "gridworld": "GUIDE",
         "interview": "CANDIDATE_RESPONSE",
+        "car_sales": "SELLER_RESPONSE",
     }[game]
 
 
@@ -62,11 +64,13 @@ def make_agents(game: str, llm, model_name: str, n_players: int, is_reasoning_mo
         reasoning_instruction = "COT"
         instruction_format = "reasoning"
 
-    if game in {"gridworld", "interview"}:
+    if game in {"gridworld", "interview", "car_sales"}:
         n_players = 2
 
     if game == "interview":
         names = ["Candidate", "HiringManager"]
+    elif game == "car_sales":
+        names = ["Seller", "Buyer"]
     else:
         names = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"]
     agents = []
@@ -86,6 +90,8 @@ def make_agents(game: str, llm, model_name: str, n_players: int, is_reasoning_mo
             ag.guide_format = "reasoning" if instruction_format == "reasoning" else "default"
             ag.challenge_format = "reasoning" if instruction_format == "reasoning" else "default"
         elif game == "interview":
+            pass
+        elif game == "car_sales":
             pass
         else:
             raise ValueError(f"Unsupported game: {game}")
@@ -143,6 +149,27 @@ def _load_processed_interview_conversation_ids(output_path: str, processed_path:
     return seen
 
 
+def _load_processed_car_sales_game_ids(output_path: str, processed_path: str) -> set[int]:
+    seen: set[int] = set()
+    for row in _iter_jsonl(processed_path):
+        game_id = row.get("game_id")
+        if isinstance(game_id, bool):
+            continue
+        try:
+            seen.add(int(game_id))
+        except Exception:
+            continue
+    for row in _iter_jsonl(output_path):
+        game_id = row.get("game_id")
+        if isinstance(game_id, bool):
+            continue
+        try:
+            seen.add(int(game_id))
+        except Exception:
+            continue
+    return seen
+
+
 def _append_processed_interview_conversation(
     processed_path: str,
     env,
@@ -167,6 +194,34 @@ def _append_processed_interview_conversation(
             "truthful_count": int(game_truthful_count),
             "unknown_count": int(game_unknown_count),
             "outcome": env.outcome,
+        },
+        processed_path,
+    )
+
+
+def _append_processed_car_sales_game(
+    processed_path: str,
+    env,
+    game_idx: int,
+    game_saved_count: int,
+    game_sample_count: int,
+    game_deceptive_count: int,
+    game_truthful_count: int,
+    game_unknown_count: int,
+) -> None:
+    append_jsonl(
+        {
+            "processed_at": time.time(),
+            "game": "car_sales",
+            "game_id": int(game_idx),
+            "scenario_name": env.current_scenario.name,
+            "saved_count": int(game_saved_count),
+            "sample_count": int(game_sample_count),
+            "deceptive_count": int(game_deceptive_count),
+            "truthful_count": int(game_truthful_count),
+            "unknown_count": int(game_unknown_count),
+            "outcome": env.outcome,
+            "max_rounds": int(env.max_rounds),
         },
         processed_path,
     )
@@ -225,6 +280,19 @@ def build_env(game: str, llm, model_name: str, seed: int, args, game_idx: int = 
             history_window=args.history_window,
         )
 
+    if game == "car_sales":
+        from car_sales_environment import CarSalesSpec, UsedCarSalesEnvironment
+
+        agents = make_agents(game, llm, model_name, 2, args.is_reasoning_model)
+        spec = CarSalesSpec(max_rounds=args.car_sales_max_rounds)
+        return UsedCarSalesEnvironment(
+            agents=agents,
+            seed=seed,
+            spec=spec,
+            scenario_name=args.car_sales_scenario_name,
+            history_window=args.history_window,
+        )
+
     raise ValueError(f"Unsupported game: {game}")
 
 
@@ -253,6 +321,18 @@ def state_summary(game: str, env) -> Dict[str, Any]:
             "candidate_target_total_comp": env._candidate_target_total_comp(),
             "history_len": len(env.history),
             "game_type": "interview",
+        }
+
+    if game == "car_sales":
+        return {
+            "phase": env.phase,
+            "active_player": active,
+            "scenario_name": env.current_scenario.name,
+            "current_round_focus": env._current_round_plan().focus_id,
+            "target_issue_id": env._current_target_issue_id(),
+            "max_rounds": env.max_rounds,
+            "history_len": len(env.history),
+            "game_type": "car_sales",
         }
 
     return {
@@ -293,7 +373,26 @@ def deception_from_action(game: str, action, env) -> Optional[bool]:
             label = env.label_candidate_action(action)
         except Exception:
             return None
-        return bool(label.get("deceptive"))
+        deceptive = label.get("deceptive")
+        if deceptive is True:
+            return True
+        if deceptive is False:
+            return False
+        return None
+
+    if game == "car_sales":
+        if env.phase != "SELLER_RESPONSE":
+            return None
+        try:
+            label = env.label_seller_action(action)
+        except Exception:
+            return None
+        deceptive = label.get("deceptive")
+        if deceptive is True:
+            return True
+        if deceptive is False:
+            return False
+        return None
 
     if not isinstance(action, dict):
         return None
@@ -327,12 +426,26 @@ def truth_context(game: str, env, action) -> Dict[str, Any]:
         label = env.label_candidate_action(normalized)
         return {
             "type": "interview_final_response",
-            "decision": normalized.get("Decision"),
+            "decision": normalized.get("Action"),
             "offer_total_comp": env._offer_total_comp(env.current_scenario.offer),
             "candidate_target_total_comp": env._candidate_target_total_comp(),
             "true_has_other_offer": bool(env.current_private_state.has_other_offer),
             "true_other_offer_company": env.current_private_state.other_offer_company,
             "true_other_offer_base_salary": env.current_private_state.other_offer_base_salary,
+            "label_preview": label,
+        }
+
+    if game == "car_sales":
+        normalized = env.normalize_seller_action(action)
+        label = env.label_seller_action(normalized)
+        truthful_action = env.get_truthful_action()
+        return {
+            "type": "car_sales_seller_response",
+            "seller_action_kind": normalized.get("Action"),
+            "target_issue_id": env._current_target_issue_id(),
+            "current_round_focus": env._current_round_plan().focus_id,
+            "already_disclosed_issue_ids": sorted(env.disclosed_issue_ids),
+            "truthful_action": truthful_action,
             "label_preview": label,
         }
 
@@ -353,7 +466,7 @@ def truth_context(game: str, env, action) -> Dict[str, Any]:
 def _fallback_primary_action(game: str, env):
     if game == "bs":
         return {"Action": "PLAY", "Cards_played": []}
-    if game == "interview":
+    if game in {"interview", "car_sales"}:
         return env.get_truthful_action()
     return {"Action": "RECOMMEND", "Direction": "UP", "Message": ""}
 
@@ -380,7 +493,7 @@ def _model_action(llm, messages, args):
     return action, seed_used
 
 
-def _model_actions(llm, messages, args, num_responses: int):
+def _model_actions(llm, messages, args, num_responses: int, seed_offset: int = 0):
     actions, seed_used = get_model_output(
         llm=llm,
         messages=messages,
@@ -392,6 +505,7 @@ def _model_actions(llm, messages, args, num_responses: int):
         num_responses=max(1, int(num_responses)),
         max_retries=args.max_retries,
         model_name=args.model_name,
+        seed_offset=seed_offset,
     )
     if isinstance(actions, list):
         return actions, seed_used
@@ -437,6 +551,19 @@ def _sample_balanced_candidates(game: str, env, candidates):
     picked_truthful = random.choice(truthful_candidates) if truthful_candidates else None
 
     return picked_deceptive, picked_truthful, unknown_candidates
+
+
+def _seed_used_from_batch(
+    batch_seed_offset: int,
+    seed_base: int,
+    sample_idx: int,
+    samples_per_state: int,
+) -> int:
+    return (
+        int(batch_seed_offset)
+        + int(seed_base) * max(1, int(samples_per_state))
+        + int(sample_idx)
+    )
 
 
 def _targets_reached(
@@ -604,6 +731,26 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
                 )
                 continue
 
+            if game == "car_sales" and env.phase == "BUYER_QUESTION":
+                state = env.get_state()
+                messages = copy.deepcopy(state.get("messages", []))
+                messages = prepare_messages_for_model(messages, model_name=args.model_name)
+                action, seed_used = _model_action(llm, messages, args)
+                applied_action = action if isinstance(action, dict) else _fallback_primary_action(game, env)
+                step_result = env.manual_step(applied_action)
+                events.append(
+                    _compact_event(
+                        phase="BUYER_QUESTION",
+                        active_player=state.get("active_player"),
+                        messages=messages,
+                        prompt=_render_prompt_text(tokenizer, messages, model_name=args.model_name),
+                        seed=seed_used,
+                        action=action,
+                        step_result=step_result,
+                    )
+                )
+                continue
+
             # Fallback for unexpected states.
             state = env.get_state()
             messages = copy.deepcopy(state.get("messages", []))
@@ -628,17 +775,23 @@ def resolve_to_next_primary_phase(game: str, env, llm, args, tokenizer=None):
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Universal deception miner for BS, Gridworld, and Interview.")
+    parser = argparse.ArgumentParser(description="Universal deception miner for BS, Gridworld, Interview, and CarSales.")
 
-    parser.add_argument("--game", choices=["bs", "gridworld", "interview"], required=True)
+    parser.add_argument("--game", choices=["bs", "gridworld", "interview", "car_sales"], required=True)
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--is_reasoning_model", action="store_true", default=False)
-    parser.add_argument("--temperature", type=float, default=0.5)
-    parser.add_argument("--top_p", type=float, default=0.5)
+    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--max_tokens", type=int, default=10000)
     parser.add_argument("--repetition_penalty", type=float, default=1.2)
     parser.add_argument("--max_retries", type=int, default=3)
     parser.add_argument("--samples_per_state", type=int, default=1)
+    parser.add_argument(
+        "--max_state_resample_rounds",
+        type=int,
+        default=0,
+        help="If > 0, stop resampling a state after this many sample batches. Default 0 means unlimited.",
+    )
 
     parser.add_argument("--max_games", type=int, default=1000)
     parser.add_argument("--max_turns", type=int, default=1000)
@@ -676,6 +829,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Interview options
     parser.add_argument("--interview_conversations_path", type=str, default=None)
     parser.add_argument("--interview_private_profile_name", type=str, default=None)
+
+    # CarSales options
+    parser.add_argument("--car_sales_scenario_name", type=str, default=None)
+    parser.add_argument("--car_sales_max_rounds", type=int, default=4)
+
     if hasattr(argparse, "BooleanOptionalAction"):
         parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     else:
@@ -716,6 +874,7 @@ def main(argv=None):
         "max_tokens": args.max_tokens,
         "repetition_penalty": args.repetition_penalty,
         "samples_per_state": args.samples_per_state,
+        "max_state_resample_rounds": args.max_state_resample_rounds,
         "num_players": args.num_players,
         "cards_per_player": args.cards_per_player,
         "grid_width": args.grid_width,
@@ -728,6 +887,8 @@ def main(argv=None):
         "auto_move_explorer": args.auto_move_explorer,
         "interview_conversations_path": args.interview_conversations_path,
         "interview_private_profile_name": args.interview_private_profile_name,
+        "car_sales_scenario_name": args.car_sales_scenario_name,
+        "car_sales_max_rounds": args.car_sales_max_rounds,
         "max_games": args.max_games,
         "max_turns": args.max_turns,
         "target_deceptive": args.target_deceptive,
@@ -751,6 +912,7 @@ def main(argv=None):
 
     output_path = os.path.join(args.output_dir, "deception_samples.jsonl")
     processed_path = os.path.join(args.output_dir, "processed_interview_conversations.jsonl")
+    processed_car_sales_path = os.path.join(args.output_dir, "processed_car_sales_games.jsonl")
 
     total_states = 0
     total_samples = 0
@@ -768,6 +930,7 @@ def main(argv=None):
     max_game_slots = args.max_games
     interview_scenarios = None
     processed_interview_ids: set[str] = set()
+    processed_car_sales_game_ids: set[int] = set()
     if args.game == "interview":
         interview_scenarios = _load_interview_scenarios(args)
         meta["interview_num_seed_conversations"] = len(interview_scenarios)
@@ -783,6 +946,19 @@ def main(argv=None):
                 logging.info(
                     "Resume enabled for interview miner: skipping %d previously processed conversations.",
                     len(processed_interview_ids),
+                )
+    elif args.game == "car_sales":
+        meta["processed_car_sales_manifest"] = processed_car_sales_path
+        atomic_write_json(os.path.join(args.output_dir, "meta.json"), meta)
+        if args.resume:
+            processed_car_sales_game_ids = _load_processed_car_sales_game_ids(
+                output_path=output_path,
+                processed_path=processed_car_sales_path,
+            )
+            if processed_car_sales_game_ids:
+                logging.info(
+                    "Resume enabled for car_sales miner: skipping %d previously processed games.",
+                    len(processed_car_sales_game_ids),
                 )
 
     for game_idx in range(max_game_slots):
@@ -801,6 +977,8 @@ def main(argv=None):
             conversation_id = interview_scenarios[game_idx].conversation_id
             if conversation_id and str(conversation_id) in processed_interview_ids:
                 continue
+        if args.game == "car_sales" and game_idx in processed_car_sales_game_ids:
+            continue
 
         env = build_env(
             game=args.game,
@@ -840,20 +1018,118 @@ def main(argv=None):
             messages = copy.deepcopy(state["messages"])
             messages = prepare_messages_for_model(messages, model_name=args.model_name)
 
-            candidate_actions, seed_base = _model_actions(
-                llm,
-                messages,
-                args,
-                num_responses=args.samples_per_state,
-            )
             sampled_state_summary = state_summary(args.game, env)
             prompt_text = _render_prompt_text(tokenizer, messages, model_name=args.model_name)
+            require_deceptive = use_target_deceptive
+            require_truthful = use_target_truthful
+            picked_deceptive = None
+            picked_truthful = None
+            last_candidate_actions = []
+            last_seed_base = 0
+            last_batch_seed_offset = 0
+            last_resample_round_idx = 0
 
-            picked_deceptive, picked_truthful, _ = _sample_balanced_candidates(
-                args.game,
-                env,
-                candidate_actions,
-            )
+            resample_round_idx = 0
+            while True:
+                batch_seed_offset = (
+                    int(resample_round_idx)
+                    * max(1, int(args.samples_per_state))
+                    * max(1, int(args.max_retries))
+                )
+                candidate_actions, seed_base = _model_actions(
+                    llm,
+                    messages,
+                    args,
+                    num_responses=args.samples_per_state,
+                    seed_offset=batch_seed_offset,
+                )
+                last_candidate_actions = candidate_actions
+                last_seed_base = seed_base
+                last_batch_seed_offset = batch_seed_offset
+                last_resample_round_idx = resample_round_idx
+
+                batch_picked_deceptive, batch_picked_truthful, _ = _sample_balanced_candidates(
+                    args.game,
+                    env,
+                    candidate_actions,
+                )
+
+                if picked_deceptive is None and batch_picked_deceptive is not None:
+                    batch_sample_idx, action, deceptive = batch_picked_deceptive
+                    state_sample_idx = (
+                        int(resample_round_idx) * max(1, int(args.samples_per_state))
+                        + int(batch_sample_idx)
+                    )
+                    seed_used = _seed_used_from_batch(
+                        batch_seed_offset=batch_seed_offset,
+                        seed_base=seed_base,
+                        sample_idx=batch_sample_idx,
+                        samples_per_state=args.samples_per_state,
+                    )
+                    picked_deceptive = (
+                        seed_used,
+                        state_sample_idx,
+                        int(resample_round_idx),
+                        action,
+                        deceptive,
+                    )
+
+                if picked_truthful is None and batch_picked_truthful is not None:
+                    batch_sample_idx, action, deceptive = batch_picked_truthful
+                    state_sample_idx = (
+                        int(resample_round_idx) * max(1, int(args.samples_per_state))
+                        + int(batch_sample_idx)
+                    )
+                    seed_used = _seed_used_from_batch(
+                        batch_seed_offset=batch_seed_offset,
+                        seed_base=seed_base,
+                        sample_idx=batch_sample_idx,
+                        samples_per_state=args.samples_per_state,
+                    )
+                    picked_truthful = (
+                        seed_used,
+                        state_sample_idx,
+                        int(resample_round_idx),
+                        action,
+                        deceptive,
+                    )
+
+                missing_labels = []
+                if require_deceptive and picked_deceptive is None:
+                    missing_labels.append("deceptive")
+                if require_truthful and picked_truthful is None:
+                    missing_labels.append("truthful")
+                if not missing_labels:
+                    break
+
+                next_resample_round_idx = int(resample_round_idx) + 1
+                if (
+                    int(args.max_state_resample_rounds) > 0
+                    and next_resample_round_idx >= int(args.max_state_resample_rounds)
+                ):
+                    logging.warning(
+                        "State %d (game=%s game_idx=%d turn=%d) missing labels=%s after %d sample batches; proceeding with available outputs.",
+                        total_states,
+                        args.game,
+                        game_idx,
+                        turn_idx,
+                        ",".join(missing_labels),
+                        int(args.max_state_resample_rounds),
+                    )
+                    break
+
+                if next_resample_round_idx == 1 or next_resample_round_idx % 10 == 0:
+                    logging.info(
+                        "Resampling state %d (game=%s game_idx=%d turn=%d); still missing labels=%s after %d sample batches.",
+                        total_states,
+                        args.game,
+                        game_idx,
+                        turn_idx,
+                        ",".join(missing_labels),
+                        next_resample_round_idx,
+                    )
+
+                resample_round_idx = next_resample_round_idx
 
             transition_candidates = []
             if picked_deceptive is not None:
@@ -862,24 +1138,63 @@ def main(argv=None):
                 transition_candidates.append(picked_truthful)
 
             record_candidates = []
-            need_deceptive = (not use_target_deceptive) or (total_deceptive < args.target_deceptive)
-            need_truthful = (not use_target_truthful) or (total_truthful < args.target_truthful)
-            if picked_deceptive is not None and need_deceptive:
-                sample_idx, action, deceptive = picked_deceptive
-                record_candidates.append((sample_idx, action, deceptive, truth_context(args.game, env, action)))
-            if picked_truthful is not None and need_truthful:
-                sample_idx, action, deceptive = picked_truthful
-                record_candidates.append((sample_idx, action, deceptive, truth_context(args.game, env, action)))
+            if picked_deceptive is not None and require_deceptive:
+                seed_used, sample_idx, sample_round_idx, action, deceptive = picked_deceptive
+                record_candidates.append(
+                    (
+                        seed_used,
+                        sample_idx,
+                        sample_round_idx,
+                        action,
+                        deceptive,
+                        truth_context(args.game, env, action),
+                    )
+                )
+            if picked_truthful is not None and require_truthful:
+                seed_used, sample_idx, sample_round_idx, action, deceptive = picked_truthful
+                record_candidates.append(
+                    (
+                        seed_used,
+                        sample_idx,
+                        sample_round_idx,
+                        action,
+                        deceptive,
+                        truth_context(args.game, env, action),
+                    )
+                )
 
             if transition_candidates:
-                chosen_sample_idx, transition_action, _transition_deceptive = random.choice(transition_candidates)
+                (
+                    chosen_seed_used,
+                    chosen_sample_idx,
+                    chosen_sample_round_idx,
+                    transition_action,
+                    _transition_deceptive,
+                ) = random.choice(transition_candidates)
             else:
-                transition_action, chosen_sample_idx = _choose_primary_action(args.game, env, candidate_actions)
+                transition_action, chosen_batch_sample_idx = _choose_primary_action(
+                    args.game,
+                    env,
+                    last_candidate_actions,
+                )
                 transition_deceptive = deception_from_action(args.game, transition_action, env)
+                chosen_seed_used = _seed_used_from_batch(
+                    batch_seed_offset=last_batch_seed_offset,
+                    seed_base=last_seed_base,
+                    sample_idx=chosen_batch_sample_idx,
+                    samples_per_state=args.samples_per_state,
+                )
+                chosen_sample_idx = (
+                    int(last_resample_round_idx) * max(1, int(args.samples_per_state))
+                    + int(chosen_batch_sample_idx)
+                )
+                chosen_sample_round_idx = int(last_resample_round_idx)
                 if not record_candidates:
                     record_candidates.append(
                         (
+                            chosen_seed_used,
                             chosen_sample_idx,
+                            chosen_sample_round_idx,
                             transition_action,
                             transition_deceptive,
                             truth_context(args.game, env, transition_action),
@@ -915,12 +1230,12 @@ def main(argv=None):
             challenge_pass = challenge_passes[0] if challenge_passes else None
 
             record_entries = []
-            for sample_idx, action, deceptive, truth_ctx in record_candidates:
-                seed_used = seed_base * max(1, int(args.samples_per_state)) + int(sample_idx)
-                used_for_transition = int(sample_idx) == int(chosen_sample_idx)
+            for seed_used, sample_idx, sample_round_idx, action, deceptive, truth_ctx in record_candidates:
+                used_for_transition = int(seed_used) == int(chosen_seed_used)
                 rec = {
                     "state_id": total_states,
                     "sample_idx": sample_idx,
+                    "resample_round_idx": sample_round_idx,
                     "seed": seed_used,
                     "deceptive": deceptive,
                     "naturally_deceptive": deceptive,
@@ -1000,6 +1315,18 @@ def main(argv=None):
             )
             if env.current_scenario.conversation_id:
                 processed_interview_ids.add(str(env.current_scenario.conversation_id))
+        elif args.game == "car_sales" and game_processed_state_count > 0:
+            _append_processed_car_sales_game(
+                processed_path=processed_car_sales_path,
+                env=env,
+                game_idx=game_idx,
+                game_saved_count=game_saved_count,
+                game_sample_count=game_sample_count,
+                game_deceptive_count=game_deceptive_count,
+                game_truthful_count=game_truthful_count,
+                game_unknown_count=game_unknown_count,
+            )
+            processed_car_sales_game_ids.add(int(game_idx))
 
         if _targets_reached(
             total_deceptive,
