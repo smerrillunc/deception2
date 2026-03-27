@@ -38,7 +38,7 @@ Required:
   --mining_dir DIR              Directory containing deception_samples.jsonl and ideally meta.json
 
 Optional:
-  --env ENV                     One of: bs, gridworld, advisor_audit. If omitted, infer from meta.json.
+  --env ENV                     One of: bs, gridworld, advisor_audit, interview, car_sales. If omitted, infer from meta.json.
   --model_name MODEL            If omitted, infer from meta.json.
   --gpu GPU                     Optional single GPU id; otherwise uses existing CUDA_VISIBLE_DEVICES
   --pipeline_dir DIR            Output root for examples/sentences/localization
@@ -214,7 +214,7 @@ if [[ -z "$ENVIRONMENT" || -z "$MODEL_NAME" ]]; then
 fi
 
 case "$ENVIRONMENT" in
-  bs|gridworld|advisor_audit)
+  bs|gridworld|advisor_audit|interview|car_sales)
     ;;
   *)
     echo "Unsupported env: $ENVIRONMENT" >&2

@@ -37,7 +37,7 @@ Usage:
   run_sentence_localization_dataset_main_multi_gpu.sh --env ENV --model_name MODEL --gpu_ids "2 3 4 5"
 
 Required:
-  --env ENV                  One of: bs, gridworld, advisor_audit
+  --env ENV                  One of: bs, gridworld, advisor_audit, interview, car_sales
   --model_name MODEL         Hugging Face / vLLM model name
   --gpu_ids "2 3 4 5"        Space-separated GPU ids on the current machine
 
@@ -118,7 +118,7 @@ if [[ -z "$ENVIRONMENT" || -z "$MODEL_NAME" || -z "$GPU_IDS_STR" ]]; then
 fi
 
 case "$ENVIRONMENT" in
-  bs|gridworld|advisor_audit)
+  bs|gridworld|advisor_audit|interview|car_sales)
     ;;
   *)
     echo "Unsupported env: $ENVIRONMENT" >&2

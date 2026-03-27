@@ -137,6 +137,42 @@ def _synthesize_action_raw_text(action: Dict[str, Any]) -> Optional[str]:
         return None
 
 
+def _sanitize_record_token(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+
+
+def _compose_record_id(run_id: str, line_num: int, row: Dict[str, Any]) -> str:
+    parts = [run_id]
+
+    conversation_id = _sanitize_record_token(row.get("conversation_id"))
+    game_id = _sanitize_record_token(row.get("game_id"))
+    turn_idx = _sanitize_record_token(row.get("turn_idx"))
+    state_id = _sanitize_record_token(row.get("state_id"))
+    sample_idx = _sanitize_record_token(row.get("sample_idx"))
+
+    if conversation_id is not None:
+        parts.append(f"conversation_{conversation_id}")
+    elif game_id is not None:
+        parts.append(f"game_{game_id}")
+
+    if turn_idx is not None:
+        parts.append(f"turn_{turn_idx}")
+    if state_id is not None:
+        parts.append(f"state_{state_id}")
+    if sample_idx is not None:
+        parts.append(f"sample_{sample_idx}")
+
+    if len(parts) == 1:
+        parts.append(f"line_{line_num}")
+
+    return "/".join(parts)
+
+
 def iter_deception_records(
     root_dir: str | Path,
     *,
@@ -175,6 +211,9 @@ def iter_deception_records(
                 "seed",
                 "deceptive",
                 "game_id",
+                "conversation_id",
+                "scenario_name",
+                "base_scenario_name",
                 "turn_idx",
                 "phase",
                 "current_rank",
@@ -216,12 +255,7 @@ def iter_deception_records(
                 if isinstance(action.get("Cards_played"), list):
                     out["cards_played_len"] = len(action["Cards_played"])
 
-            state_id = out.get("state_id")
-            sample_idx = out.get("sample_idx")
-            if state_id is not None and sample_idx is not None:
-                out["record_id"] = f"{run_info['run_id']}/state_{state_id}/sample_{sample_idx}"
-            else:
-                out["record_id"] = f"{run_info['run_id']}/line_{line_num}"
+            out["record_id"] = _compose_record_id(run_info["run_id"], line_num, out)
 
             if not keep_record_for_label_filter(out, label_filter):
                 continue
