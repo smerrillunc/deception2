@@ -90,19 +90,13 @@ def parse_args():
     )
     parser.add_argument(
         "--output_path",
-        default=str(
-            INTERVIEW_ROOT / "Data" / "interview_conversation_seeds_vllm_qwen14b.jsonl"
-        ),
-        help="JSONL output path for generated conversation seeds.",
+        default=None,
+        help="JSONL output path for generated conversation seeds. Defaults to a model-specific path under Interview/Data/.",
     )
     parser.add_argument(
         "--dry_run_output_path",
-        default=str(
-            INTERVIEW_ROOT
-            / "Data"
-            / "interview_conversation_seeds_vllm_qwen14b_dry_run.jsonl"
-        ),
-        help="Optional single-record JSONL path used with --dry_run.",
+        default=None,
+        help="Optional single-record JSONL path used with --dry_run. Defaults to a model-specific *_dry_run.jsonl path under Interview/Data/.",
     )
     parser.add_argument("--total_conversations", type=int, default=5000)
     parser.add_argument("--turns_per_conversation", type=int, default=4)
@@ -113,12 +107,21 @@ def parse_args():
     parser.add_argument("--max_retries", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument(
+        "--quantization",
+        default=None,
+        help="Optional vLLM quantization mode, e.g. bitsandbytes. In this env, bitsandbytes defaults to 4-bit loading.",
+    )
     parser.add_argument("--max_model_len", type=int, default=4096)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--log_every", type=int, default=25)
-    parser.add_argument("--run_tag", default="vllm_qwen14b_seeded_dialogues_v1")
+    parser.add_argument(
+        "--run_tag",
+        default=None,
+        help="Optional run tag stored in metadata. Defaults to a model-specific tag.",
+    )
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--resume", dest="resume", action="store_true", default=True)
@@ -134,6 +137,35 @@ def parse_args():
         help="Print the example prompt before generating.",
     )
     return parser.parse_args()
+
+
+def slugify_name(text: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", str(text).strip())
+    return slug.strip("_").lower() or "model"
+
+
+def default_output_stem(model_name: str, quantization: str | None = None) -> str:
+    model_tail = str(model_name).split("/")[-1]
+    stem = f"interview_conversation_seeds_vllm_{slugify_name(model_tail)}"
+    if quantization:
+        stem = f"{stem}_{slugify_name(quantization)}"
+    return stem
+
+
+def apply_default_paths_and_run_tag(args):
+    if args.quantization is not None:
+        args.quantization = str(args.quantization).strip() or None
+
+    stem = default_output_stem(args.model_name, args.quantization)
+    if not args.output_path:
+        args.output_path = str(INTERVIEW_ROOT / "Data" / f"{stem}.jsonl")
+    if not args.dry_run_output_path:
+        args.dry_run_output_path = str(
+            INTERVIEW_ROOT / "Data" / f"{stem}_dry_run.jsonl"
+        )
+    if not args.run_tag:
+        args.run_tag = stem
+    return args
 
 
 def validate_args(args):
@@ -404,7 +436,7 @@ def make_llm(args) -> LLM:
         raise ValueError(
             f"Need at least {args.tensor_parallel_size} visible CUDA devices, found {visible_cuda}."
         )
-    return LLM(
+    llm_kwargs = dict(
         model=args.model_name,
         dtype=args.dtype,
         max_model_len=args.max_model_len,
@@ -413,6 +445,9 @@ def make_llm(args) -> LLM:
         trust_remote_code=args.trust_remote_code,
         seed=args.seed,
     )
+    if args.quantization:
+        llm_kwargs["quantization"] = args.quantization
+    return LLM(**llm_kwargs)
 
 
 def call_vllm_raw(
@@ -495,6 +530,7 @@ def generate_conversation_record(llm: LLM, job, args, attempt_seed: int = 0):
         metadata={
             "run_tag": args.run_tag,
             "model_name": args.model_name,
+            "quantization": args.quantization,
             "backend": "vllm",
             "temperature": args.temperature,
             "top_p": args.top_p,
@@ -558,6 +594,7 @@ def choose_example_job(jobs, fallback_jobs):
 
 def main():
     args = parse_args()
+    args = apply_default_paths_and_run_tag(args)
     validate_args(args)
 
     output_path = Path(args.output_path)
@@ -573,6 +610,7 @@ def main():
     print(f"repo_root = {REPO_ROOT}", flush=True)
     print(f"cuda_device_count = {torch.cuda.device_count()}", flush=True)
     print(f"model = {args.model_name}", flush=True)
+    print(f"quantization = {args.quantization}", flush=True)
     print(f"output_path = {output_path}", flush=True)
     print(f"total_conversations = {args.total_conversations}", flush=True)
     print(
