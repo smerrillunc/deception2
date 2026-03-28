@@ -199,26 +199,40 @@ def _strict_bool(value: Any) -> Optional[bool]:
     return value if isinstance(value, bool) else None
 
 
+def _looks_like_bs_record(rec: Dict[str, Any]) -> bool:
+    if any(rec.get(key) is not None for key in ("current_rank", "previous_rank", "truthful_rank")):
+        return True
+
+    action = rec.get("action")
+    if not isinstance(action, dict):
+        return False
+
+    if action.get("Action") != "PLAY":
+        return False
+
+    return any(rec.get(key) is not None for key in ("hand", "pile_size", "active_player"))
+
+
 def _record_game_type(rec: Dict[str, Any]) -> Optional[str]:
     game_type = rec.get("game_type")
     if isinstance(game_type, str) and game_type.strip():
         return game_type.strip()
 
     truth_context = rec.get("truth_context")
-    if not isinstance(truth_context, dict):
-        return None
-
-    tc_type = truth_context.get("type")
-    if tc_type == "bs_play":
+    if isinstance(truth_context, dict):
+        tc_type = truth_context.get("type")
+        if tc_type == "bs_play":
+            return "bs"
+        if tc_type == "gridworld_recommendation":
+            return "gridworld"
+        if tc_type == "interview_final_response":
+            return "interview"
+        if tc_type == "car_sales_seller_response":
+            return "car_sales"
+        if tc_type == "advisor_audit_recommendation":
+            return "advisor_audit"
+    if _looks_like_bs_record(rec):
         return "bs"
-    if tc_type == "gridworld_recommendation":
-        return "gridworld"
-    if tc_type == "interview_final_response":
-        return "interview"
-    if tc_type == "car_sales_seller_response":
-        return "car_sales"
-    if tc_type == "advisor_audit_recommendation":
-        return "advisor_audit"
     return None
 
 
@@ -239,6 +253,9 @@ def _strict_deceptive_label(rec: Dict[str, Any]) -> tuple[Optional[bool], str]:
             return None, "bs_action_unrecognized"
         truthful = _strict_bool(truth_context.get("truthful"))
         if truthful is None:
+            recorded = _coerce_deceptive_label(rec.get("deceptive"))
+            if recorded is not None and _looks_like_bs_record(rec):
+                return recorded, "bs_legacy_recorded_label"
             return None, "bs_truthfulness_missing"
         return (not truthful), "bs_truth_context"
 

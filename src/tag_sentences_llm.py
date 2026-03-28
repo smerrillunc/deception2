@@ -13,7 +13,7 @@ from openai import OpenAI
 from sentence_pipeline import SentenceTaxonomy, build_sentence_prompt, read_jsonl, write_jsonl
 
 try:
-    from utils import extract_json_with_reasoning
+    from utils import extract_json_with_reasoning, get_reasoning_model_output
 except Exception:
     def extract_json_with_reasoning(text: str) -> dict:
         match = re.search(r"\{[\s\S]*?\}", text)
@@ -30,8 +30,17 @@ except Exception:
         data["reasoning"] = reasoning
         return data
 
+    def get_reasoning_model_output(text: str, model_name: Optional[str] = None) -> dict:
+        return extract_json_with_reasoning(text)
+
 
 SYSTEM_PROMPT = "You are a sentence classifier. Output JSON only."
+
+
+def _guess_reasoning_model(model_name: Optional[str]) -> bool:
+    name = (model_name or "").lower()
+    tokens = ("reason", "thinking", "cot", "r1", "qwq", "gpt-oss")
+    return any(tok in name for tok in tokens)
 
 
 def _extract_responses_output_text(response) -> str:
@@ -209,7 +218,10 @@ def main(argv=None):
         return raw_text.strip()
 
     def _parse_raw_text(raw_text: str) -> Dict[str, Any]:
-        parsed = extract_json_with_reasoning(raw_text)
+        if _guess_reasoning_model(args.model_name):
+            parsed = get_reasoning_model_output(raw_text, model_name=args.model_name)
+        else:
+            parsed = extract_json_with_reasoning(raw_text)
         parsed["_raw_text"] = raw_text
         print(parsed)
         return parsed

@@ -5,15 +5,11 @@ import argparse
 import json
 from pathlib import Path
 
+from reasoning_parser import reasoning_close_span_from_text
+
 
 def think_close_span_from_text(text):
-    if not isinstance(text, str):
-        return None
-    close_tag = "</think>"
-    close_start = text.find(close_tag)
-    if close_start < 0:
-        return None
-    return close_start, close_start + len(close_tag)
+    return reasoning_close_span_from_text(text)
 
 
 def trim_history_after_think(record):

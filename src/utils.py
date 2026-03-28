@@ -16,10 +16,11 @@ import numpy as np
 import torch
 from vllm import SamplingParams
 
-
-def _is_ministral3_family(model_name: Optional[str]) -> bool:
-    name = (model_name or "").strip().lower()
-    return "mistralai/" in name and "ministral-3" in name
+from reasoning_parser import (
+    extract_reasoning_trace,
+    is_ministral3_family,
+    strip_reasoning_trace,
+)
 
 
 @lru_cache(maxsize=16)
@@ -113,7 +114,7 @@ def prepare_messages_for_model(messages: List[Dict[str, Any]], model_name: Optio
     if not isinstance(messages, list):
         return messages
 
-    if not _is_ministral3_family(model_name):
+    if not is_ministral3_family(model_name):
         return messages
 
     try:
@@ -290,24 +291,15 @@ def extract_last_json_with_reasoning(text: str) -> dict:
 
 
 def get_reasoning_model_output(text: str, model_name: Optional[str] = None) -> dict:
-    if _is_ministral3_family(model_name):
-        think_pattern = r".*?\[/THINK\]"
-        think_match = re.search(think_pattern, text, flags=re.DOTALL)
-        if think_match:
-            think = think_match.group(0)
-            remaining = re.sub(think_pattern, "", text, flags=re.DOTALL).strip()
-            output_json = extract_json_with_reasoning(remaining)
-            output_json.update({"reasoning": think})
-            return output_json
-        return extract_last_json_with_reasoning(text)
+    reasoning = extract_reasoning_trace(text, model_name=model_name)
+    remaining = strip_reasoning_trace(text, model_name=model_name)
 
-    think_pattern = r".*?</think>"
-    think_match = re.search(think_pattern, text, flags=re.DOTALL)
-    think = think_match.group(0) if think_match else ""
-    remaining = re.sub(think_pattern, "", text, flags=re.DOTALL).strip()
-    output_json = extract_json_with_reasoning(remaining)
-    output_json.update({"reasoning": think})
-    return output_json
+    if reasoning or remaining != ("" if text is None else str(text).strip()):
+        output_json = extract_json_with_reasoning(remaining)
+        output_json.update({"reasoning": reasoning})
+        return output_json
+
+    return extract_last_json_with_reasoning(text)
 
 
 def atomic_write_json(path: str, data: Any) -> None:

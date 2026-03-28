@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
+from reasoning_parser import extract_reasoning_trace
+
 
 LABEL_FILTER_ALL = "all"
 LABEL_FILTER_DECEPTIVE_ONLY = "deceptive_only"
@@ -117,15 +119,8 @@ def _extract_run_info(samples_path: Path, root_dir: Path) -> Dict[str, Optional[
 
 
 def _extract_reasoning_from_raw_text(text: Any) -> Optional[str]:
-    if not isinstance(text, str):
-        return None
-    for pattern in (r"(?is).*?</think>", r"(?is).*?\[/think\]"):
-        match = re.search(pattern, text)
-        if match:
-            reasoning = match.group(0).strip()
-            if reasoning:
-                return reasoning
-    return None
+    reasoning = extract_reasoning_trace(text)
+    return reasoning or None
 
 
 def _synthesize_action_raw_text(action: Dict[str, Any]) -> Optional[str]:

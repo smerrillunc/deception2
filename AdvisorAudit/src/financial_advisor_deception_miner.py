@@ -37,6 +37,7 @@ from deception_dataset import (
     normalize_label_filter,
 )
 from financial_advisor_environment import AdvisorAuditSpec, FinancialAdvisorAuditEnvironment
+from reasoning_parser import extract_reasoning_trace, strip_reasoning_trace
 from utils import (
     append_jsonl,
     atomic_write_json,
@@ -198,21 +199,11 @@ def _query_llm_raw_outputs(
 
 
 def _strip_reasoning_blocks(text: Any) -> str:
-    cleaned = "" if text is None else str(text)
-    cleaned = re.sub(r"(?is)<think>.*?</think>", " ", cleaned)
-    cleaned = re.sub(r"(?is)\[THINK\].*?\[/THINK\]", " ", cleaned)
-    cleaned = re.sub(r"```(?:json)?", "", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.replace("```", "")
-    return cleaned.strip()
+    return strip_reasoning_trace(text)
 
 
 def _extract_reasoning_text(text: Any) -> str:
-    raw = "" if text is None else str(text)
-    for pattern in (r"(?is).*?</think>", r"(?is).*?\[/think\]"):
-        match = re.search(pattern, raw)
-        if match:
-            return match.group(0).strip()
-    return ""
+    return extract_reasoning_trace(text)
 
 
 def _balanced_json_candidates(text: str) -> List[str]:

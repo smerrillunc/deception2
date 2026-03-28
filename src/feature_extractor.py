@@ -24,6 +24,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from reasoning_parser import reasoning_close_span_from_text
+
 WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
 NEGATION_RE = re.compile(r"\b(no|not|never|n't|none|nothing|neither|nor)\b", re.IGNORECASE)
 
@@ -146,13 +148,7 @@ def text_features(text: str) -> Dict[str, Any]:
 
 
 def think_close_span_from_text(text: Any) -> Optional[Tuple[int, int]]:
-    if not isinstance(text, str):
-        return None
-    close_tag = "</think>"
-    close_start = text.find(close_tag)
-    if close_start < 0:
-        return None
-    return close_start, close_start + len(close_tag)
+    return reasoning_close_span_from_text(text)
 
 
 def trim_text_after_think(text: Any) -> Tuple[Any, Optional[Tuple[int, int]]]:
