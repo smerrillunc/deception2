@@ -43,6 +43,13 @@ def _guess_reasoning_model(model_name: Optional[str]) -> bool:
     return any(tok in name for tok in tokens)
 
 
+def _openai_reasoning_kwargs(model_name: Optional[str]) -> Dict[str, Any]:
+    name = (model_name or "").lower()
+    if "gpt-oss" in name or "gpt_oss" in name:
+        return {"reasoning_effort": "high"}
+    return {}
+
+
 def _extract_responses_output_text(response) -> str:
     text = getattr(response, "output_text", None)
     if text:
@@ -157,6 +164,7 @@ def main(argv=None):
                     temperature=args.temperature,
                     top_p=args.top_p,
                     max_output_tokens=args.max_tokens,
+                    **_openai_reasoning_kwargs(args.model_name),
                 )
                 raw_text = _extract_responses_output_text(response)
                 if raw_text:
@@ -182,6 +190,7 @@ def main(argv=None):
                     temperature=args.temperature,
                     top_p=args.top_p,
                     max_tokens=args.max_tokens,
+                    **_openai_reasoning_kwargs(args.model_name),
                 )
                 raw_text = _extract_chat_output_text(response)
                 if raw_text:

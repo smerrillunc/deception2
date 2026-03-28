@@ -786,7 +786,7 @@ def sample_actions_for_prefix(
         prompt_messages,
         prefix_text,
     )
-    print(rendered_prompt)
+    #print(rendered_prompt)
     sampling_params = SamplingParams(
         n=n_samples,
         temperature=temperature,
