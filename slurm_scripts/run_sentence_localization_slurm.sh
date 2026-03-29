@@ -46,7 +46,7 @@ DATASET_ROOT="$PROJECT_ROOT/DatasetMain"
 # For instruction models you may want:
 # METHOD="full"
 # TEXT_FIELD="reasoning"
-GAME='bs'   # bs | gridworld | advisor_audit
+GAME='bs'   # bs | gridworld | advisor_audit | interview | car_sales
 MODEL_NAME='deepseek-ai/DeepSeek-R1-Distill-Qwen-7B'
 # ---------------- End parameters -----------------
 
@@ -55,8 +55,28 @@ module load anaconda
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
+build_job_name() {
+  local env_name="$1"
+  local model_tail="$2"
+  local job_name="sentence_loc_${env_name}_${model_tail}"
+
+  job_name="${job_name//[^[:alnum:]_.-]/_}"
+  printf '%s' "${job_name:0:120}"
+}
+
 MODEL_TAIL="${MODEL_NAME##*/}"
-DATA_DIR="$DATASET_ROOT/$GAME/$MODEL_TAIL"
+JOB_NAME="$(build_job_name "$GAME" "$MODEL_TAIL")"
+DATA_DIR="${DATA_DIR:-$DATASET_ROOT/$GAME/$MODEL_TAIL}"
+
+# #SBATCH directives are static, so rename the live job after GAME/MODEL_NAME
+# are available inside the script.
+if [[ -n "${SLURM_JOB_ID:-}" ]] && command -v scontrol >/dev/null 2>&1; then
+  if scontrol update JobId="$SLURM_JOB_ID" JobName="$JOB_NAME" >/dev/null 2>&1; then
+    echo "SLURM job name: $JOB_NAME"
+  else
+    echo "Warning: failed to update SLURM job name to $JOB_NAME" >&2
+  fi
+fi
 
 if [[ -z "${DATA_DIR:-}" ]]; then
   echo "DATA_DIR is not set. Set DATA_DIR near the top of this script."
@@ -81,6 +101,11 @@ if [[ "$SHARD_ID" -ge "$NUM_SHARDS" ]]; then
 fi
 
 if [[ ! -f "$EXAMPLES_PATH" ]]; then
+  LEGACY_FLAT_EXAMPLES_PATH="$DATASET_ROOT/$GAME/examples.jsonl"
+  if [[ -f "$LEGACY_FLAT_EXAMPLES_PATH" ]]; then
+    echo "Found legacy flat dataset layout at: $DATASET_ROOT/$GAME"
+    echo "This launcher now expects nested datasets at: $DATASET_ROOT/$GAME/$MODEL_TAIL"
+  fi
   echo "Missing examples file: $EXAMPLES_PATH"
   echo "Build the DatasetMain dataset first and rerun."
   exit 1
@@ -125,6 +150,7 @@ printf '%q ' "${CMD[@]}"
 echo
 echo "Running shard $SHARD_ID of $NUM_SHARDS"
 echo "Dataset dir: $DATA_DIR"
+echo "Dataset layout: nested ($DATASET_ROOT/$GAME/$MODEL_TAIL)"
 
 "${CMD[@]}"
 
