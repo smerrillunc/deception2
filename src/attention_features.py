@@ -255,11 +255,29 @@ def resolve_dtype(dtype_arg: str, device: str) -> torch.dtype:
     return torch.float32
 
 
-def iter_localization_paths(localization_dir: Path, *, max_examples: int) -> list[Path]:
+def validate_shard_args(*, shard_id: int, num_shards: int) -> None:
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if shard_id < 0:
+        raise ValueError(f"shard_id must be >= 0, got {shard_id}")
+    if shard_id >= num_shards:
+        raise ValueError(f"shard_id must be in [0, num_shards), got shard_id={shard_id}, num_shards={num_shards}")
+
+
+def iter_localization_paths(
+    localization_dir: Path,
+    *,
+    max_examples: int,
+    shard_id: int = 0,
+    num_shards: int = 1,
+) -> list[Path]:
+    validate_shard_args(shard_id=shard_id, num_shards=num_shards)
     paths = sorted(localization_dir.glob("*.json"))
     if max_examples > 0:
-        return paths[:max_examples]
-    return paths
+        paths = paths[:max_examples]
+    if num_shards == 1:
+        return paths
+    return paths[shard_id::num_shards]
 
 
 def build_localized_sentence_df(example: dict[str, Any]) -> pd.DataFrame:
