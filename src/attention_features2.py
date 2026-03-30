@@ -225,6 +225,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Optional cap on the number of localization JSON files to process.",
     )
     parser.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Zero-based shard index to process after sorting localization files.",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Total number of shards to split the sorted localization files across.",
+    )
+    parser.add_argument(
         "--write-every-examples",
         type=int,
         default=DEFAULT_WRITE_EVERY_EXAMPLES,
@@ -1069,6 +1081,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     model_dtype = resolve_dtype(args.dtype, device)
     write_every_examples = max(1, int(args.write_every_examples))
 
+    all_localization_paths = iter_localization_paths(
+        dataset_paths.localization_dir,
+        max_examples=int(args.max_examples),
+    )
+    if not all_localization_paths:
+        raise FileNotFoundError(f"No localization JSON files found in {dataset_paths.localization_dir}")
+    localization_paths = iter_localization_paths(
+        dataset_paths.localization_dir,
+        max_examples=int(args.max_examples),
+        shard_id=int(args.shard_id),
+        num_shards=int(args.num_shards),
+    )
+    if not localization_paths:
+        print(f"Dataset dir: {dataset_paths.dataset_dir}")
+        print(f"Localization dir: {dataset_paths.localization_dir}")
+        print(f"Output parquet: {dataset_paths.output_path}")
+        print(f"Shard: {int(args.shard_id) + 1}/{int(args.num_shards)}")
+        print(f"Localization files before sharding: {len(all_localization_paths)}")
+        print("Localization files to process on this shard: 0")
+        print("No localization files assigned to this shard. Exiting without writing output.")
+        return
+
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=args.trust_remote_code)
     num_layers = int(config.num_hidden_layers)
     num_heads = int(config.num_attention_heads)
@@ -1092,13 +1126,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     model.to(device)
     model.eval()
 
-    localization_paths = iter_localization_paths(
-        dataset_paths.localization_dir,
-        max_examples=int(args.max_examples),
-    )
-    if not localization_paths:
-        raise FileNotFoundError(f"No localization JSON files found in {dataset_paths.localization_dir}")
-
     writer = StreamingParquetWriter(dataset_paths.output_path, overwrite=args.overwrite)
     buffered_frames: list[pd.DataFrame] = []
     skip_counts: dict[str, int] = {}
@@ -1120,6 +1147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"Device: {device}")
     print(f"Model dtype: {model_dtype}")
     print(f"Layers: {num_layers} | Heads: {num_heads}")
+    print(f"Shard: {int(args.shard_id) + 1}/{int(args.num_shards)}")
     print(
         "Feature columns: "
         f"{attention_base_feature_count} attention-base + "
@@ -1133,7 +1161,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if not gpu_df.empty:
         print("Visible GPUs:")
         print(gpu_df.to_string(index=False))
-    print(f"Localization files to process: {len(localization_paths)}")
+    print(f"Localization files before sharding: {len(all_localization_paths)}")
+    print(f"Localization files to process on this shard: {len(localization_paths)}")
 
     try:
         for path in localization_paths:
