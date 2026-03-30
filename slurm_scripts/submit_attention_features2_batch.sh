@@ -48,10 +48,10 @@ build_job_name() {
   printf '%s' "${job_name:0:120}"
 }
 
-DATASET_NAME="$(extract_literal_assignment DATASET_NAME)"
+GAME="$(extract_literal_assignment GAME)"
 MODEL_NAME="$(extract_literal_assignment MODEL_NAME)"
 MODEL_TAIL="${MODEL_NAME##*/}"
-JOB_NAME="$(build_job_name "$DATASET_NAME" "$MODEL_TAIL")"
+JOB_NAME="$(build_job_name "$GAME" "$MODEL_TAIL")"
 
 echo "Submitting $N shard jobs (array 0-$((N-1)))"
 echo "Using run script: $RUN_SCRIPT"

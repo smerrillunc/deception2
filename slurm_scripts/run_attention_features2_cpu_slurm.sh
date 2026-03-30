@@ -31,10 +31,10 @@ SHARD_ID="${SHARD_ID:-${SLURM_ARRAY_TASK_ID:-0}}"
 
 PROJECT_ROOT="${PROJECT_ROOT:-/work/users/s/m/smerrill/deception2}"
 SRC_ROOT="$PROJECT_ROOT/src"
-DATASET_ROOT="${DATASET_ROOT:-$PROJECT_ROOT/Dataset}"
+DATASET_ROOT="${DATASET_ROOT:-$PROJECT_ROOT/DatasetMain}"
 
-# Dataset / model selection.
-DATASET_NAME='Gridworld'   # AdvisorAudit | BS | Gridworld
+# Dataset / environment selection.
+GAME='gridworld'   # advisor_audit | bs | gridworld | interview | car_sales
 MODEL_NAME='deepseek-ai/DeepSeek-R1-Distill-Qwen-7B'
 # ---------------- End parameters -----------------
 
@@ -53,8 +53,8 @@ build_job_name() {
 }
 
 MODEL_TAIL="${MODEL_NAME##*/}"
-JOB_NAME="$(build_job_name "$DATASET_NAME" "$MODEL_TAIL")"
-DATA_DIR="${DATA_DIR:-$DATASET_ROOT/$DATASET_NAME/$MODEL_TAIL}"
+JOB_NAME="$(build_job_name "$GAME" "$MODEL_TAIL")"
+DATA_DIR="${DATA_DIR:-$DATASET_ROOT/$GAME/$MODEL_TAIL}"
 SHARD_OUT_DIR="${SHARD_OUT_DIR:-$DATA_DIR/attention_features2_shards}"
 OUT_PATH="${OUT_PATH:-$SHARD_OUT_DIR/attention_features2_shard_${SHARD_ID}_of_${NUM_SHARDS}.parquet}"
 THREADS="${THREADS:-${SLURM_CPUS_PER_TASK:-4}}"
