@@ -22,6 +22,8 @@ PROGRESS_EVERY=10
 OVERWRITE=0
 STRICT=0
 TRUST_REMOTE_CODE=0
+SKIP_EXISTING=1
+CLEAN_STALE_OUTPUTS=1
 
 # Sharding:
 # - NUM_SHARDS is the total shard count.
@@ -57,6 +59,7 @@ JOB_NAME="$(build_job_name "$GAME" "$MODEL_TAIL")"
 DATA_DIR="${DATA_DIR:-$DATASET_ROOT/$GAME/$MODEL_TAIL}"
 SHARD_OUT_DIR="${SHARD_OUT_DIR:-$DATA_DIR/attention_features2_shards}"
 OUT_PATH="${OUT_PATH:-$SHARD_OUT_DIR/attention_features2_shard_${SHARD_ID}_of_${NUM_SHARDS}.parquet}"
+TMP_OUT_PATH="${OUT_PATH}.tmp"
 THREADS="${THREADS:-${SLURM_CPUS_PER_TASK:-4}}"
 
 if [[ -n "${SLURM_JOB_ID:-}" ]] && command -v scontrol >/dev/null 2>&1; then
@@ -85,6 +88,27 @@ if [[ ! -d "$DATA_DIR/localization" ]]; then
 fi
 
 mkdir -p "$SHARD_OUT_DIR"
+
+if [[ "$OVERWRITE" != "1" ]]; then
+  if [[ -e "$OUT_PATH" && "$SKIP_EXISTING" == "1" ]]; then
+    echo "Shard output already exists; skipping shard $SHARD_ID:"
+    echo "  $OUT_PATH"
+    exit 0
+  fi
+
+  if [[ ! -e "$OUT_PATH" && -e "$TMP_OUT_PATH" ]]; then
+    if [[ "$CLEAN_STALE_OUTPUTS" == "1" ]]; then
+      echo "Removing stale temporary shard output before rerun:"
+      echo "  $TMP_OUT_PATH"
+      rm -f "$TMP_OUT_PATH"
+    else
+      echo "Temporary shard output exists and cleanup is disabled:"
+      echo "  $TMP_OUT_PATH"
+      echo "Set CLEAN_STALE_OUTPUTS=1 or delete it manually before rerunning."
+      exit 1
+    fi
+  fi
+fi
 
 export OMP_NUM_THREADS="$THREADS"
 export MKL_NUM_THREADS="$THREADS"
