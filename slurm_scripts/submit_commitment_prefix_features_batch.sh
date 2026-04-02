@@ -27,7 +27,27 @@ if ! [[ "$N" =~ ^[0-9]+$ ]] || [[ "$N" -lt 1 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+
+resolve_project_root() {
+  local candidate
+  for candidate in \
+    "${PROJECT_ROOT:-}" \
+    "/work/users/s/m/smerrill/deception2" \
+    "/playpen-ssd/smerrill/deception2" \
+    "$(cd "$SCRIPT_DIR/.." && pwd)"
+  do
+    if [[ -n "$candidate" && -d "$candidate/src" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PROJECT_ROOT="$(resolve_project_root)" || {
+  echo "Could not resolve PROJECT_ROOT. Set PROJECT_ROOT explicitly before submitting."
+  exit 1
+}
 DATASET_ROOT="${DATASET_ROOT:-$PROJECT_ROOT/DatasetMain}"
 RUN_SCRIPT="$SCRIPT_DIR/run_commitment_prefix_features_cpu_slurm.sh"
 MODEL_TAIL="${MODEL_NAME##*/}"
@@ -90,7 +110,7 @@ for env_name in "${ENVIRONMENTS[@]}"; do
     --job-name "$job_name" \
     --parsable \
     --array=0-$((N-1)) \
-    --export=ALL,NUM_SHARDS="$N",GAME="$env_name",MODEL_NAME="$MODEL_NAME" \
+    --export=ALL,PROJECT_ROOT="$PROJECT_ROOT",DATASET_ROOT="$DATASET_ROOT",NUM_SHARDS="$N",GAME="$env_name",MODEL_NAME="$MODEL_NAME" \
     "$RUN_SCRIPT")"
 
   JOB_IDS+=("$array_job_id")

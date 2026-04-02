@@ -34,7 +34,27 @@ NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD_ID="${SHARD_ID:-${SLURM_ARRAY_TASK_ID:-0}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+
+resolve_project_root() {
+  local candidate
+  for candidate in \
+    "${PROJECT_ROOT:-}" \
+    "/work/users/s/m/smerrill/deception2" \
+    "/playpen-ssd/smerrill/deception2" \
+    "$(cd "$SCRIPT_DIR/.." && pwd)"
+  do
+    if [[ -n "$candidate" && -d "$candidate/src" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PROJECT_ROOT="$(resolve_project_root)" || {
+  echo "Could not resolve PROJECT_ROOT. Set PROJECT_ROOT explicitly before submitting."
+  exit 1
+}
 SRC_ROOT="$PROJECT_ROOT/src"
 DATASET_ROOT="${DATASET_ROOT:-$PROJECT_ROOT/DatasetMain}"
 
