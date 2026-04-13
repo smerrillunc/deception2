@@ -11,11 +11,47 @@ set -euo pipefail
 
 # Example:
 # sbatch --account=rc_amcavoy_pi \
-#   --export=ALL,DATASET_ROOT=/work/users/s/m/smerrill/deception2/DatasetMain,MODEL_DIRNAME=DeepSeek-R1-Distill-Qwen-7B \
+#   --export=ALL,PROJECT_ROOT=/work/users/s/m/smerrill/deception2,DATASET_ROOT=/work/users/s/m/smerrill/deception2/DatasetMain,MODEL_DIRNAME=DeepSeek-R1-Distill-Qwen-7B \
 #   slurm_scripts/run_ood_modeling_main3_consistency_ablation_slurm.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+
+find_project_root() {
+  local start_dir=""
+  local candidate=""
+  local resolved=""
+
+  for start_dir in "${PROJECT_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "${PWD:-}" "$SCRIPT_DIR"; do
+    if [[ -z "$start_dir" ]] || [[ ! -d "$start_dir" ]]; then
+      continue
+    fi
+    resolved="$(cd "$start_dir" && pwd)"
+    candidate="$resolved"
+    while true; do
+      if [[ -f "$candidate/src/run_ood_modeling_main3_consistency_ablation.py" ]]; then
+        printf '%s' "$candidate"
+        return 0
+      fi
+      if [[ "$candidate" == "/" ]]; then
+        break
+      fi
+      candidate="$(dirname "$candidate")"
+    done
+  done
+  return 1
+}
+
+PROJECT_ROOT="${PROJECT_ROOT:-}"
+if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/src/run_ood_modeling_main3_consistency_ablation.py" ]]; then
+  PROJECT_ROOT="$(find_project_root || true)"
+fi
+if [[ -z "$PROJECT_ROOT" ]]; then
+  echo "Could not resolve PROJECT_ROOT." >&2
+  echo "Set PROJECT_ROOT explicitly when submitting, e.g." >&2
+  echo "  sbatch --export=ALL,PROJECT_ROOT=/work/users/s/m/smerrill/deception2,DATASET_ROOT=/work/users/s/m/smerrill/deception2/DatasetMain ..." >&2
+  exit 1
+fi
+
 RUNNER_PATH="${RUNNER_PATH:-$PROJECT_ROOT/src/run_ood_modeling_main3_consistency_ablation.py}"
 
 MODEL_DIRNAME="${MODEL_DIRNAME:-DeepSeek-R1-Distill-Qwen-7B}"
