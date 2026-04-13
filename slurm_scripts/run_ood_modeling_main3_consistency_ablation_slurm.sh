@@ -13,6 +13,11 @@ set -euo pipefail
 # sbatch --account=rc_amcavoy_pi \
 #   --export=ALL,PROJECT_ROOT=/work/users/s/m/smerrill/deception2,DATASET_ROOT=/work/users/s/m/smerrill/deception2/DatasetMain,MODEL_DIRNAME=DeepSeek-R1-Distill-Qwen-7B \
 #   slurm_scripts/run_ood_modeling_main3_consistency_ablation_slurm.sh
+#
+# Most explicit version:
+# sbatch --account=rc_amcavoy_pi \
+#   --export=ALL,PROJECT_ROOT=/work/users/s/m/smerrill/deception2,RUNNER_PATH=/work/users/s/m/smerrill/deception2/src/run_ood_modeling_main3_consistency_ablation.py,DATASET_ROOT=/work/users/s/m/smerrill/deception2/DatasetMain,MODEL_DIRNAME=DeepSeek-R1-Distill-Qwen-7B \
+#   /work/users/s/m/smerrill/deception2/slurm_scripts/run_ood_modeling_main3_consistency_ablation_slurm.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -20,6 +25,8 @@ find_project_root() {
   local start_dir=""
   local candidate=""
   local resolved=""
+  local user_first=""
+  local user_second=""
 
   for start_dir in "${PROJECT_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" "${PWD:-}" "$SCRIPT_DIR"; do
     if [[ -z "$start_dir" ]] || [[ ! -d "$start_dir" ]]; then
@@ -38,6 +45,33 @@ find_project_root() {
       candidate="$(dirname "$candidate")"
     done
   done
+
+  if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    for candidate in \
+      "$SLURM_SUBMIT_DIR/deception2" \
+      "$SLURM_SUBMIT_DIR/../deception2" \
+      "$SLURM_SUBMIT_DIR/../../deception2"; do
+      if [[ -f "$candidate/src/run_ood_modeling_main3_consistency_ablation.py" ]]; then
+        printf '%s' "$(cd "$candidate" && pwd)"
+        return 0
+      fi
+    done
+  fi
+
+  if [[ -n "${HOME:-}" && -f "$HOME/deception2/src/run_ood_modeling_main3_consistency_ablation.py" ]]; then
+    printf '%s' "$(cd "$HOME/deception2" && pwd)"
+    return 0
+  fi
+
+  if [[ -n "${USER:-}" && "${#USER}" -ge 2 ]]; then
+    user_first="${USER:0:1}"
+    user_second="${USER:1:1}"
+    candidate="/work/users/$user_first/$user_second/$USER/deception2"
+    if [[ -f "$candidate/src/run_ood_modeling_main3_consistency_ablation.py" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  fi
   return 1
 }
 
@@ -94,6 +128,11 @@ if [[ ! -d "$DATASET_ROOT" ]]; then
 fi
 if [[ ! -f "$RUNNER_PATH" ]]; then
   echo "Runner script not found: $RUNNER_PATH" >&2
+  echo "PROJECT_ROOT=$PROJECT_ROOT" >&2
+  echo "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-unset}" >&2
+  echo "PWD=${PWD:-unset}" >&2
+  echo "If you are still seeing a /var/spool/slurmd path here, the longleaf copy of this launcher is stale." >&2
+  echo "Resync the updated launcher or submit with explicit PROJECT_ROOT and RUNNER_PATH." >&2
   exit 1
 fi
 
