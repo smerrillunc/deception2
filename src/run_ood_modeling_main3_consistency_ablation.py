@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import runpy
 from pathlib import Path
 
@@ -127,6 +128,16 @@ def set_env(name: str, value: str | None) -> None:
     os.environ[name] = value
 
 
+def slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
+
+
+def resolve_output_root(*, source_path: Path, model_dirname: str, explicit_output_root: str | None) -> Path:
+    if explicit_output_root:
+        return Path(explicit_output_root)
+    return source_path.parent / f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(model_dirname)}"
+
+
 def main() -> None:
     args = parse_args()
     source_path = Path(args.source_path)
@@ -172,6 +183,25 @@ def main() -> None:
         print(f"Output root: {Path(args.output_root)}")
 
     runpy.run_path(str(source_path), run_name="__main__")
+
+    output_root = resolve_output_root(
+        source_path=source_path,
+        model_dirname=str(args.model_dirname),
+        explicit_output_root=args.output_root,
+    )
+    required_outputs = [
+        output_root / "config.csv",
+        output_root / "all_transfer_metrics.csv",
+        output_root / "all_model_selection.csv",
+        output_root / "all_coefficients.csv",
+    ]
+    missing_outputs = [str(path) for path in required_outputs if not path.exists()]
+    if missing_outputs:
+        raise FileNotFoundError(
+            "Run finished without writing the expected aggregate outputs:\n"
+            + "\n".join(missing_outputs)
+        )
+    print(f"Verified aggregate outputs under: {output_root}")
 
 
 if __name__ == "__main__":

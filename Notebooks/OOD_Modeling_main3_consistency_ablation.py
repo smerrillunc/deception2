@@ -187,6 +187,7 @@ OUTPUT_ROOT = Path(
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 CACHE_DIR = OUTPUT_ROOT / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_EVERY_MODEL_SELECTIONS = max(1, int(env_int("OOD_MAIN3_COMPANION_CHECKPOINT_EVERY", 5) or 5))
 
 ATTENTION_METRIC_NAMES = tuple(extractor.ATTENTION_METRIC_NAMES)
 HEAD_SUMMARY_NAMES = tuple(extractor.HEAD_SUMMARY_NAMES)
@@ -211,6 +212,7 @@ config_df = pd.DataFrame(
         {"setting": "root_batch_size", "value": ROOT_BATCH_SIZE},
         {"setting": "activation_pca_dim", "value": ACTIVATION_PCA_DIM},
         {"setting": "model_selection_objective", "value": MODEL_SELECTION_OBJECTIVE},
+        {"setting": "checkpoint_every_model_selections", "value": CHECKPOINT_EVERY_MODEL_SELECTIONS},
         {"setting": "force_rebuild_reductions", "value": FORCE_REBUILD_REDUCTIONS},
         {"setting": "disable_tqdm", "value": DISABLE_TQDM},
         {"setting": "top_features_to_show", "value": TOP_FEATURES_TO_SHOW},
@@ -1267,222 +1269,245 @@ all_transfer_metric_rows: list[dict[str, Any]] = []
 all_model_selection_rows: list[dict[str, Any]] = []
 all_coefficient_frames: list[pd.DataFrame] = []
 activation_bundle_cache: dict[tuple[str, str], ActivationMatrixBundle] = {}
+completed_model_selection_count = 0
 
-for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Model targets", total=len(TARGET_SPECS), disable=DISABLE_TQDM):
-    target_title = str(TARGET_SPECS[target_name]["title"])
-    attention_feature_pool = list(attention_pools_by_target[target_name])
-    for feature_space_name, feature_space in maybe_tqdm(
-        FEATURE_SPACES.items(),
-        desc=f"Model spaces:{target_name}",
-        total=len(FEATURE_SPACES),
-        disable=DISABLE_TQDM,
-    ):
-        ranking_df = ranking_tables_by_key[(target_name, feature_space_name)].copy()
-        ranking_meta_df = ranking_df.loc[:, [column for column in ranking_df.columns if column != "feature_space"]].drop_duplicates(
-            subset=["feature"],
-            keep="first",
-        )
-        size_options = feature_size_options_for_space(feature_space)
 
-        for train_env in maybe_tqdm(
-            ENV_ORDER,
-            desc=f"Train envs:{target_name}:{feature_space_name}",
-            total=len(ENV_ORDER),
+def persist_core_artifacts(
+    *,
+    transfer_rows: list[dict[str, Any]],
+    model_selection_rows: list[dict[str, Any]],
+    coefficient_frames: list[pd.DataFrame],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    transfer_df = pd.DataFrame(transfer_rows)
+    model_selection_df = pd.DataFrame(model_selection_rows)
+    coefficients_df = pd.concat(coefficient_frames, ignore_index=True) if coefficient_frames else pd.DataFrame()
+
+    if not transfer_df.empty:
+        transfer_df.to_csv(OUTPUT_ROOT / "all_transfer_metrics.csv", index=False)
+    if not model_selection_df.empty:
+        model_selection_df.to_csv(OUTPUT_ROOT / "all_model_selection.csv", index=False)
+    if not coefficients_df.empty:
+        coefficients_df.to_csv(OUTPUT_ROOT / "all_coefficients.csv", index=False)
+
+    return transfer_df, model_selection_df, coefficients_df
+
+try:
+    for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Model targets", total=len(TARGET_SPECS), disable=DISABLE_TQDM):
+        target_title = str(TARGET_SPECS[target_name]["title"])
+        attention_feature_pool = list(attention_pools_by_target[target_name])
+        for feature_space_name, feature_space in maybe_tqdm(
+            FEATURE_SPACES.items(),
+            desc=f"Model spaces:{target_name}",
+            total=len(FEATURE_SPACES),
             disable=DISABLE_TQDM,
         ):
-            activation_bundle: ActivationMatrixBundle | None = None
-            if feature_space.activation_variant is not None:
-                bundle_key = (train_env, feature_space_name)
-                activation_bundle = activation_bundle_cache.get(bundle_key)
-                if activation_bundle is None:
-                    activation_bundle = build_activation_matrix_bundle(
-                        train_env=train_env,
-                        feature_space_name=feature_space_name,
-                        feature_space=feature_space,
-                    )
-                    activation_bundle_cache[bundle_key] = activation_bundle
+            ranking_df = ranking_tables_by_key[(target_name, feature_space_name)].copy()
+            ranking_meta_df = ranking_df.loc[:, [column for column in ranking_df.columns if column != "feature_space"]].drop_duplicates(
+                subset=["feature"],
+                keep="first",
+            )
+            size_options = feature_size_options_for_space(feature_space)
 
-            env_pool_cache: dict[str, dict[str, np.ndarray]] = {}
-            for env_name in ENV_ORDER:
-                y_train = np.asarray(split_cache_by_env[env_name][f"y_train__{target_name}"], dtype=np.int8)
-                y_val = np.asarray(split_cache_by_env[env_name][f"y_val__{target_name}"], dtype=np.int8)
-                if np.unique(y_train).size < 2:
-                    raise ValueError(f"{env_name} train split does not contain both classes for {target_name}.")
-                if np.unique(y_val).size < 2:
-                    raise ValueError(f"{env_name} val split does not contain both classes for {target_name}.")
-
-                env_entry: dict[str, np.ndarray] = {
-                    "y_train": y_train,
-                    "y_val": y_val,
-                }
-                if feature_space.uses_attention:
-                    env_entry["train_attention_pool"] = attention_matrix_cache_by_target[target_name][env_name]["train"]
-                    env_entry["val_attention_pool"] = attention_matrix_cache_by_target[target_name][env_name]["val"]
-                if activation_bundle is not None:
-                    env_entry["train_activation_pool"] = activation_bundle.matrices_by_env[env_name]["train"]
-                    env_entry["val_activation_pool"] = activation_bundle.matrices_by_env[env_name]["val"]
-                env_pool_cache[env_name] = env_entry
-
-            for feature_size in size_options:
-                size_label = feature_size_to_label(feature_size)
-                attention_dim = 0
-                activation_dim = 0
-                current_feature_names: list[str] = []
-
-                if feature_space.uses_attention:
-                    requested_attention = len(attention_feature_pool) if feature_size is None else int(feature_size)
-                    attention_dim = int(min(len(attention_feature_pool), requested_attention))
-                    current_feature_names.extend(attention_feature_pool[:attention_dim])
-
-                if activation_bundle is not None:
-                    if feature_space.activation_use_pca:
-                        requested_activation = len(activation_bundle.feature_names) if feature_size is None else int(feature_size)
-                        activation_dim = int(min(len(activation_bundle.feature_names), requested_activation))
-                        current_feature_names.extend(activation_bundle.feature_names[:activation_dim])
-                    else:
-                        activation_dim = int(len(activation_bundle.feature_names))
-                        current_feature_names.extend(activation_bundle.feature_names)
-
-                if not current_feature_names:
-                    raise ValueError(
-                        f"No features constructed for {target_name} / {feature_space_name} / {train_env} / {size_label}."
-                    )
-
-                train_cache = env_pool_cache[train_env]
-                x_train = assemble_split_matrix(
-                    train_cache,
-                    split_name="train",
-                    feature_space=feature_space,
-                    attention_dim=attention_dim,
-                    activation_dim=activation_dim,
-                )
-                x_val = assemble_split_matrix(
-                    train_cache,
-                    split_name="val",
-                    feature_space=feature_space,
-                    attention_dim=attention_dim,
-                    activation_dim=activation_dim,
-                )
-                fitted_models, candidate_df = fit_candidate_classifiers(
-                    x_train,
-                    train_cache["y_train"],
-                    x_val,
-                    train_cache["y_val"],
-                )
-
-                best_model: FittedBinaryModel | None = None
-                best_key: tuple[float, ...] | None = None
-                best_candidate_oracle_metrics: dict[str, float] | None = None
-                oracle_rows: list[dict[str, Any]] = []
-
-                for fitted_model in fitted_models:
-                    oracle_aurocs: list[float] = []
-                    oracle_average_precisions: list[float] = []
-                    for test_env in ENV_ORDER:
-                        if test_env == train_env:
-                            continue
-                        eval_cache = env_pool_cache[test_env]
-                        x_eval = assemble_split_matrix(
-                            eval_cache,
-                            split_name="val",
+            for train_env in maybe_tqdm(
+                ENV_ORDER,
+                desc=f"Train envs:{target_name}:{feature_space_name}",
+                total=len(ENV_ORDER),
+                disable=DISABLE_TQDM,
+            ):
+                activation_bundle: ActivationMatrixBundle | None = None
+                if feature_space.activation_variant is not None:
+                    bundle_key = (train_env, feature_space_name)
+                    activation_bundle = activation_bundle_cache.get(bundle_key)
+                    if activation_bundle is None:
+                        activation_bundle = build_activation_matrix_bundle(
+                            train_env=train_env,
+                            feature_space_name=feature_space_name,
                             feature_space=feature_space,
-                            attention_dim=attention_dim,
-                            activation_dim=activation_dim,
                         )
-                        eval_scores = fitted_model.estimator.predict_proba(x_eval)[:, 1].astype(np.float32)
-                        oracle_aurocs.append(safe_auroc(eval_cache["y_val"], eval_scores))
-                        oracle_average_precisions.append(safe_average_precision(eval_cache["y_val"], eval_scores))
-                    oracle_metrics = {
-                        "oracle_mean_ood_auroc": finite_mean(oracle_aurocs),
-                        "oracle_min_ood_auroc": finite_min(oracle_aurocs),
-                        "oracle_std_ood_auroc": finite_std(oracle_aurocs),
-                        "oracle_mean_ood_average_precision": finite_mean(oracle_average_precisions),
+                        activation_bundle_cache[bundle_key] = activation_bundle
+
+                env_pool_cache: dict[str, dict[str, np.ndarray]] = {}
+                for env_name in ENV_ORDER:
+                    y_train = np.asarray(split_cache_by_env[env_name][f"y_train__{target_name}"], dtype=np.int8)
+                    y_val = np.asarray(split_cache_by_env[env_name][f"y_val__{target_name}"], dtype=np.int8)
+                    if np.unique(y_train).size < 2:
+                        raise ValueError(f"{env_name} train split does not contain both classes for {target_name}.")
+                    if np.unique(y_val).size < 2:
+                        raise ValueError(f"{env_name} val split does not contain both classes for {target_name}.")
+
+                    env_entry: dict[str, np.ndarray] = {
+                        "y_train": y_train,
+                        "y_val": y_val,
                     }
-                    oracle_rows.append({"candidate_c": float(fitted_model.chosen_c), **oracle_metrics})
-                    candidate_key = build_model_selection_key(
-                        objective=MODEL_SELECTION_OBJECTIVE,
-                        oracle_mean_ood_auroc=oracle_metrics["oracle_mean_ood_auroc"],
-                        oracle_mean_ood_average_precision=oracle_metrics["oracle_mean_ood_average_precision"],
-                        source_val_auroc=float(fitted_model.validation_metrics["auroc"]),
-                        source_val_average_precision=float(fitted_model.validation_metrics["average_precision"]),
-                        source_val_balanced_accuracy=float(fitted_model.validation_metrics["balanced_accuracy"]),
-                        feature_count=len(current_feature_names),
-                        chosen_c=float(fitted_model.chosen_c),
+                    if feature_space.uses_attention:
+                        env_entry["train_attention_pool"] = attention_matrix_cache_by_target[target_name][env_name]["train"]
+                        env_entry["val_attention_pool"] = attention_matrix_cache_by_target[target_name][env_name]["val"]
+                    if activation_bundle is not None:
+                        env_entry["train_activation_pool"] = activation_bundle.matrices_by_env[env_name]["train"]
+                        env_entry["val_activation_pool"] = activation_bundle.matrices_by_env[env_name]["val"]
+                    env_pool_cache[env_name] = env_entry
+
+                for feature_size in size_options:
+                    size_label = feature_size_to_label(feature_size)
+                    attention_dim = 0
+                    activation_dim = 0
+                    current_feature_names: list[str] = []
+
+                    if feature_space.uses_attention:
+                        requested_attention = len(attention_feature_pool) if feature_size is None else int(feature_size)
+                        attention_dim = int(min(len(attention_feature_pool), requested_attention))
+                        current_feature_names.extend(attention_feature_pool[:attention_dim])
+
+                    if activation_bundle is not None:
+                        if feature_space.activation_use_pca:
+                            requested_activation = len(activation_bundle.feature_names) if feature_size is None else int(feature_size)
+                            activation_dim = int(min(len(activation_bundle.feature_names), requested_activation))
+                            current_feature_names.extend(activation_bundle.feature_names[:activation_dim])
+                        else:
+                            activation_dim = int(len(activation_bundle.feature_names))
+                            current_feature_names.extend(activation_bundle.feature_names)
+
+                    if not current_feature_names:
+                        raise ValueError(
+                            f"No features constructed for {target_name} / {feature_space_name} / {train_env} / {size_label}."
+                        )
+
+                    train_cache = env_pool_cache[train_env]
+                    x_train = assemble_split_matrix(
+                        train_cache,
+                        split_name="train",
+                        feature_space=feature_space,
+                        attention_dim=attention_dim,
+                        activation_dim=activation_dim,
                     )
-                    if best_key is None or candidate_key > best_key:
-                        best_key = candidate_key
-                        best_model = fitted_model
-                        best_candidate_oracle_metrics = oracle_metrics
+                    x_val = assemble_split_matrix(
+                        train_cache,
+                        split_name="val",
+                        feature_space=feature_space,
+                        attention_dim=attention_dim,
+                        activation_dim=activation_dim,
+                    )
+                    fitted_models, candidate_df = fit_candidate_classifiers(
+                        x_train,
+                        train_cache["y_train"],
+                        x_val,
+                        train_cache["y_val"],
+                    )
 
-                if best_model is None or best_candidate_oracle_metrics is None:
-                    raise RuntimeError(f"Failed to select model for {target_name} / {feature_space_name} / {train_env} / {size_label}.")
+                    best_model: FittedBinaryModel | None = None
+                    best_key: tuple[float, ...] | None = None
+                    best_candidate_oracle_metrics: dict[str, float] | None = None
+                    oracle_rows: list[dict[str, Any]] = []
 
-                selection_dir = OUTPUT_ROOT / "model_selection" / target_name / feature_space_name / size_label
-                selection_dir.mkdir(parents=True, exist_ok=True)
-                candidate_path = selection_dir / f"{slugify(train_env)}__candidates.csv"
-                candidate_df = candidate_df.merge(
-                    pd.DataFrame(oracle_rows),
-                    on="candidate_c",
-                    how="left",
-                    validate="one_to_one",
-                )
-                candidate_df["target_name"] = target_name
-                candidate_df["feature_space"] = feature_space_name
-                candidate_df["feature_space_title"] = feature_space.title
-                candidate_df["feature_family_group"] = feature_space.family_title
-                candidate_df["train_env"] = train_env
-                candidate_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
-                candidate_df["feature_size_label"] = size_label
-                candidate_df["attention_feature_count"] = int(attention_dim)
-                candidate_df["activation_feature_count"] = int(activation_dim)
-                candidate_df["selected_feature_count"] = len(current_feature_names)
-                candidate_df["effective_activation_pca_dim"] = (
-                    pd.NA if activation_bundle is None or activation_bundle.effective_pca_dim is None else int(activation_bundle.effective_pca_dim)
-                )
-                candidate_df.to_csv(candidate_path, index=False)
+                    for fitted_model in fitted_models:
+                        oracle_aurocs: list[float] = []
+                        oracle_average_precisions: list[float] = []
+                        for test_env in ENV_ORDER:
+                            if test_env == train_env:
+                                continue
+                            eval_cache = env_pool_cache[test_env]
+                            x_eval = assemble_split_matrix(
+                                eval_cache,
+                                split_name="val",
+                                feature_space=feature_space,
+                                attention_dim=attention_dim,
+                                activation_dim=activation_dim,
+                            )
+                            eval_scores = fitted_model.estimator.predict_proba(x_eval)[:, 1].astype(np.float32)
+                            oracle_aurocs.append(safe_auroc(eval_cache["y_val"], eval_scores))
+                            oracle_average_precisions.append(safe_average_precision(eval_cache["y_val"], eval_scores))
+                        oracle_metrics = {
+                            "oracle_mean_ood_auroc": finite_mean(oracle_aurocs),
+                            "oracle_min_ood_auroc": finite_min(oracle_aurocs),
+                            "oracle_std_ood_auroc": finite_std(oracle_aurocs),
+                            "oracle_mean_ood_average_precision": finite_mean(oracle_average_precisions),
+                        }
+                        oracle_rows.append({"candidate_c": float(fitted_model.chosen_c), **oracle_metrics})
+                        candidate_key = build_model_selection_key(
+                            objective=MODEL_SELECTION_OBJECTIVE,
+                            oracle_mean_ood_auroc=oracle_metrics["oracle_mean_ood_auroc"],
+                            oracle_mean_ood_average_precision=oracle_metrics["oracle_mean_ood_average_precision"],
+                            source_val_auroc=float(fitted_model.validation_metrics["auroc"]),
+                            source_val_average_precision=float(fitted_model.validation_metrics["average_precision"]),
+                            source_val_balanced_accuracy=float(fitted_model.validation_metrics["balanced_accuracy"]),
+                            feature_count=len(current_feature_names),
+                            chosen_c=float(fitted_model.chosen_c),
+                        )
+                        if best_key is None or candidate_key > best_key:
+                            best_key = candidate_key
+                            best_model = fitted_model
+                            best_candidate_oracle_metrics = oracle_metrics
 
-                selected_path = selection_dir / f"{slugify(train_env)}__selected_features.csv"
-                coefficients_path = selection_dir / f"{slugify(train_env)}__coefficients.csv"
+                    if best_model is None or best_candidate_oracle_metrics is None:
+                        raise RuntimeError(f"Failed to select model for {target_name} / {feature_space_name} / {train_env} / {size_label}.")
 
-                selected_df = pd.DataFrame({"feature": current_feature_names})
-                if not selected_df.empty:
-                    selected_df = selected_df.merge(
-                        ranking_meta_df,
-                        on="feature",
+                    selection_dir = OUTPUT_ROOT / "model_selection" / target_name / feature_space_name / size_label
+                    selection_dir.mkdir(parents=True, exist_ok=True)
+                    candidate_path = selection_dir / f"{slugify(train_env)}__candidates.csv"
+                    candidate_df = candidate_df.merge(
+                        pd.DataFrame(oracle_rows),
+                        on="candidate_c",
                         how="left",
                         validate="one_to_one",
                     )
-                selected_df["target_name"] = target_name
-                selected_df["feature_space"] = feature_space_name
-                selected_df["feature_space_title"] = feature_space.title
-                selected_df["feature_family_group"] = feature_space.family_title
-                selected_df["train_env"] = train_env
-                selected_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
-                selected_df["feature_size_label"] = size_label
-                selected_df["attention_feature_count"] = int(attention_dim)
-                selected_df["activation_feature_count"] = int(activation_dim)
-                selected_df["selected_feature_count"] = len(current_feature_names)
-                selected_df.to_csv(selected_path, index=False)
+                    candidate_df["target_name"] = target_name
+                    candidate_df["feature_space"] = feature_space_name
+                    candidate_df["feature_space_title"] = feature_space.title
+                    candidate_df["feature_family_group"] = feature_space.family_title
+                    candidate_df["train_env"] = train_env
+                    candidate_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
+                    candidate_df["feature_size_label"] = size_label
+                    candidate_df["attention_feature_count"] = int(attention_dim)
+                    candidate_df["activation_feature_count"] = int(activation_dim)
+                    candidate_df["selected_feature_count"] = len(current_feature_names)
+                    candidate_df["effective_activation_pca_dim"] = (
+                        pd.NA if activation_bundle is None or activation_bundle.effective_pca_dim is None else int(activation_bundle.effective_pca_dim)
+                    )
+                    candidate_df.to_csv(candidate_path, index=False)
 
-                coefficient_df = extract_standardized_coefficients(
-                    best_model,
-                    feature_names=current_feature_names,
-                    target_name=target_name,
-                    feature_space=feature_space_name,
-                    train_env=train_env,
-                )
-                coefficient_df["feature_space_title"] = feature_space.title
-                coefficient_df["feature_family_group"] = feature_space.family_title
-                coefficient_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
-                coefficient_df["feature_size_label"] = size_label
-                coefficient_df["attention_feature_count"] = int(attention_dim)
-                coefficient_df["activation_feature_count"] = int(activation_dim)
-                coefficient_df["selected_feature_count"] = len(current_feature_names)
-                coefficient_df.to_csv(coefficients_path, index=False)
-                all_coefficient_frames.append(coefficient_df)
+                    selected_path = selection_dir / f"{slugify(train_env)}__selected_features.csv"
+                    coefficients_path = selection_dir / f"{slugify(train_env)}__coefficients.csv"
+                    selection_summary_path = selection_dir / f"{slugify(train_env)}__selection_summary.csv"
+                    transfer_metrics_path = selection_dir / f"{slugify(train_env)}__transfer_metrics.csv"
 
-                all_model_selection_rows.append(
-                    {
+                    selected_df = pd.DataFrame({"feature": current_feature_names})
+                    if not selected_df.empty:
+                        selected_df = selected_df.merge(
+                            ranking_meta_df,
+                            on="feature",
+                            how="left",
+                            validate="one_to_one",
+                        )
+                    selected_df["target_name"] = target_name
+                    selected_df["feature_space"] = feature_space_name
+                    selected_df["feature_space_title"] = feature_space.title
+                    selected_df["feature_family_group"] = feature_space.family_title
+                    selected_df["train_env"] = train_env
+                    selected_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
+                    selected_df["feature_size_label"] = size_label
+                    selected_df["attention_feature_count"] = int(attention_dim)
+                    selected_df["activation_feature_count"] = int(activation_dim)
+                    selected_df["selected_feature_count"] = len(current_feature_names)
+                    selected_df.to_csv(selected_path, index=False)
+
+                    coefficient_df = extract_standardized_coefficients(
+                        best_model,
+                        feature_names=current_feature_names,
+                        target_name=target_name,
+                        feature_space=feature_space_name,
+                        train_env=train_env,
+                    )
+                    coefficient_df["feature_space_title"] = feature_space.title
+                    coefficient_df["feature_family_group"] = feature_space.family_title
+                    coefficient_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
+                    coefficient_df["feature_size_label"] = size_label
+                    coefficient_df["attention_feature_count"] = int(attention_dim)
+                    coefficient_df["activation_feature_count"] = int(activation_dim)
+                    coefficient_df["selected_feature_count"] = len(current_feature_names)
+                    coefficient_df.to_csv(coefficients_path, index=False)
+                    all_coefficient_frames.append(coefficient_df)
+
+                    selection_summary_row = {
                         "target_name": target_name,
                         "target_title": target_title,
                         "feature_space": feature_space_name,
@@ -1507,27 +1532,30 @@ for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Model targets", t
                         "candidate_path": str(candidate_path),
                         "selected_features_path": str(selected_path),
                         "coefficients_path": str(coefficients_path),
+                        "selection_summary_path": str(selection_summary_path),
+                        "transfer_metrics_path": str(transfer_metrics_path),
                         **best_model.validation_metrics,
                     }
-                )
+                    pd.DataFrame([selection_summary_row]).to_csv(selection_summary_path, index=False)
+                    all_model_selection_rows.append(selection_summary_row)
 
-                for test_env in ENV_ORDER:
-                    eval_cache = env_pool_cache[test_env]
-                    x_eval = assemble_split_matrix(
-                        eval_cache,
-                        split_name="val",
-                        feature_space=feature_space,
-                        attention_dim=attention_dim,
-                        activation_dim=activation_dim,
-                    )
-                    eval_scores = best_model.estimator.predict_proba(x_eval)[:, 1].astype(np.float32)
-                    eval_metrics = summarize_score_metrics(
-                        eval_cache["y_val"],
-                        eval_scores,
-                        decision_threshold=float(best_model.decision_threshold),
-                    )
-                    all_transfer_metric_rows.append(
-                        {
+                    current_transfer_rows: list[dict[str, Any]] = []
+                    for test_env in ENV_ORDER:
+                        eval_cache = env_pool_cache[test_env]
+                        x_eval = assemble_split_matrix(
+                            eval_cache,
+                            split_name="val",
+                            feature_space=feature_space,
+                            attention_dim=attention_dim,
+                            activation_dim=activation_dim,
+                        )
+                        eval_scores = best_model.estimator.predict_proba(x_eval)[:, 1].astype(np.float32)
+                        eval_metrics = summarize_score_metrics(
+                            eval_cache["y_val"],
+                            eval_scores,
+                            decision_threshold=float(best_model.decision_threshold),
+                        )
+                        transfer_row = {
                             "target_name": target_name,
                             "target_title": target_title,
                             "feature_space": feature_space_name,
@@ -1550,18 +1578,28 @@ for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Model targets", t
                             "oracle_mean_ood_auroc_selected": float(best_candidate_oracle_metrics["oracle_mean_ood_auroc"]),
                             "selected_features_path": str(selected_path),
                             "coefficients_path": str(coefficients_path),
+                            "transfer_metrics_path": str(transfer_metrics_path),
                             **eval_metrics,
                         }
-                    )
+                        current_transfer_rows.append(transfer_row)
+                        all_transfer_metric_rows.append(transfer_row)
 
-                gc.collect()
+                    pd.DataFrame(current_transfer_rows).to_csv(transfer_metrics_path, index=False)
 
-all_transfer_metrics_df = pd.DataFrame(all_transfer_metric_rows)
-all_model_selection_df = pd.DataFrame(all_model_selection_rows)
-all_coefficients_df = pd.concat(all_coefficient_frames, ignore_index=True) if all_coefficient_frames else pd.DataFrame()
-all_transfer_metrics_df.to_csv(OUTPUT_ROOT / "all_transfer_metrics.csv", index=False)
-all_model_selection_df.to_csv(OUTPUT_ROOT / "all_model_selection.csv", index=False)
-all_coefficients_df.to_csv(OUTPUT_ROOT / "all_coefficients.csv", index=False)
+                    gc.collect()
+                    completed_model_selection_count += 1
+                    if completed_model_selection_count % CHECKPOINT_EVERY_MODEL_SELECTIONS == 0:
+                        persist_core_artifacts(
+                            transfer_rows=all_transfer_metric_rows,
+                            model_selection_rows=all_model_selection_rows,
+                            coefficient_frames=all_coefficient_frames,
+                        )
+finally:
+    all_transfer_metrics_df, all_model_selection_df, all_coefficients_df = persist_core_artifacts(
+        transfer_rows=all_transfer_metric_rows,
+        model_selection_rows=all_model_selection_rows,
+        coefficient_frames=all_coefficient_frames,
+    )
 
 
 # %%
