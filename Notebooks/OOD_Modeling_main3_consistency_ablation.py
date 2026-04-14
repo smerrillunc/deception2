@@ -92,6 +92,7 @@ safe_metric_min = oml.safe_metric_min
 safe_metric_std = oml.safe_metric_std
 build_common_layer_roots = oml.build_common_layer_roots
 COMMITMENT_NON_FEATURE_COLUMNS = set(oml.COMMITMENT_NON_FEATURE_COLUMNS)
+classify_feature_family = oml.classify_feature_family
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 pd.set_option("display.max_columns", 200)
@@ -191,6 +192,7 @@ CHECKPOINT_EVERY_MODEL_SELECTIONS = max(1, int(env_int("OOD_MAIN3_COMPANION_CHEC
 
 ATTENTION_METRIC_NAMES = tuple(extractor.ATTENTION_METRIC_NAMES)
 HEAD_SUMMARY_NAMES = tuple(extractor.HEAD_SUMMARY_NAMES)
+ATTENTION_TRANSITION_PREFIXES = tuple(extractor.TRANSITION_PREFIXES)
 BAND_NAMES = ("early", "mid", "late")
 BAND_STAT_NAMES = ("mean", "min", "max", "std")
 
@@ -571,7 +573,9 @@ for env_name, metadata_df in feature_metadata_by_env.items():
 
 # %%
 ATTN_ROOT_RE = re.compile(
-    r"^(?P<metric>"
+    r"^(?:(?P<transition_prefix>"
+    + "|".join(re.escape(prefix) for prefix in ATTENTION_TRANSITION_PREFIXES)
+    + r")_)?(?P<metric>"
     + "|".join(re.escape(metric) for metric in ATTENTION_METRIC_NAMES)
     + r")_(?P<head_summary>"
     + "|".join(re.escape(name) for name in HEAD_SUMMARY_NAMES)
@@ -620,18 +624,20 @@ def build_attention_reduction_lookup() -> pd.DataFrame:
         if match is None:
             continue
         layer_count = len(columns)
+        transition_prefix = str(match.group("transition_prefix") or "")
         for band_name in BAND_NAMES:
             for stat_name in BAND_STAT_NAMES:
                 rows.append(
                     {
                         "feature": f"{root_name}__band_{band_name}__{stat_name}",
                         "feature_root": root_name,
+                        "transition_prefix": transition_prefix,
                         "metric_name": match.group("metric"),
                         "head_summary": match.group("head_summary"),
                         "band": band_name,
                         "band_stat": stat_name,
                         "layer_count": int(layer_count),
-                        "family": "attention",
+                        "family": classify_feature_family(root_name),
                     }
                 )
     return pd.DataFrame(rows)
@@ -640,6 +646,7 @@ def build_attention_reduction_lookup() -> pd.DataFrame:
 attention_reduction_lookup_df = build_attention_reduction_lookup()
 display(attention_reduction_lookup_df.head(20))
 attention_reduction_lookup_df.to_csv(OUTPUT_ROOT / "attention_reduction_lookup.csv", index=False)
+expected_attention_reduced_columns = set(attention_reduction_lookup_df["feature"].astype(str).tolist())
 
 
 def build_attention_reduced_env_frame(
@@ -702,9 +709,17 @@ for env_name, env_paths in maybe_tqdm(
     disable=DISABLE_TQDM,
 ):
     attention_cache_path = CACHE_DIR / f"{slugify(env_name)}__attention_reduced.parquet"
-    if attention_cache_path.exists() and not FORCE_REBUILD_REDUCTIONS:
+    should_rebuild_cache = bool(FORCE_REBUILD_REDUCTIONS)
+    if attention_cache_path.exists() and not should_rebuild_cache:
         attention_df = pd.read_parquet(attention_cache_path)
-    else:
+        missing_reduced_columns = sorted(expected_attention_reduced_columns - set(attention_df.columns.astype(str).tolist()))
+        if missing_reduced_columns:
+            print(
+                f"Rebuilding stale attention cache for {env_name}: "
+                f"{len(missing_reduced_columns)} reduced columns missing."
+            )
+            should_rebuild_cache = True
+    if not attention_cache_path.exists() or should_rebuild_cache:
         attention_df = build_attention_reduced_env_frame(
             env_name,
             feature_path=env_paths["feature_path"],
