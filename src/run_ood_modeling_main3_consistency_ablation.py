@@ -34,7 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         default=None,
-        help="Optional explicit output directory. Defaults to the notebook's standard output path.",
+        help="Optional explicit output directory. Defaults to the notebook's family-aware output path.",
+    )
+    parser.add_argument(
+        "--model-family",
+        default="logreg",
+        help="Model family to train for this run, e.g. logreg or xgb.",
     )
     parser.add_argument(
         "--feature-sizes",
@@ -48,9 +53,26 @@ def parse_args() -> argparse.Namespace:
         help="Maximum ranked attention features to cache before slicing to each feature size.",
     )
     parser.add_argument(
+        "--logreg-c",
+        type=float,
+        default=0.1,
+        help="Fixed logistic-regression C value.",
+    )
+    parser.add_argument(
+        "--xgb-max-depth",
+        type=int,
+        default=5,
+        help="Fixed XGBoost max_depth value.",
+    )
+    parser.add_argument(
         "--c-grid",
-        default="0.1",
-        help="Comma-separated logistic C values. Keep this small for faster iteration.",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--xgb-max-depth-grid",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--seed",
@@ -132,10 +154,34 @@ def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
 
 
-def resolve_output_root(*, source_path: Path, model_dirname: str, explicit_output_root: str | None) -> Path:
+def normalize_model_family(raw_value: str) -> str:
+    value = str(raw_value).strip().lower()
+    if value in {"logreg", "logistic", "logistic_regression", "lr"}:
+        return "logreg"
+    if value in {"xgboost", "xgb"}:
+        return "xgboost"
+    raise ValueError(f"Unsupported model family: {raw_value!r}")
+
+
+def first_csv_item(raw_value: str, *, cast: type[float] | type[int]) -> float | int:
+    parts = [part.strip() for part in str(raw_value).split(",") if part.strip()]
+    if not parts:
+        raise ValueError(f"Expected at least one comma-separated value, got {raw_value!r}")
+    return cast(parts[0])
+
+
+def resolve_output_root(
+    *,
+    source_path: Path,
+    model_dirname: str,
+    model_family: str,
+    explicit_output_root: str | None,
+) -> Path:
     if explicit_output_root:
         return Path(explicit_output_root)
-    return source_path.parent / f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(model_dirname)}"
+    return source_path.parent / (
+        f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(model_dirname)}__{slugify(model_family)}"
+    )
 
 
 def main() -> None:
@@ -147,16 +193,32 @@ def main() -> None:
     if not args.show_plots:
         os.environ.setdefault("MPLBACKEND", "Agg")
 
+    model_family = normalize_model_family(args.model_family)
     feature_sizes = [int(part.strip()) for part in str(args.feature_sizes).split(",") if part.strip()]
     attention_top_k = int(args.attention_top_k) if args.attention_top_k is not None else max(feature_sizes)
+    logreg_c = float(args.logreg_c)
+    if args.c_grid:
+        logreg_c = float(first_csv_item(args.c_grid, cast=float))
+    xgb_max_depth = int(args.xgb_max_depth)
+    if args.xgb_max_depth_grid:
+        xgb_max_depth = int(first_csv_item(args.xgb_max_depth_grid, cast=int))
+    output_root = resolve_output_root(
+        source_path=source_path,
+        model_dirname=str(args.model_dirname),
+        model_family=model_family,
+        explicit_output_root=args.output_root,
+    )
 
     set_env("OOD_MAIN3_COMPANION_MODEL_NAME", str(args.model_dirname))
+    set_env("OOD_MAIN3_COMPANION_MODEL_FAMILY", model_family)
     set_env("OOD_MAIN3_COMPANION_SOURCE_PATH", str(source_path))
     set_env("OOD_MAIN3_COMPANION_REPO_ROOT", str(REPO_ROOT))
     set_env("OOD_MAIN3_COMPANION_NOTEBOOK_ROOT", str(source_path.parent))
+    set_env("OOD_MAIN3_COMPANION_OUTPUT_ROOT", str(output_root))
     set_env("OOD_MAIN3_COMPANION_FEATURE_SIZES", ",".join(str(value) for value in feature_sizes))
     set_env("OOD_MAIN3_COMPANION_ATTENTION_TOP_K", str(attention_top_k))
-    set_env("OOD_MAIN3_COMPANION_C_GRID", str(args.c_grid))
+    set_env("OOD_MAIN3_COMPANION_LOGREG_C", str(logreg_c))
+    set_env("OOD_MAIN3_COMPANION_XGB_MAX_DEPTH", str(xgb_max_depth))
     set_env("OOD_MAIN3_COMPANION_SEED", str(int(args.seed)))
     set_env("OOD_MAIN3_COMPANION_VAL_SIZE", str(float(args.val_size)))
     set_env("OOD_MAIN3_COMPANION_DELTA_THRESHOLD", str(float(args.delta_threshold)))
@@ -169,26 +231,21 @@ def main() -> None:
     set_env("OOD_MAIN3_COMPANION_DISABLE_TQDM", "1" if args.disable_tqdm else "0")
     if args.dataset_root:
         set_env("OOD_MAIN3_COMPANION_DATASET_ROOT", str(Path(args.dataset_root)))
-    if args.output_root:
-        set_env("OOD_MAIN3_COMPANION_OUTPUT_ROOT", str(Path(args.output_root)))
 
     print("Running OOD Main3 consistency ablation script")
     print(f"Source: {source_path}")
     print(f"Model: {args.model_dirname}")
+    print(f"Model family: {model_family}")
     print(f"Feature sizes: {feature_sizes}")
     print(f"Attention top-k cache: {attention_top_k}")
+    print(f"Fixed logistic C: {logreg_c:g}")
+    print(f"Fixed XGBoost max_depth: {xgb_max_depth}")
     if args.dataset_root:
         print(f"Dataset root: {Path(args.dataset_root)}")
-    if args.output_root:
-        print(f"Output root: {Path(args.output_root)}")
+    print(f"Output root: {output_root}")
 
     runpy.run_path(str(source_path), run_name="__main__")
 
-    output_root = resolve_output_root(
-        source_path=source_path,
-        model_dirname=str(args.model_dirname),
-        explicit_output_root=args.output_root,
-    )
     required_outputs = [
         output_root / "config.csv",
         output_root / "all_transfer_metrics.csv",

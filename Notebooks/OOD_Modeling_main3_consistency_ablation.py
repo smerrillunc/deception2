@@ -10,7 +10,8 @@
 # - only predict `delta > 0.3` and `delta < -0.3`
 # - rank attention features globally by cross-environment consistency and keep the top 256
 # - sweep feature sizes `[32, 64, 128, 256]`
-# - use fixed `C=0.1` by default for faster iteration
+# - support either logistic regression or XGBoost as the modeling family with fixed defaults
+# - include all-attention plus grounding/concentration and transition-only attention ablations
 # - activation baselines use `.h5` final-layer sentence activations:
 #   1. raw z-standardized final-sentence activations
 #   2. PCA-k of z-standardized final-sentence activations
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import gc
 import importlib
+import json
 import math
 import os
 import re
@@ -45,6 +47,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    XGBClassifier = None
 
 try:
     from IPython.display import display
@@ -136,6 +143,47 @@ def env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(int(part) for part in parts)
 
 
+def _first_csv_item(raw: str) -> str:
+    parts = [part.strip() for part in str(raw).split(",") if part.strip()]
+    if not parts:
+        raise ValueError(f"Expected at least one value, got {raw!r}")
+    return parts[0]
+
+
+def env_float_with_legacy_list(name: str, default: float, *, legacy_names: tuple[str, ...] = ()) -> float:
+    raw = os.environ.get(name)
+    if raw is not None and raw != "":
+        return float(raw)
+    for legacy_name in legacy_names:
+        legacy_raw = os.environ.get(legacy_name)
+        if legacy_raw is not None and legacy_raw != "":
+            return float(_first_csv_item(legacy_raw))
+    return float(default)
+
+
+def env_int_with_legacy_list(name: str, default: int, *, legacy_names: tuple[str, ...] = ()) -> int:
+    raw = os.environ.get(name)
+    if raw is not None and raw != "":
+        return int(raw)
+    for legacy_name in legacy_names:
+        legacy_raw = os.environ.get(legacy_name)
+        if legacy_raw is not None and legacy_raw != "":
+            return int(_first_csv_item(legacy_raw))
+    return int(default)
+
+
+def normalize_model_family(raw_value: str | None) -> str:
+    value = str(raw_value or "logreg").strip().lower()
+    if value in {"logreg", "logistic", "logistic_regression", "lr"}:
+        return "logreg"
+    if value in {"xgboost", "xgb"}:
+        return "xgboost"
+    raise ValueError(
+        f"Unsupported model family {raw_value!r}. "
+        "Expected one of ['logreg', 'xgboost']."
+    )
+
+
 # %%
 DATASET_ROOT = Path(
     os.environ.get(
@@ -166,7 +214,39 @@ VAL_SIZE = env_float("OOD_MAIN3_COMPANION_VAL_SIZE", env_float("OOD_MAIN3_VAL_SI
 DELTA_THRESHOLD = env_float("OOD_MAIN3_COMPANION_DELTA_THRESHOLD", env_float("OOD_MAIN3_DELTA_THRESHOLD", 0.30))
 FEATURE_SIZE_GRID = env_int_tuple("OOD_MAIN3_COMPANION_FEATURE_SIZES", (32, 64, 128, 256))
 ATTENTION_TOP_K = env_int("OOD_MAIN3_COMPANION_ATTENTION_TOP_K", max(FEATURE_SIZE_GRID))
-C_GRID = env_float_tuple("OOD_MAIN3_COMPANION_C_GRID", (0.1,))
+MODEL_FAMILY = normalize_model_family(
+    os.environ.get(
+        "OOD_MAIN3_COMPANION_MODEL_FAMILY",
+        os.environ.get("OOD_MAIN3_MODEL_FAMILY", "logreg"),
+    )
+)
+MODEL_FAMILY_TITLE = {
+    "logreg": "Logistic regression",
+    "xgboost": "XGBoost",
+}[MODEL_FAMILY]
+MODEL_WEIGHT_KIND = {
+    "logreg": "coefficient",
+    "xgboost": "gain_importance",
+}[MODEL_FAMILY]
+LOGREG_C = env_float_with_legacy_list(
+    "OOD_MAIN3_COMPANION_LOGREG_C",
+    0.1,
+    legacy_names=("OOD_MAIN3_COMPANION_C_GRID",),
+)
+XGB_MAX_DEPTH = env_int_with_legacy_list(
+    "OOD_MAIN3_COMPANION_XGB_MAX_DEPTH",
+    5,
+    legacy_names=("OOD_MAIN3_COMPANION_XGB_MAX_DEPTH_GRID",),
+)
+XGB_N_ESTIMATORS = int(env_int("OOD_MAIN3_COMPANION_XGB_N_ESTIMATORS", 300) or 300)
+XGB_LEARNING_RATE = env_float("OOD_MAIN3_COMPANION_XGB_LEARNING_RATE", 0.05)
+XGB_SUBSAMPLE = env_float("OOD_MAIN3_COMPANION_XGB_SUBSAMPLE", 0.8)
+XGB_COLSAMPLE_BYTREE = env_float("OOD_MAIN3_COMPANION_XGB_COLSAMPLE_BYTREE", 0.8)
+XGB_REG_LAMBDA = env_float("OOD_MAIN3_COMPANION_XGB_REG_LAMBDA", 1.0)
+XGB_MIN_CHILD_WEIGHT = env_float("OOD_MAIN3_COMPANION_XGB_MIN_CHILD_WEIGHT", 1.0)
+XGB_GAMMA = env_float("OOD_MAIN3_COMPANION_XGB_GAMMA", 0.0)
+XGB_N_JOBS = int(env_int("OOD_MAIN3_COMPANION_XGB_N_JOBS", 1) or 1)
+XGB_IMPORTANCE_TYPE = os.environ.get("OOD_MAIN3_COMPANION_XGB_IMPORTANCE_TYPE", "gain")
 PER_ROOT_LIMIT = env_int("OOD_MAIN3_COMPANION_PER_ROOT_LIMIT", 4)
 ROOT_BATCH_SIZE = env_int("OOD_MAIN3_COMPANION_ROOT_BATCH_SIZE", 8)
 ACTIVATION_PCA_DIM = int(max(FEATURE_SIZE_GRID))
@@ -179,10 +259,16 @@ FORCE_REBUILD_REDUCTIONS = os.environ.get("OOD_MAIN3_COMPANION_FORCE_REBUILD", "
 DISABLE_TQDM = os.environ.get("OOD_MAIN3_COMPANION_DISABLE_TQDM", "0") == "1"
 TOP_FEATURES_TO_SHOW = env_int("OOD_MAIN3_COMPANION_TOP_FEATURES_TO_SHOW", 20)
 
+if MODEL_FAMILY == "xgboost" and XGBClassifier is None:
+    raise ImportError("xgboost is not installed, but MODEL_FAMILY='xgboost' was requested.")
+
 OUTPUT_ROOT = Path(
     os.environ.get(
         "OOD_MAIN3_COMPANION_OUTPUT_ROOT",
-        str(NOTEBOOK_ROOT / f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(MODEL_DIRNAME)}"),
+        str(
+            NOTEBOOK_ROOT
+            / f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(MODEL_DIRNAME)}__{slugify(MODEL_FAMILY)}"
+        ),
     )
 )
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -196,6 +282,33 @@ ATTENTION_TRANSITION_PREFIXES = tuple(extractor.TRANSITION_PREFIXES)
 BAND_NAMES = ("early", "mid", "late")
 BAND_STAT_NAMES = ("mean", "min", "max", "std")
 
+GROUNDING_ATTENTION_METRIC_NAMES = (
+    "current_vs_prior",
+    "current_vs_prev",
+    "current_vs_prev3",
+    "recent_vs_early",
+    "prev_share_of_prior",
+    "current_share_total",
+)
+CONCENTRATION_ATTENTION_METRIC_NAMES = (
+    "entropy_prior",
+    "entropy_full",
+    "top1_prior",
+    "top5_prior",
+    "herfindahl_prior",
+    "effective_support_prior",
+)
+ATTENTION_METRIC_GROUP_BY_NAME = {
+    **{metric_name: "grounding" for metric_name in GROUNDING_ATTENTION_METRIC_NAMES},
+    **{metric_name: "concentration" for metric_name in CONCENTRATION_ATTENTION_METRIC_NAMES},
+}
+unknown_attention_metrics = sorted(set(ATTENTION_METRIC_NAMES) - set(ATTENTION_METRIC_GROUP_BY_NAME))
+if unknown_attention_metrics:
+    raise ValueError(
+        "Attention metrics are missing grounding/concentration assignments: "
+        + ", ".join(unknown_attention_metrics)
+    )
+
 config_df = pd.DataFrame(
     [
         {"setting": "source_path", "value": str(SOURCE_PATH)},
@@ -207,9 +320,23 @@ config_df = pd.DataFrame(
         {"setting": "env_order", "value": ", ".join(ENV_ORDER)},
         {"setting": "val_size", "value": VAL_SIZE},
         {"setting": "delta_threshold", "value": DELTA_THRESHOLD},
+        {"setting": "model_family", "value": MODEL_FAMILY},
+        {"setting": "model_family_title", "value": MODEL_FAMILY_TITLE},
+        {"setting": "model_weight_kind", "value": MODEL_WEIGHT_KIND},
         {"setting": "attention_top_k", "value": ATTENTION_TOP_K},
         {"setting": "feature_size_grid", "value": ", ".join(str(value) for value in FEATURE_SIZE_GRID)},
-        {"setting": "c_grid", "value": ", ".join(f"{value:g}" for value in C_GRID)},
+        {"setting": "model_search_mode", "value": "fixed_defaults"},
+        {"setting": "logreg_c", "value": LOGREG_C},
+        {"setting": "xgb_max_depth", "value": XGB_MAX_DEPTH},
+        {"setting": "xgb_n_estimators", "value": XGB_N_ESTIMATORS},
+        {"setting": "xgb_learning_rate", "value": XGB_LEARNING_RATE},
+        {"setting": "xgb_subsample", "value": XGB_SUBSAMPLE},
+        {"setting": "xgb_colsample_bytree", "value": XGB_COLSAMPLE_BYTREE},
+        {"setting": "xgb_reg_lambda", "value": XGB_REG_LAMBDA},
+        {"setting": "xgb_min_child_weight", "value": XGB_MIN_CHILD_WEIGHT},
+        {"setting": "xgb_gamma", "value": XGB_GAMMA},
+        {"setting": "xgb_n_jobs", "value": XGB_N_JOBS},
+        {"setting": "xgb_importance_type", "value": XGB_IMPORTANCE_TYPE},
         {"setting": "per_root_limit", "value": PER_ROOT_LIMIT},
         {"setting": "root_batch_size", "value": ROOT_BATCH_SIZE},
         {"setting": "activation_pca_dim", "value": ACTIVATION_PCA_DIM},
@@ -249,13 +376,73 @@ TARGET_SPECS = OrderedDict(
 
 
 @dataclass(frozen=True)
+class AttentionSubsetSpec:
+    key: str
+    title: str
+    metric_names: tuple[str, ...]
+    transition_mode: str
+
+
+@dataclass(frozen=True)
 class FeatureSpaceSpec:
     name: str
     title: str
     family_title: str
     uses_attention: bool
+    attention_subset_key: str | None
     activation_variant: str | None
     activation_use_pca: bool
+
+
+ATTENTION_SUBSETS = OrderedDict(
+    [
+        (
+            "all_attention",
+            AttentionSubsetSpec(
+                key="all_attention",
+                title="All attention features",
+                metric_names=ATTENTION_METRIC_NAMES,
+                transition_mode="all",
+            ),
+        ),
+        (
+            "grounding_only",
+            AttentionSubsetSpec(
+                key="grounding_only",
+                title="Grounding only",
+                metric_names=GROUNDING_ATTENTION_METRIC_NAMES,
+                transition_mode="base_only",
+            ),
+        ),
+        (
+            "concentration_only",
+            AttentionSubsetSpec(
+                key="concentration_only",
+                title="Concentration only",
+                metric_names=CONCENTRATION_ATTENTION_METRIC_NAMES,
+                transition_mode="base_only",
+            ),
+        ),
+        (
+            "grounding_transition_only",
+            AttentionSubsetSpec(
+                key="grounding_transition_only",
+                title="Grounding transitions only",
+                metric_names=GROUNDING_ATTENTION_METRIC_NAMES,
+                transition_mode="transition_only",
+            ),
+        ),
+        (
+            "concentration_transition_only",
+            AttentionSubsetSpec(
+                key="concentration_transition_only",
+                title="Concentration transitions only",
+                metric_names=CONCENTRATION_ATTENTION_METRIC_NAMES,
+                transition_mode="transition_only",
+            ),
+        ),
+    ]
+)
 
 
 FEATURE_SPACES = OrderedDict(
@@ -267,6 +454,55 @@ FEATURE_SPACES = OrderedDict(
                 title="Attention only",
                 family_title="attention_only",
                 uses_attention=True,
+                attention_subset_key="all_attention",
+                activation_variant=None,
+                activation_use_pca=False,
+            ),
+        ),
+        (
+            "attention_grounding_only",
+            FeatureSpaceSpec(
+                name="attention_grounding_only",
+                title="Attention only: grounding",
+                family_title="attention_only",
+                uses_attention=True,
+                attention_subset_key="grounding_only",
+                activation_variant=None,
+                activation_use_pca=False,
+            ),
+        ),
+        (
+            "attention_concentration_only",
+            FeatureSpaceSpec(
+                name="attention_concentration_only",
+                title="Attention only: concentration",
+                family_title="attention_only",
+                uses_attention=True,
+                attention_subset_key="concentration_only",
+                activation_variant=None,
+                activation_use_pca=False,
+            ),
+        ),
+        (
+            "attention_grounding_transition_only",
+            FeatureSpaceSpec(
+                name="attention_grounding_transition_only",
+                title="Attention only: grounding transition",
+                family_title="attention_only",
+                uses_attention=True,
+                attention_subset_key="grounding_transition_only",
+                activation_variant=None,
+                activation_use_pca=False,
+            ),
+        ),
+        (
+            "attention_concentration_transition_only",
+            FeatureSpaceSpec(
+                name="attention_concentration_transition_only",
+                title="Attention only: concentration transition",
+                family_title="attention_only",
+                uses_attention=True,
+                attention_subset_key="concentration_transition_only",
                 activation_variant=None,
                 activation_use_pca=False,
             ),
@@ -278,6 +514,7 @@ FEATURE_SPACES = OrderedDict(
                 title="Activation only: PCA final",
                 family_title="activation_only",
                 uses_attention=False,
+                attention_subset_key=None,
                 activation_variant="final_sentence",
                 activation_use_pca=True,
             ),
@@ -289,6 +526,7 @@ FEATURE_SPACES = OrderedDict(
                 title="Activation only: PCA final - previous",
                 family_title="activation_only",
                 uses_attention=False,
+                attention_subset_key=None,
                 activation_variant="delta_last2",
                 activation_use_pca=True,
             ),
@@ -300,6 +538,7 @@ FEATURE_SPACES = OrderedDict(
                 title="Activation only: PCA final - mean(prev 4)",
                 family_title="activation_only",
                 uses_attention=False,
+                attention_subset_key=None,
                 activation_variant="delta_prev4mean",
                 activation_use_pca=True,
             ),
@@ -311,6 +550,7 @@ FEATURE_SPACES = OrderedDict(
                 title="Baseline: raw final",
                 family_title="baseline",
                 uses_attention=False,
+                attention_subset_key=None,
                 activation_variant="final_sentence",
                 activation_use_pca=False,
             ),
@@ -322,6 +562,7 @@ FEATURE_SPACES = OrderedDict(
                 title="Attention + PCA final",
                 family_title="attention_plus_activation",
                 uses_attention=True,
+                attention_subset_key="all_attention",
                 activation_variant="final_sentence",
                 activation_use_pca=True,
             ),
@@ -333,6 +574,7 @@ FEATURE_SPACES = OrderedDict(
                 title="Attention + PCA final - previous",
                 family_title="attention_plus_activation",
                 uses_attention=True,
+                attention_subset_key="all_attention",
                 activation_variant="delta_last2",
                 activation_use_pca=True,
             ),
@@ -344,12 +586,47 @@ FEATURE_SPACES = OrderedDict(
                 title="Attention + PCA final - mean(prev 4)",
                 family_title="attention_plus_activation",
                 uses_attention=True,
+                attention_subset_key="all_attention",
                 activation_variant="delta_prev4mean",
                 activation_use_pca=True,
             ),
         ),
     ]
 )
+
+attention_subset_catalog_df = pd.DataFrame(
+    [
+        {
+            "attention_subset_key": subset_spec.key,
+            "attention_subset_title": subset_spec.title,
+            "transition_mode": subset_spec.transition_mode,
+            "metric_names": ", ".join(subset_spec.metric_names),
+        }
+        for subset_spec in ATTENTION_SUBSETS.values()
+    ]
+)
+attention_subset_catalog_df.to_csv(OUTPUT_ROOT / "attention_subset_catalog.csv", index=False)
+
+feature_space_catalog_df = pd.DataFrame(
+    [
+        {
+            "feature_space": feature_space.name,
+            "feature_space_title": feature_space.title,
+            "feature_family_group": feature_space.family_title,
+            "uses_attention": feature_space.uses_attention,
+            "attention_subset_key": feature_space.attention_subset_key or "",
+            "attention_subset_title": (
+                ATTENTION_SUBSETS[str(feature_space.attention_subset_key)].title
+                if feature_space.attention_subset_key is not None
+                else ""
+            ),
+            "activation_variant": feature_space.activation_variant or "",
+            "activation_use_pca": feature_space.activation_use_pca,
+        }
+        for feature_space in FEATURE_SPACES.values()
+    ]
+)
+feature_space_catalog_df.to_csv(OUTPUT_ROOT / "feature_space_catalog.csv", index=False)
 
 FAMILY_PANEL_ORDER = (
     "attention_only",
@@ -624,7 +901,11 @@ def build_attention_reduction_lookup() -> pd.DataFrame:
         if match is None:
             continue
         layer_count = len(columns)
+        metric_name = str(match.group("metric"))
         transition_prefix = str(match.group("transition_prefix") or "")
+        is_transition = transition_prefix != ""
+        metric_group = ATTENTION_METRIC_GROUP_BY_NAME[metric_name]
+        attention_feature_group = f"{metric_group}_transition" if is_transition else metric_group
         for band_name in BAND_NAMES:
             for stat_name in BAND_STAT_NAMES:
                 rows.append(
@@ -632,12 +913,15 @@ def build_attention_reduction_lookup() -> pd.DataFrame:
                         "feature": f"{root_name}__band_{band_name}__{stat_name}",
                         "feature_root": root_name,
                         "transition_prefix": transition_prefix,
-                        "metric_name": match.group("metric"),
+                        "is_transition": bool(is_transition),
+                        "metric_name": metric_name,
+                        "metric_group": metric_group,
+                        "attention_feature_group": attention_feature_group,
                         "head_summary": match.group("head_summary"),
                         "band": band_name,
                         "band_stat": stat_name,
                         "layer_count": int(layer_count),
-                        "family": classify_feature_family(root_name),
+                        "family": attention_feature_group,
                     }
                 )
     return pd.DataFrame(rows)
@@ -647,6 +931,26 @@ attention_reduction_lookup_df = build_attention_reduction_lookup()
 display(attention_reduction_lookup_df.head(20))
 attention_reduction_lookup_df.to_csv(OUTPUT_ROOT / "attention_reduction_lookup.csv", index=False)
 expected_attention_reduced_columns = set(attention_reduction_lookup_df["feature"].astype(str).tolist())
+
+
+def build_attention_subset_lookup(
+    feature_lookup_df: pd.DataFrame,
+    *,
+    subset_spec: AttentionSubsetSpec,
+) -> pd.DataFrame:
+    subset_mask = feature_lookup_df["metric_name"].isin(subset_spec.metric_names)
+    is_transition = feature_lookup_df["is_transition"].to_numpy(dtype=bool, copy=False)
+    if subset_spec.transition_mode == "base_only":
+        subset_mask &= ~is_transition
+    elif subset_spec.transition_mode == "transition_only":
+        subset_mask &= is_transition
+    elif subset_spec.transition_mode != "all":
+        raise ValueError(f"Unsupported attention transition mode: {subset_spec.transition_mode!r}")
+
+    subset_df = feature_lookup_df.loc[subset_mask].copy().reset_index(drop=True)
+    if subset_df.empty:
+        raise ValueError(f"Attention subset {subset_spec.key!r} did not match any reduced features.")
+    return subset_df
 
 
 def build_attention_reduced_env_frame(
@@ -730,10 +1034,32 @@ for env_name, env_paths in maybe_tqdm(
     attention_envs[env_name] = attention_df
 
 attention_feature_names = feature_columns_for_env(next(iter(attention_envs.values())))
+attention_lookup = attention_reduction_lookup_df.loc[
+    attention_reduction_lookup_df["feature"].isin(attention_feature_names)
+].copy()
+attention_lookup_by_subset = OrderedDict(
+    (
+        subset_key,
+        build_attention_subset_lookup(attention_lookup, subset_spec=subset_spec),
+    )
+    for subset_key, subset_spec in ATTENTION_SUBSETS.items()
+)
+attention_subset_feature_counts_df = pd.DataFrame(
+    [
+        {
+            "attention_subset_key": subset_key,
+            "attention_subset_title": ATTENTION_SUBSETS[subset_key].title,
+            "reduced_feature_count": len(subset_lookup_df),
+        }
+        for subset_key, subset_lookup_df in attention_lookup_by_subset.items()
+    ]
+)
+attention_subset_feature_counts_df.to_csv(OUTPUT_ROOT / "attention_subset_feature_counts.csv", index=False)
 feature_space_summary_df = pd.DataFrame(
     [
         {"setting": "attention_layer_root_count", "value": len(attention_layer_roots)},
         {"setting": "attention_reduced_feature_count", "value": len(attention_feature_names)},
+        {"setting": "attention_subset_count", "value": len(ATTENTION_SUBSETS)},
         {"setting": "activation_hidden_dim", "value": ACTIVATION_HIDDEN_DIM},
         {"setting": "activation_pca_dim", "value": ACTIVATION_PCA_DIM},
         {"setting": "feature_size_grid", "value": ",".join(str(value) for value in FEATURE_SIZE_GRID)},
@@ -866,7 +1192,11 @@ def make_activation_lookup(
             {
                 "feature": feature_name,
                 "feature_root": space_name,
+                "transition_prefix": "",
+                "is_transition": False,
                 "metric_name": metric_name,
+                "metric_group": "",
+                "attention_feature_group": "",
                 "head_summary": "",
                 "band": "",
                 "band_stat": "",
@@ -941,31 +1271,105 @@ def finite_std(values: Iterable[float]) -> float:
     return float(np.std(finite, dtype=np.float32))
 
 
+def serialize_candidate_params(candidate_params: dict[str, Any]) -> str:
+    return json.dumps(candidate_params, sort_keys=True)
+
+
+def build_model_candidate_specs(y_train: np.ndarray) -> list[dict[str, Any]]:
+    y_train = np.asarray(y_train, dtype=np.int8)
+    if MODEL_FAMILY == "logreg":
+        return [
+            {
+                "candidate_key": f"c={float(LOGREG_C):g}",
+                "candidate_label": f"C={float(LOGREG_C):g}",
+                "candidate_complexity": float(LOGREG_C),
+                "chosen_c": float(LOGREG_C),
+                "candidate_max_depth": np.nan,
+                "candidate_params": {"C": float(LOGREG_C)},
+            }
+        ]
+
+    if MODEL_FAMILY == "xgboost":
+        pos_count = int((y_train == 1).sum())
+        neg_count = int((y_train == 0).sum())
+        scale_pos_weight = float(neg_count / max(pos_count, 1))
+        return [
+            {
+                "candidate_key": f"max_depth={int(XGB_MAX_DEPTH)}",
+                "candidate_label": f"max_depth={int(XGB_MAX_DEPTH)}",
+                "candidate_complexity": float(XGB_MAX_DEPTH),
+                "chosen_c": np.nan,
+                "candidate_max_depth": int(XGB_MAX_DEPTH),
+                "candidate_params": {
+                    "objective": "binary:logistic",
+                    "n_estimators": int(XGB_N_ESTIMATORS),
+                    "max_depth": int(XGB_MAX_DEPTH),
+                    "learning_rate": float(XGB_LEARNING_RATE),
+                    "subsample": float(XGB_SUBSAMPLE),
+                    "colsample_bytree": float(XGB_COLSAMPLE_BYTREE),
+                    "reg_lambda": float(XGB_REG_LAMBDA),
+                    "min_child_weight": float(XGB_MIN_CHILD_WEIGHT),
+                    "gamma": float(XGB_GAMMA),
+                    "scale_pos_weight": scale_pos_weight,
+                    "tree_method": "hist",
+                    "eval_metric": "logloss",
+                    "importance_type": XGB_IMPORTANCE_TYPE,
+                    "random_state": int(RANDOM_SEED),
+                    "n_jobs": int(XGB_N_JOBS),
+                    "verbosity": 0,
+                },
+            }
+        ]
+
+    raise ValueError(f"Unsupported MODEL_FAMILY={MODEL_FAMILY!r}")
+
+
 @dataclass
 class FittedBinaryModel:
     estimator: Pipeline
-    chosen_c: float
+    model_family: str
+    model_family_title: str
+    model_weight_kind: str
+    candidate_key: str
+    candidate_label: str
+    candidate_complexity: float
+    candidate_params: dict[str, Any]
+    chosen_c: float | None
+    candidate_max_depth: int | None
     decision_threshold: float
     validation_metrics: dict[str, Any]
 
 
-def build_estimator(*, c_value: float) -> Pipeline:
-    return Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            (
-                "model",
-                LogisticRegression(
-                    C=float(c_value),
-                    class_weight="balanced",
-                    max_iter=4000,
-                    solver="liblinear",
-                    random_state=int(RANDOM_SEED),
+def build_estimator(*, candidate_params: dict[str, Any]) -> Pipeline:
+    if MODEL_FAMILY == "logreg":
+        return Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                (
+                    "model",
+                    LogisticRegression(
+                        C=float(candidate_params["C"]),
+                        class_weight="balanced",
+                        max_iter=4000,
+                        solver="liblinear",
+                        random_state=int(RANDOM_SEED),
+                    ),
                 ),
-            ),
-        ]
-    )
+            ]
+        )
+
+    if MODEL_FAMILY == "xgboost":
+        if XGBClassifier is None:
+            raise ImportError("xgboost is unavailable, but MODEL_FAMILY='xgboost' was requested.")
+        return Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                ("model", XGBClassifier(**candidate_params)),
+            ]
+        )
+
+    raise ValueError(f"Unsupported MODEL_FAMILY={MODEL_FAMILY!r}")
 
 
 def fit_candidate_classifiers(
@@ -977,8 +1381,8 @@ def fit_candidate_classifiers(
     candidate_rows: list[dict[str, Any]] = []
     fitted_models: list[FittedBinaryModel] = []
 
-    for c_value in C_GRID:
-        estimator = build_estimator(c_value=float(c_value))
+    for candidate_spec in build_model_candidate_specs(y_train):
+        estimator = build_estimator(candidate_params=dict(candidate_spec["candidate_params"]))
         estimator.fit(x_train, y_train)
         val_scores = estimator.predict_proba(x_val)[:, 1].astype(np.float32)
         decision_threshold = choose_decision_threshold(
@@ -990,7 +1394,23 @@ def fit_candidate_classifiers(
         metrics = summarize_score_metrics(y_val, val_scores, decision_threshold=decision_threshold)
         candidate_rows.append(
             {
-                "candidate_c": float(c_value),
+                "model_family": MODEL_FAMILY,
+                "model_family_title": MODEL_FAMILY_TITLE,
+                "model_weight_kind": MODEL_WEIGHT_KIND,
+                "candidate_key": str(candidate_spec["candidate_key"]),
+                "candidate_label": str(candidate_spec["candidate_label"]),
+                "candidate_complexity": float(candidate_spec["candidate_complexity"]),
+                "candidate_params_json": serialize_candidate_params(candidate_spec["candidate_params"]),
+                "candidate_c": (
+                    float(candidate_spec["chosen_c"])
+                    if pd.notna(candidate_spec["chosen_c"])
+                    else np.nan
+                ),
+                "candidate_max_depth": (
+                    int(candidate_spec["candidate_max_depth"])
+                    if pd.notna(candidate_spec["candidate_max_depth"])
+                    else np.nan
+                ),
                 "decision_threshold": float(decision_threshold),
                 **metrics,
             }
@@ -998,7 +1418,23 @@ def fit_candidate_classifiers(
         fitted_models.append(
             FittedBinaryModel(
                 estimator=estimator,
-                chosen_c=float(c_value),
+                model_family=MODEL_FAMILY,
+                model_family_title=MODEL_FAMILY_TITLE,
+                model_weight_kind=MODEL_WEIGHT_KIND,
+                candidate_key=str(candidate_spec["candidate_key"]),
+                candidate_label=str(candidate_spec["candidate_label"]),
+                candidate_complexity=float(candidate_spec["candidate_complexity"]),
+                candidate_params=dict(candidate_spec["candidate_params"]),
+                chosen_c=(
+                    float(candidate_spec["chosen_c"])
+                    if pd.notna(candidate_spec["chosen_c"])
+                    else None
+                ),
+                candidate_max_depth=(
+                    int(candidate_spec["candidate_max_depth"])
+                    if pd.notna(candidate_spec["candidate_max_depth"])
+                    else None
+                ),
                 decision_threshold=float(decision_threshold),
                 validation_metrics=metrics,
             )
@@ -1009,7 +1445,7 @@ def fit_candidate_classifiers(
     return fitted_models, pd.DataFrame(candidate_rows)
 
 
-def extract_standardized_coefficients(
+def extract_feature_weights(
     fitted_model: FittedBinaryModel,
     *,
     feature_names: list[str],
@@ -1018,17 +1454,32 @@ def extract_standardized_coefficients(
     train_env: str,
 ) -> pd.DataFrame:
     model = fitted_model.estimator.named_steps["model"]
-    coef = np.asarray(model.coef_, dtype=np.float32).reshape(-1)
+    if fitted_model.model_family == "logreg":
+        feature_weight = np.asarray(model.coef_, dtype=np.float32).reshape(-1)
+    elif fitted_model.model_family == "xgboost":
+        feature_weight = np.asarray(model.feature_importances_, dtype=np.float32).reshape(-1)
+    else:
+        raise ValueError(f"Unsupported model family: {fitted_model.model_family!r}")
+    if feature_weight.shape[0] != len(feature_names):
+        raise ValueError(
+            "Feature-weight length mismatch: "
+            f"expected {len(feature_names)}, got {feature_weight.shape[0]}"
+        )
     out = pd.DataFrame(
         {
             "target_name": target_name,
             "feature_space": feature_space,
             "train_env": train_env,
             "feature": feature_names,
-            "coefficient": coef,
+            "model_family": fitted_model.model_family,
+            "model_family_title": fitted_model.model_family_title,
+            "feature_weight_kind": fitted_model.model_weight_kind,
+            "feature_weight": feature_weight,
         }
     )
-    out["abs_coefficient"] = out["coefficient"].abs()
+    out["abs_feature_weight"] = out["feature_weight"].abs()
+    out["coefficient"] = out["feature_weight"]
+    out["abs_coefficient"] = out["abs_feature_weight"]
     return out
 
 
@@ -1041,7 +1492,7 @@ def build_model_selection_key(
     source_val_average_precision: float,
     source_val_balanced_accuracy: float,
     feature_count: int,
-    chosen_c: float,
+    candidate_complexity: float,
 ) -> tuple[float, ...]:
     if objective == "mean_ood_auroc_oracle":
         return (
@@ -1050,7 +1501,7 @@ def build_model_selection_key(
             source_val_auroc if np.isfinite(source_val_auroc) else float("-inf"),
             source_val_average_precision if np.isfinite(source_val_average_precision) else float("-inf"),
             -int(feature_count),
-            -float(chosen_c),
+            -float(candidate_complexity),
         )
     if objective == "source_val_auroc":
         return (
@@ -1058,7 +1509,7 @@ def build_model_selection_key(
             source_val_average_precision if np.isfinite(source_val_average_precision) else float("-inf"),
             source_val_balanced_accuracy if np.isfinite(source_val_balanced_accuracy) else float("-inf"),
             -int(feature_count),
-            -float(chosen_c),
+            -float(candidate_complexity),
         )
     raise ValueError(
         "Unsupported MODEL_SELECTION_OBJECTIVE="
@@ -1161,9 +1612,6 @@ def build_activation_matrix_bundle(
     )
 
 
-attention_lookup = attention_reduction_lookup_df.loc[
-    attention_reduction_lookup_df["feature"].isin(attention_feature_names)
-].copy()
 activation_lookup_by_space: dict[str, pd.DataFrame] = {}
 for feature_space_name, feature_space in FEATURE_SPACES.items():
     if feature_space.activation_variant is None:
@@ -1179,26 +1627,45 @@ for feature_space_name, feature_space in FEATURE_SPACES.items():
 ranking_frames: list[pd.DataFrame] = []
 ranking_pools: dict[tuple[str, str], list[str]] = {}
 ranking_tables_by_key: dict[tuple[str, str], pd.DataFrame] = {}
-attention_pools_by_target: dict[str, list[str]] = {}
+attention_pools_by_target_subset: dict[tuple[str, str], list[str]] = {}
+used_attention_subset_keys = [
+    subset_key
+    for subset_key in ATTENTION_SUBSETS
+    if any(
+        feature_space.uses_attention and feature_space.attention_subset_key == subset_key
+        for feature_space in FEATURE_SPACES.values()
+    )
+]
 
 for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Rank targets", total=len(TARGET_SPECS), disable=DISABLE_TQDM):
-    attention_ranking_df = build_consistency_ranking(
-        attention_envs,
-        feature_names=attention_feature_names,
-        feature_lookup_df=attention_lookup,
-        target_name=target_name,
-    )
-    attention_pool = select_ranked_feature_pool(
-        attention_ranking_df,
-        max_features=int(ATTENTION_TOP_K),
-        per_root_limit=int(PER_ROOT_LIMIT),
-    )
-    attention_pools_by_target[target_name] = attention_pool
+    attention_rankings_by_subset: dict[str, pd.DataFrame] = {}
+    for subset_key in used_attention_subset_keys:
+        subset_lookup_df = attention_lookup_by_subset[subset_key]
+        attention_ranking_df = build_consistency_ranking(
+            attention_envs,
+            feature_names=subset_lookup_df["feature"].astype(str).tolist(),
+            feature_lookup_df=subset_lookup_df,
+            target_name=target_name,
+        )
+        attention_rankings_by_subset[subset_key] = attention_ranking_df
+        attention_pools_by_target_subset[(target_name, subset_key)] = select_ranked_feature_pool(
+            attention_ranking_df,
+            max_features=int(ATTENTION_TOP_K),
+            per_root_limit=int(PER_ROOT_LIMIT),
+        )
 
     for feature_space_name, feature_space in FEATURE_SPACES.items():
+        feature_space_attention_subset_key = str(feature_space.attention_subset_key or "")
+        feature_space_attention_subset_title = (
+            ATTENTION_SUBSETS[str(feature_space.attention_subset_key)].title
+            if feature_space.attention_subset_key is not None
+            else ""
+        )
         if feature_space.uses_attention and feature_space.activation_variant is None:
-            ranking_df = attention_ranking_df.copy()
-            feature_pool = list(attention_pool)
+            if feature_space.attention_subset_key is None:
+                raise ValueError(f"{feature_space_name} uses attention but has no attention subset key.")
+            ranking_df = attention_rankings_by_subset[str(feature_space.attention_subset_key)].copy()
+            feature_pool = list(attention_pools_by_target_subset[(target_name, str(feature_space.attention_subset_key))])
         elif (not feature_space.uses_attention) and feature_space.activation_variant is not None:
             activation_lookup_df = activation_lookup_by_space[feature_space_name].copy()
             ranking_df = make_activation_ranking_df(
@@ -1207,20 +1674,26 @@ for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Rank targets", to
             )
             feature_pool = activation_lookup_df["feature"].astype(str).tolist()
         else:
+            if feature_space.attention_subset_key is None:
+                raise ValueError(f"{feature_space_name} uses attention but has no attention subset key.")
             activation_lookup_df = activation_lookup_by_space[feature_space_name].copy()
-            attention_part = attention_ranking_df.copy()
+            attention_part = attention_rankings_by_subset[str(feature_space.attention_subset_key)].copy()
             activation_part = make_activation_ranking_df(
                 target_name=target_name,
                 feature_lookup_df=activation_lookup_df,
                 start_rank=int(attention_part["global_rank"].max()) + 1,
             )
             ranking_df = pd.concat([attention_part, activation_part], ignore_index=True)
-            feature_pool = list(attention_pool) + activation_lookup_df["feature"].astype(str).tolist()
+            feature_pool = list(attention_pools_by_target_subset[(target_name, str(feature_space.attention_subset_key))]) + activation_lookup_df["feature"].astype(str).tolist()
 
+        ranking_df["feature_space_attention_subset_key"] = feature_space_attention_subset_key
+        ranking_df["feature_space_attention_subset_title"] = feature_space_attention_subset_title
         ranking_tables_by_key[(target_name, feature_space_name)] = ranking_df.copy()
         ranking_pools[(target_name, feature_space_name)] = feature_pool
         ranking_frame = ranking_df.copy()
         ranking_frame["feature_space"] = feature_space_name
+        ranking_frame["feature_space_title"] = feature_space.title
+        ranking_frame["feature_family_group"] = feature_space.family_title
         ranking_frames.append(ranking_frame)
 
 ranking_df_all = pd.concat(ranking_frames, ignore_index=True)
@@ -1230,21 +1703,32 @@ display(ranking_df_all.head(20))
 for (target_name, feature_space_name), feature_pool in ranking_pools.items():
     rank_dir = OUTPUT_ROOT / "rankings" / target_name
     rank_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
+    ranking_meta_df = ranking_tables_by_key[(target_name, feature_space_name)].drop_duplicates(subset=["feature"], keep="first")
+    pool_df = pd.DataFrame(
         {
             "feature": feature_pool,
             "pool_rank": np.arange(1, len(feature_pool) + 1, dtype=int),
         }
-    ).to_csv(rank_dir / f"{feature_space_name}__feature_pool.csv", index=False)
+    )
+    pool_df = pool_df.merge(
+        ranking_meta_df,
+        on="feature",
+        how="left",
+        validate="one_to_one",
+    )
+    pool_df.to_csv(rank_dir / f"{feature_space_name}__feature_pool.csv", index=False)
 
-attention_matrix_cache_by_target: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+attention_matrix_cache_by_target_subset: dict[tuple[str, str], dict[str, dict[str, np.ndarray]]] = {}
 for target_name in maybe_tqdm(
     list(TARGET_SPECS.keys()),
     desc="Cache attention",
     total=len(TARGET_SPECS),
     disable=DISABLE_TQDM,
 ):
-    attention_matrix_cache_by_target[target_name] = build_attention_matrix_cache(attention_pools_by_target[target_name])
+    for subset_key in used_attention_subset_keys:
+        attention_matrix_cache_by_target_subset[(target_name, subset_key)] = build_attention_matrix_cache(
+            attention_pools_by_target_subset[(target_name, subset_key)]
+        )
 
 
 # %%
@@ -1309,13 +1793,25 @@ def persist_core_artifacts(
 try:
     for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Model targets", total=len(TARGET_SPECS), disable=DISABLE_TQDM):
         target_title = str(TARGET_SPECS[target_name]["title"])
-        attention_feature_pool = list(attention_pools_by_target[target_name])
         for feature_space_name, feature_space in maybe_tqdm(
             FEATURE_SPACES.items(),
             desc=f"Model spaces:{target_name}",
             total=len(FEATURE_SPACES),
             disable=DISABLE_TQDM,
         ):
+            feature_space_attention_subset_key = str(feature_space.attention_subset_key or "")
+            feature_space_attention_subset_title = (
+                ATTENTION_SUBSETS[str(feature_space.attention_subset_key)].title
+                if feature_space.attention_subset_key is not None
+                else ""
+            )
+            attention_feature_pool: list[str] = []
+            if feature_space.uses_attention:
+                if feature_space.attention_subset_key is None:
+                    raise ValueError(f"{feature_space_name} uses attention but has no attention subset key.")
+                attention_feature_pool = list(
+                    attention_pools_by_target_subset[(target_name, str(feature_space.attention_subset_key))]
+                )
             ranking_df = ranking_tables_by_key[(target_name, feature_space_name)].copy()
             ranking_meta_df = ranking_df.loc[:, [column for column in ranking_df.columns if column != "feature_space"]].drop_duplicates(
                 subset=["feature"],
@@ -1355,8 +1851,12 @@ try:
                         "y_val": y_val,
                     }
                     if feature_space.uses_attention:
-                        env_entry["train_attention_pool"] = attention_matrix_cache_by_target[target_name][env_name]["train"]
-                        env_entry["val_attention_pool"] = attention_matrix_cache_by_target[target_name][env_name]["val"]
+                        env_entry["train_attention_pool"] = attention_matrix_cache_by_target_subset[
+                            (target_name, str(feature_space.attention_subset_key))
+                        ][env_name]["train"]
+                        env_entry["val_attention_pool"] = attention_matrix_cache_by_target_subset[
+                            (target_name, str(feature_space.attention_subset_key))
+                        ][env_name]["val"]
                     if activation_bundle is not None:
                         env_entry["train_activation_pool"] = activation_bundle.matrices_by_env[env_name]["train"]
                         env_entry["val_activation_pool"] = activation_bundle.matrices_by_env[env_name]["val"]
@@ -1437,7 +1937,12 @@ try:
                             "oracle_std_ood_auroc": finite_std(oracle_aurocs),
                             "oracle_mean_ood_average_precision": finite_mean(oracle_average_precisions),
                         }
-                        oracle_rows.append({"candidate_c": float(fitted_model.chosen_c), **oracle_metrics})
+                        oracle_rows.append(
+                            {
+                                "candidate_key": str(fitted_model.candidate_key),
+                                **oracle_metrics,
+                            }
+                        )
                         candidate_key = build_model_selection_key(
                             objective=MODEL_SELECTION_OBJECTIVE,
                             oracle_mean_ood_auroc=oracle_metrics["oracle_mean_ood_auroc"],
@@ -1446,7 +1951,7 @@ try:
                             source_val_average_precision=float(fitted_model.validation_metrics["average_precision"]),
                             source_val_balanced_accuracy=float(fitted_model.validation_metrics["balanced_accuracy"]),
                             feature_count=len(current_feature_names),
-                            chosen_c=float(fitted_model.chosen_c),
+                            candidate_complexity=float(fitted_model.candidate_complexity),
                         )
                         if best_key is None or candidate_key > best_key:
                             best_key = candidate_key
@@ -1461,7 +1966,7 @@ try:
                     candidate_path = selection_dir / f"{slugify(train_env)}__candidates.csv"
                     candidate_df = candidate_df.merge(
                         pd.DataFrame(oracle_rows),
-                        on="candidate_c",
+                        on="candidate_key",
                         how="left",
                         validate="one_to_one",
                     )
@@ -1469,6 +1974,8 @@ try:
                     candidate_df["feature_space"] = feature_space_name
                     candidate_df["feature_space_title"] = feature_space.title
                     candidate_df["feature_family_group"] = feature_space.family_title
+                    candidate_df["feature_space_attention_subset_key"] = feature_space_attention_subset_key
+                    candidate_df["feature_space_attention_subset_title"] = feature_space_attention_subset_title
                     candidate_df["train_env"] = train_env
                     candidate_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
                     candidate_df["feature_size_label"] = size_label
@@ -1485,7 +1992,12 @@ try:
                     selection_summary_path = selection_dir / f"{slugify(train_env)}__selection_summary.csv"
                     transfer_metrics_path = selection_dir / f"{slugify(train_env)}__transfer_metrics.csv"
 
-                    selected_df = pd.DataFrame({"feature": current_feature_names})
+                    selected_df = pd.DataFrame(
+                        {
+                            "feature": current_feature_names,
+                            "selected_rank": np.arange(1, len(current_feature_names) + 1, dtype=int),
+                        }
+                    )
                     if not selected_df.empty:
                         selected_df = selected_df.merge(
                             ranking_meta_df,
@@ -1497,6 +2009,8 @@ try:
                     selected_df["feature_space"] = feature_space_name
                     selected_df["feature_space_title"] = feature_space.title
                     selected_df["feature_family_group"] = feature_space.family_title
+                    selected_df["feature_space_attention_subset_key"] = feature_space_attention_subset_key
+                    selected_df["feature_space_attention_subset_title"] = feature_space_attention_subset_title
                     selected_df["train_env"] = train_env
                     selected_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
                     selected_df["feature_size_label"] = size_label
@@ -1505,7 +2019,7 @@ try:
                     selected_df["selected_feature_count"] = len(current_feature_names)
                     selected_df.to_csv(selected_path, index=False)
 
-                    coefficient_df = extract_standardized_coefficients(
+                    coefficient_df = extract_feature_weights(
                         best_model,
                         feature_names=current_feature_names,
                         target_name=target_name,
@@ -1514,6 +2028,8 @@ try:
                     )
                     coefficient_df["feature_space_title"] = feature_space.title
                     coefficient_df["feature_family_group"] = feature_space.family_title
+                    coefficient_df["feature_space_attention_subset_key"] = feature_space_attention_subset_key
+                    coefficient_df["feature_space_attention_subset_title"] = feature_space_attention_subset_title
                     coefficient_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
                     coefficient_df["feature_size_label"] = size_label
                     coefficient_df["attention_feature_count"] = int(attention_dim)
@@ -1528,13 +2044,23 @@ try:
                         "feature_space": feature_space_name,
                         "feature_space_title": feature_space.title,
                         "feature_family_group": feature_space.family_title,
+                        "feature_space_attention_subset_key": feature_space_attention_subset_key,
+                        "feature_space_attention_subset_title": feature_space_attention_subset_title,
                         "train_env": train_env,
                         "feature_size": pd.NA if feature_size is None else int(feature_size),
                         "feature_size_label": size_label,
                         "attention_feature_count": int(attention_dim),
                         "activation_feature_count": int(activation_dim),
                         "selected_feature_count": len(current_feature_names),
-                        "chosen_c": float(best_model.chosen_c),
+                        "model_family": best_model.model_family,
+                        "model_family_title": best_model.model_family_title,
+                        "model_weight_kind": best_model.model_weight_kind,
+                        "candidate_key": best_model.candidate_key,
+                        "candidate_label": best_model.candidate_label,
+                        "candidate_complexity": float(best_model.candidate_complexity),
+                        "candidate_params_json": serialize_candidate_params(best_model.candidate_params),
+                        "chosen_c": pd.NA if best_model.chosen_c is None else float(best_model.chosen_c),
+                        "chosen_max_depth": pd.NA if best_model.candidate_max_depth is None else int(best_model.candidate_max_depth),
                         "decision_threshold": float(best_model.decision_threshold),
                         "effective_activation_pca_dim": (
                             pd.NA if activation_bundle is None or activation_bundle.effective_pca_dim is None else int(activation_bundle.effective_pca_dim)
@@ -1576,6 +2102,8 @@ try:
                             "feature_space": feature_space_name,
                             "feature_space_title": feature_space.title,
                             "feature_family_group": feature_space.family_title,
+                            "feature_space_attention_subset_key": feature_space_attention_subset_key,
+                            "feature_space_attention_subset_title": feature_space_attention_subset_title,
                             "train_env": train_env,
                             "test_env": test_env,
                             "eval_role": "val" if train_env == test_env else "ood",
@@ -1584,7 +2112,15 @@ try:
                             "attention_feature_count": int(attention_dim),
                             "activation_feature_count": int(activation_dim),
                             "selected_feature_count": len(current_feature_names),
-                            "chosen_c": float(best_model.chosen_c),
+                            "model_family": best_model.model_family,
+                            "model_family_title": best_model.model_family_title,
+                            "model_weight_kind": best_model.model_weight_kind,
+                            "candidate_key": best_model.candidate_key,
+                            "candidate_label": best_model.candidate_label,
+                            "candidate_complexity": float(best_model.candidate_complexity),
+                            "candidate_params_json": serialize_candidate_params(best_model.candidate_params),
+                            "chosen_c": pd.NA if best_model.chosen_c is None else float(best_model.chosen_c),
+                            "chosen_max_depth": pd.NA if best_model.candidate_max_depth is None else int(best_model.candidate_max_depth),
                             "decision_threshold": float(best_model.decision_threshold),
                             "effective_activation_pca_dim": (
                                 pd.NA if activation_bundle is None or activation_bundle.effective_pca_dim is None else int(activation_bundle.effective_pca_dim)
@@ -2350,7 +2886,8 @@ for target_name in TARGET_SPECS:
         )
 
 print(f"Model selection objective: {MODEL_SELECTION_OBJECTIVE}")
-print(f"Fixed C grid: {C_GRID}")
+print(f"Fixed logistic C: {LOGREG_C:g}")
+print(f"Fixed XGBoost max_depth: {XGB_MAX_DEPTH}")
 print("\nBest feature-space variant by target, feature size, and family:")
 display(family_panel_selection_df)
 print("\nBest train-env model by target, feature size, and family:")
