@@ -1,23 +1,25 @@
 # %% [markdown]
 # # OOD Main3 Consistency Ablation: Precomputed Analysis
 #
-# This notebook reads the saved outputs from
-# `run_ood_modeling_main3_consistency_ablation.py` and builds interpretable plots
+# This notebook-style script reads the saved outputs from
+# `OOD_Modeling_main3_consistency_ablation.py` and builds interpretable plots
 # without rerunning any modeling.
 #
 # It focuses on:
 # - AUROC transfer matrices where the diagonal is source-validation AUROC
 #   and the off-diagonal cells are OOD AUROC
 # - OOD confusion matrices aggregated across off-diagonal train/test pairs
-# - coefficient-based feature-importance views for every saved feature-space run
+# - saved feature-weight views for every `(feature_space, feature_size)` run
 #
-# By default it reads:
-# `OOD_Modeling_main3_consistency_ablation_outputs__deepseek_r1_distill_qwen_7b`
+# By default it prefers output roots like:
+# `OOD_Modeling_main3_consistency_ablation_outputs__deepseek_r1_distill_qwen_7b__logreg`
+# and falls back to the legacy non-model-family root if needed.
 #
 # You can override the output bundle with:
 # `OOD_MAIN3_PRECOMPUTED_OUTPUT_ROOT=/abs/path/to/output_root`
 #
 # Optional knobs:
+# - `OOD_MAIN3_PRECOMPUTED_MODEL_FAMILY=logreg|xgboost`
 # - `OOD_MAIN3_PRECOMPUTED_TOP_FEATURES=15`
 # - `OOD_MAIN3_PRECOMPUTED_EXPORT=1`
 
@@ -25,7 +27,7 @@
 from __future__ import annotations
 
 import os
-import textwrap
+import re
 from pathlib import Path
 from typing import Any
 
@@ -85,8 +87,78 @@ def max_numeric(series: pd.Series) -> float:
     return float(numeric.max()) if not numeric.empty else float("nan")
 
 
+def mean_numeric(series: pd.Series) -> float:
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    return float(numeric.mean()) if not numeric.empty else float("nan")
+
+
+def int_mean(series: pd.Series) -> int:
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    return int(round(float(numeric.mean()))) if not numeric.empty else 0
+
+
 def shorten_label(text: str, width: int = 42) -> str:
     return text if len(text) <= width else f"{text[: width - 3]}..."
+
+
+def slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
+
+
+def normalize_model_family(raw_value: str | None) -> str:
+    value = str(raw_value or "logreg").strip().lower()
+    if value in {"logreg", "logistic", "logistic_regression", "lr"}:
+        return "logreg"
+    if value in {"xgboost", "xgb"}:
+        return "xgboost"
+    return value
+
+
+def format_feature_size_label(feature_size: Any, feature_size_label: Any) -> str:
+    label = "" if pd.isna(feature_size_label) else str(feature_size_label).strip()
+    if label and label.lower() != "nan":
+        return label
+    numeric = pd.to_numeric(pd.Series([feature_size]), errors="coerce").iloc[0]
+    if pd.notna(numeric):
+        return f"k{int(numeric):03d}"
+    return "unspecified"
+
+
+def make_feature_run_key(feature_space: str, feature_size_label: str) -> str:
+    return f"{feature_space}__{feature_size_label}"
+
+
+def make_directory_run_key(feature_space: str, feature_size_label: str) -> str:
+    return f"{feature_space}/{feature_size_label}"
+
+
+def format_feature_run_title(
+    feature_space_title: str,
+    feature_size_label: str,
+    model_family_title: str,
+) -> str:
+    return f"{feature_space_title} [{feature_size_label}; {model_family_title}]"
+
+
+def default_output_root(notebook_root: Path) -> Path:
+    model_slug = "deepseek_r1_distill_qwen_7b"
+    preferred_family = normalize_model_family(
+        os.environ.get(
+            "OOD_MAIN3_PRECOMPUTED_MODEL_FAMILY",
+            os.environ.get(
+                "OOD_MAIN3_COMPANION_MODEL_FAMILY",
+                os.environ.get("OOD_MAIN3_MODEL_FAMILY", "logreg"),
+            ),
+        )
+    )
+    candidates = [
+        notebook_root / f"OOD_Modeling_main3_consistency_ablation_outputs__{model_slug}__{preferred_family}",
+        notebook_root / f"OOD_Modeling_main3_consistency_ablation_outputs__{model_slug}",
+    ]
+    for candidate in candidates:
+        if (candidate / "config.csv").exists():
+            return candidate
+    return candidates[0]
 
 
 def load_or_rebuild_csv(
@@ -111,10 +183,66 @@ def load_or_rebuild_csv(
     return rebuilt_df
 
 
+def ensure_run_columns(df: pd.DataFrame, *, config: dict[str, Any]) -> pd.DataFrame:
+    out = df.copy()
+    if "feature_size" not in out.columns:
+        out["feature_size"] = pd.NA
+    if "feature_size_label" not in out.columns:
+        out["feature_size_label"] = out.get("feature_size", pd.Series([pd.NA] * len(out))).apply(
+            lambda value: format_feature_size_label(value, pd.NA)
+        )
+    else:
+        out["feature_size_label"] = [
+            format_feature_size_label(feature_size, feature_size_label)
+            for feature_size, feature_size_label in zip(
+                out.get("feature_size", pd.Series([pd.NA] * len(out))),
+                out["feature_size_label"],
+                strict=False,
+            )
+        ]
+
+    model_family = str(config.get("model_family", "logreg"))
+    model_family_title = str(config.get("model_family_title", "Logistic regression"))
+    model_weight_kind = str(config.get("model_weight_kind", "coefficient"))
+
+    if "model_family" not in out.columns:
+        out["model_family"] = model_family
+    if "model_family_title" not in out.columns:
+        out["model_family_title"] = model_family_title
+    if "model_weight_kind" not in out.columns:
+        out["model_weight_kind"] = model_weight_kind
+    if "feature_space_attention_subset_key" not in out.columns:
+        out["feature_space_attention_subset_key"] = ""
+    if "feature_space_attention_subset_title" not in out.columns:
+        out["feature_space_attention_subset_title"] = ""
+    if "feature_space_title" not in out.columns and "feature_space" in out.columns:
+        out["feature_space_title"] = out["feature_space"].astype(str)
+    if "feature_family_group" not in out.columns:
+        out["feature_family_group"] = ""
+
+    out["feature_run_key"] = [
+        make_feature_run_key(str(feature_space), str(feature_size_label))
+        for feature_space, feature_size_label in zip(out["feature_space"], out["feature_size_label"], strict=False)
+    ]
+    out["feature_run_title"] = [
+        format_feature_run_title(
+            str(feature_space_title),
+            str(feature_size_label),
+            str(model_family_title_value),
+        )
+        for feature_space_title, feature_size_label, model_family_title_value in zip(
+            out["feature_space_title"],
+            out["feature_size_label"],
+            out["model_family_title"],
+            strict=False,
+        )
+    ]
+    return out
+
+
 NOTEBOOK_ROOT = locate_repo_root(notebook_anchor()) / "deception2" / "Notebooks"
-DEFAULT_OUTPUT_ROOT = NOTEBOOK_ROOT / "OOD_Modeling_main3_consistency_ablation_outputs__deepseek_r1_distill_qwen_7b"
 OUTPUT_ROOT = Path(
-    os.environ.get("OOD_MAIN3_PRECOMPUTED_OUTPUT_ROOT", str(DEFAULT_OUTPUT_ROOT))
+    os.environ.get("OOD_MAIN3_PRECOMPUTED_OUTPUT_ROOT", str(default_output_root(NOTEBOOK_ROOT)))
 ).expanduser().resolve()
 
 CONFIG_PATH = OUTPUT_ROOT / "config.csv"
@@ -181,6 +309,10 @@ all_coefficients_df = load_or_rebuild_csv(
     description="coefficients",
 )
 
+transfer_metrics_df = ensure_run_columns(transfer_metrics_df, config=CONFIG)
+model_selection_df = ensure_run_columns(model_selection_df, config=CONFIG)
+all_coefficients_df = ensure_run_columns(all_coefficients_df, config=CONFIG) if not all_coefficients_df.empty else all_coefficients_df
+
 feature_space_title_lookup = (
     model_selection_df.loc[:, ["feature_space", "feature_space_title"]]
     .drop_duplicates()
@@ -195,18 +327,31 @@ target_title_lookup = (
     .to_dict()
 )
 
-directory_feature_spaces: dict[str, list[str]] = {}
-transfer_feature_spaces: dict[str, list[str]] = {}
+directory_feature_runs: dict[str, list[str]] = {}
+transfer_feature_runs: dict[str, list[str]] = {}
 missing_transfer_directories: dict[str, list[str]] = {}
 
 for target_name in TARGET_SPECS:
     target_dir = OUTPUT_ROOT / "model_selection" / target_name
-    dirs = sorted(path.name for path in target_dir.iterdir() if path.is_dir()) if target_dir.exists() else []
-    present_in_transfer = sorted(
-        transfer_metrics_df.loc[transfer_metrics_df["target_name"].eq(target_name), "feature_space"].dropna().unique().tolist()
+    dirs = (
+        sorted(
+            make_directory_run_key(path.parent.name, path.name)
+            for path in target_dir.glob("*/*")
+            if path.is_dir()
+        )
+        if target_dir.exists()
+        else []
     )
-    directory_feature_spaces[target_name] = dirs
-    transfer_feature_spaces[target_name] = present_in_transfer
+    present_in_transfer = sorted(
+        make_directory_run_key(str(row.feature_space), str(row.feature_size_label))
+        for row in (
+            transfer_metrics_df.loc[transfer_metrics_df["target_name"].eq(target_name), ["feature_space", "feature_size_label"]]
+            .drop_duplicates()
+            .itertuples(index=False)
+        )
+    )
+    directory_feature_runs[target_name] = dirs
+    transfer_feature_runs[target_name] = present_in_transfer
     missing_transfer_directories[target_name] = [name for name in dirs if name not in set(present_in_transfer)]
 
 display(
@@ -214,8 +359,8 @@ display(
         [
             {
                 "target_name": target_name,
-                "directories_found": len(directory_feature_spaces[target_name]),
-                "feature_spaces_with_transfer_rows": len(transfer_feature_spaces[target_name]),
+                "run_directories_found": len(directory_feature_runs[target_name]),
+                "feature_runs_with_transfer_rows": len(transfer_feature_runs[target_name]),
                 "directories_without_transfer_rows": ", ".join(missing_transfer_directories[target_name]) or "",
             }
             for target_name in TARGET_SPECS
@@ -225,47 +370,96 @@ display(
 
 
 # %%
-def save_figure(fig: plt.Figure, *, target_name: str, feature_space: str, suffix: str) -> Path | None:
+def save_figure(fig: plt.Figure, *, target_name: str, feature_run_key: str, suffix: str) -> Path | None:
     if not EXPORT_FIGURES:
         return None
     out_dir = FIGURE_ROOT / target_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{feature_space}__{suffix}.png"
+    out_path = out_dir / f"{slugify(feature_run_key)}__{suffix}.png"
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     return out_path
 
 
 def build_feature_space_overview(metrics_df: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    for (target_name, feature_space), subset in metrics_df.groupby(["target_name", "feature_space"], sort=False):
+    group_cols = [
+        "target_name",
+        "feature_space",
+        "feature_space_title",
+        "feature_family_group",
+        "feature_space_attention_subset_key",
+        "feature_space_attention_subset_title",
+        "feature_size",
+        "feature_size_label",
+        "model_family",
+        "model_family_title",
+        "model_weight_kind",
+    ]
+    for group_values, subset in metrics_df.groupby(group_cols, sort=False, dropna=False):
+        (
+            target_name,
+            feature_space,
+            feature_space_title,
+            feature_family_group,
+            attention_subset_key,
+            attention_subset_title,
+            feature_size,
+            feature_size_label,
+            model_family,
+            model_family_title,
+            model_weight_kind,
+        ) = group_values
         val_subset = subset.loc[subset["eval_role"].eq("val")]
         ood_subset = subset.loc[subset["eval_role"].eq("ood")]
         rows.append(
             {
                 "target_name": target_name,
                 "target_title": first_non_null(subset["target_title"], default=target_title_lookup.get(target_name, target_name)),
+                "target_short_label": "> 0.3" if target_name == "delta_pos_gt_0_3" else "< -0.3",
                 "feature_space": feature_space,
-                "feature_space_title": first_non_null(
-                    subset["feature_space_title"],
-                    default=feature_space_title_lookup.get(feature_space, feature_space),
+                "feature_space_title": feature_space_title,
+                "feature_family_group": feature_family_group,
+                "feature_space_attention_subset_key": attention_subset_key,
+                "feature_space_attention_subset_title": attention_subset_title,
+                "feature_size": feature_size,
+                "feature_size_label": feature_size_label,
+                "model_family": model_family,
+                "model_family_title": model_family_title,
+                "model_weight_kind": model_weight_kind,
+                "feature_run_key": make_feature_run_key(str(feature_space), str(feature_size_label)),
+                "feature_run_title": format_feature_run_title(
+                    str(feature_space_title),
+                    str(feature_size_label),
+                    str(model_family_title),
                 ),
-                "feature_family_group": first_non_null(subset["feature_family_group"]),
-                "selected_feature_count": int(round(float(val_subset["selected_feature_count"].mean()))),
-                "mean_val_accuracy": float(val_subset["accuracy"].mean()),
-                "mean_ood_accuracy": float(ood_subset["accuracy"].mean()),
-                "min_ood_accuracy": float(ood_subset["accuracy"].min()),
-                "mean_val_balanced_accuracy": float(val_subset["balanced_accuracy"].mean()),
-                "mean_ood_balanced_accuracy": float(ood_subset["balanced_accuracy"].mean()),
-                "mean_val_auroc": float(val_subset["auroc"].mean()),
-                "mean_ood_auroc": float(ood_subset["auroc"].mean()),
+                "selected_feature_count": int_mean(val_subset["selected_feature_count"]),
+                "mean_val_accuracy": mean_numeric(val_subset["accuracy"]),
+                "mean_ood_accuracy": mean_numeric(ood_subset["accuracy"]),
+                "min_ood_accuracy": min_numeric(ood_subset["accuracy"]),
+                "mean_val_balanced_accuracy": mean_numeric(val_subset["balanced_accuracy"]),
+                "mean_ood_balanced_accuracy": mean_numeric(ood_subset["balanced_accuracy"]),
+                "mean_val_auroc": mean_numeric(val_subset["auroc"]),
+                "mean_ood_auroc": mean_numeric(ood_subset["auroc"]),
+                "min_ood_auroc": min_numeric(ood_subset["auroc"]),
             }
         )
-    return pd.DataFrame(rows).sort_values(["target_name", "mean_ood_auroc", "mean_val_auroc"], ascending=[True, False, False])
+    return pd.DataFrame(rows).sort_values(
+        ["target_name", "mean_ood_auroc", "mean_val_auroc"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
 
 
-def build_source_env_summary(metrics_df: pd.DataFrame, *, target_name: str, feature_space: str) -> pd.DataFrame:
+def build_source_env_summary(
+    metrics_df: pd.DataFrame,
+    *,
+    target_name: str,
+    feature_space: str,
+    feature_size_label: str,
+) -> pd.DataFrame:
     subset = metrics_df.loc[
-        metrics_df["target_name"].eq(target_name) & metrics_df["feature_space"].eq(feature_space)
+        metrics_df["target_name"].eq(target_name)
+        & metrics_df["feature_space"].eq(feature_space)
+        & metrics_df["feature_size_label"].eq(feature_size_label)
     ].copy()
     val_summary = (
         subset.loc[subset["eval_role"].eq("val"), ["train_env", "accuracy", "balanced_accuracy", "auroc"]]
@@ -298,10 +492,13 @@ def build_transfer_matrix(
     *,
     target_name: str,
     feature_space: str,
+    feature_size_label: str,
     metric: str = "auroc",
 ) -> pd.DataFrame:
     subset = metrics_df.loc[
-        metrics_df["target_name"].eq(target_name) & metrics_df["feature_space"].eq(feature_space)
+        metrics_df["target_name"].eq(target_name)
+        & metrics_df["feature_space"].eq(feature_space)
+        & metrics_df["feature_size_label"].eq(feature_size_label)
     ].copy()
     matrix_df = pd.DataFrame(np.nan, index=ENV_ORDER, columns=ENV_ORDER, dtype=float)
     for row in subset.itertuples(index=False):
@@ -318,10 +515,12 @@ def build_ood_confusion_matrix(
     *,
     target_name: str,
     feature_space: str,
+    feature_size_label: str,
 ) -> pd.DataFrame | None:
     subset = metrics_df.loc[
         metrics_df["target_name"].eq(target_name)
         & metrics_df["feature_space"].eq(feature_space)
+        & metrics_df["feature_size_label"].eq(feature_size_label)
         & metrics_df["eval_role"].eq("ood")
     ]
     if subset.empty:
@@ -342,9 +541,12 @@ def load_feature_importance_data(
     *,
     target_name: str,
     feature_space: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    feature_size_label: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, str, str]:
     subset = model_df.loc[
-        model_df["target_name"].eq(target_name) & model_df["feature_space"].eq(feature_space)
+        model_df["target_name"].eq(target_name)
+        & model_df["feature_space"].eq(feature_space)
+        & model_df["feature_size_label"].eq(feature_size_label)
     ].copy()
     env_categorical = pd.Categorical(subset["train_env"], categories=ENV_ORDER, ordered=True)
     subset = subset.assign(train_env=env_categorical).sort_values("train_env").reset_index(drop=True)
@@ -359,6 +561,9 @@ def load_feature_importance_data(
         "feature_root",
         "family",
         "metric_name",
+        "metric_group",
+        "attention_feature_group",
+        "transition_prefix",
         "head_summary",
         "band",
         "band_stat",
@@ -366,6 +571,12 @@ def load_feature_importance_data(
 
     for row in subset.itertuples(index=False):
         coef_df = pd.read_csv(Path(row.coefficients_path))
+        if "feature_weight" not in coef_df.columns and "coefficient" in coef_df.columns:
+            coef_df["feature_weight"] = coef_df["coefficient"]
+        if "abs_feature_weight" not in coef_df.columns and "abs_coefficient" in coef_df.columns:
+            coef_df["abs_feature_weight"] = coef_df["abs_coefficient"]
+        if "feature_weight_kind" not in coef_df.columns:
+            coef_df["feature_weight_kind"] = str(getattr(row, "model_weight_kind", "coefficient"))
         selected_path = Path(row.selected_features_path)
         if selected_path.exists():
             selected_df = pd.read_csv(selected_path)
@@ -378,23 +589,28 @@ def load_feature_importance_data(
                     validate="one_to_one",
                 )
         coef_df["train_env"] = str(row.train_env)
-        coef_df["feature_space_title"] = str(row.feature_space_title)
+        coef_df["feature_run_title"] = str(row.feature_run_title)
         coef_df["feature_family_group"] = str(row.feature_family_group)
+        coef_df["model_family_title"] = str(row.model_family_title)
         merged_frames.append(coef_df)
 
     if not merged_frames:
-        return pd.DataFrame(), pd.DataFrame()
+        empty = pd.DataFrame()
+        return empty, empty, "coefficient", str(first_non_null(subset["model_family_title"], default="Model"))
 
     long_df = pd.concat(merged_frames, ignore_index=True)
     for col in rank_cols:
         if col != "feature" and col not in long_df.columns:
             long_df[col] = np.nan
+
+    weight_kind = str(first_non_null(long_df["feature_weight_kind"], default="coefficient"))
+    model_family_title = str(first_non_null(long_df["model_family_title"], default="Model"))
     summary_df = (
         long_df.groupby("feature", as_index=False)
         .agg(
-            mean_coefficient=("coefficient", "mean"),
-            mean_abs_coefficient=("abs_coefficient", "mean"),
-            max_abs_coefficient=("abs_coefficient", "max"),
+            mean_weight=("feature_weight", "mean"),
+            mean_abs_weight=("abs_feature_weight", "mean"),
+            max_abs_weight=("abs_feature_weight", "max"),
             selected_in_sources=("train_env", "nunique"),
             global_rank=("global_rank", min_numeric),
             selected_rank=("selected_rank", min_numeric),
@@ -403,11 +619,17 @@ def load_feature_importance_data(
             feature_root=("feature_root", first_non_null),
             family=("family", first_non_null),
             metric_name=("metric_name", first_non_null),
+            metric_group=("metric_group", first_non_null),
+            attention_feature_group=("attention_feature_group", first_non_null),
+            transition_prefix=("transition_prefix", first_non_null),
+            feature_weight_kind=("feature_weight_kind", first_non_null),
         )
-        .sort_values(["mean_abs_coefficient", "global_rank", "selected_rank"], ascending=[False, True, True], na_position="last")
+        .sort_values(["mean_abs_weight", "global_rank", "selected_rank"], ascending=[False, True, True], na_position="last")
         .reset_index(drop=True)
     )
-    return long_df, summary_df
+    summary_df["mean_coefficient"] = summary_df["mean_weight"]
+    summary_df["mean_abs_coefficient"] = summary_df["mean_abs_weight"]
+    return long_df, summary_df, weight_kind, model_family_title
 
 
 def plot_auroc_and_confusion(
@@ -415,8 +637,8 @@ def plot_auroc_and_confusion(
     confusion_df: pd.DataFrame | None,
     *,
     target_name: str,
-    feature_space: str,
-    feature_space_title: str,
+    feature_run_key: str,
+    feature_run_title: str,
 ) -> Path | None:
     fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.8), constrained_layout=True)
 
@@ -471,11 +693,11 @@ def plot_auroc_and_confusion(
 
     target_title = target_title_lookup.get(target_name, TARGET_SPECS[target_name]["title"])
     fig.suptitle(
-        f"{target_title} | {feature_space_title}\n"
+        f"{target_title} | {feature_run_title}\n"
         "Diagonal = source validation AUROC, off-diagonal = OOD AUROC",
         fontsize=13,
     )
-    out_path = save_figure(fig, target_name=target_name, feature_space=feature_space, suffix="auroc_and_confusion")
+    out_path = save_figure(fig, target_name=target_name, feature_run_key=feature_run_key, suffix="auroc_and_confusion")
     if out_path is not None:
         print(f"Saved {out_path}")
     plt.show()
@@ -488,20 +710,23 @@ def plot_feature_importances(
     summary_df: pd.DataFrame,
     *,
     target_name: str,
-    feature_space: str,
-    feature_space_title: str,
+    feature_run_key: str,
+    feature_run_title: str,
+    model_family_title: str,
+    weight_kind: str,
     top_n: int,
 ) -> Path | None:
     if long_df.empty or summary_df.empty:
-        print(f"No coefficient data available for {target_name} / {feature_space}")
+        print(f"No saved feature weights available for {feature_run_key}")
         return None
 
+    uses_signed_weights = weight_kind == "coefficient"
     top_df = summary_df.head(top_n).copy()
     ordered_features = top_df["feature"].tolist()
     bar_df = top_df.iloc[::-1].reset_index(drop=True)
-    coef_matrix = (
-        long_df.loc[long_df["feature"].isin(ordered_features), ["train_env", "feature", "coefficient"]]
-        .pivot_table(index="train_env", columns="feature", values="coefficient", aggfunc="first")
+    weight_matrix = (
+        long_df.loc[long_df["feature"].isin(ordered_features), ["train_env", "feature", "feature_weight"]]
+        .pivot_table(index="train_env", columns="feature", values="feature_weight", aggfunc="first")
         .reindex(index=ENV_ORDER, columns=ordered_features)
     )
 
@@ -518,58 +743,75 @@ def plot_feature_importances(
     }
     colors = [color_lookup.get(str(direction), "#6b7280") for direction in bar_df["sign_direction"]]
     y_positions = np.arange(len(bar_df))
-    ax_bar.barh(y_positions, bar_df["mean_abs_coefficient"], color=colors)
+    ax_bar.barh(y_positions, bar_df["mean_abs_weight"], color=colors)
     ax_bar.set_yticks(y_positions)
     ax_bar.set_yticklabels([shorten_label(value) for value in bar_df["feature"]], fontsize=9)
-    ax_bar.set_xlabel("Mean |coefficient| across source environments")
-    ax_bar.set_title(f"Top {len(bar_df)} features by mean absolute coefficient", fontsize=11)
+    ax_bar.set_xlabel("Mean |coefficient|" if uses_signed_weights else "Mean feature importance")
+    ax_bar.set_title(
+        f"Top {len(bar_df)} features by {'mean absolute coefficient' if uses_signed_weights else 'mean importance'}",
+        fontsize=11,
+    )
     ax_bar.grid(axis="x", alpha=0.25, linewidth=0.6)
     for idx, row in enumerate(bar_df.itertuples(index=False)):
-        rank_text = ""
-        if np.isfinite(row.global_rank):
-            rank_text = f" | rank {int(row.global_rank)}"
+        rank_text = f" | rank {int(row.global_rank)}" if np.isfinite(row.global_rank) else ""
+        value_text = f"{row.mean_weight:+.3f}" if uses_signed_weights else f"{row.mean_weight:.3f}"
         ax_bar.text(
-            float(row.mean_abs_coefficient) + 0.01,
+            float(row.mean_abs_weight) + 0.01,
             idx,
-            f"{row.mean_coefficient:+.3f}{rank_text}",
+            f"{value_text}{rank_text}",
             va="center",
             fontsize=8.5,
         )
 
-    heat_values = coef_matrix.to_numpy(dtype=float)
-    vmax = float(np.nanmax(np.abs(heat_values))) if np.isfinite(heat_values).any() else 1.0
-    heat = ax_heat.imshow(heat_values, cmap="coolwarm", vmin=-max(vmax, 1e-6), vmax=max(vmax, 1e-6), aspect="auto")
+    heat_values = weight_matrix.to_numpy(dtype=float)
+    if uses_signed_weights:
+        vmax = float(np.nanmax(np.abs(heat_values))) if np.isfinite(heat_values).any() else 1.0
+        heat = ax_heat.imshow(
+            heat_values,
+            cmap="coolwarm",
+            vmin=-max(vmax, 1e-6),
+            vmax=max(vmax, 1e-6),
+            aspect="auto",
+        )
+    else:
+        vmax = float(np.nanmax(heat_values)) if np.isfinite(heat_values).any() else 1.0
+        heat = ax_heat.imshow(
+            heat_values,
+            cmap="YlOrRd",
+            vmin=0.0,
+            vmax=max(vmax, 1e-6),
+            aspect="auto",
+        )
     ax_heat.set_xticks(np.arange(len(ordered_features)))
     ax_heat.set_xticklabels([shorten_label(value, width=28) for value in ordered_features], rotation=45, ha="right", fontsize=8)
     ax_heat.set_yticks(np.arange(len(ENV_ORDER)))
     ax_heat.set_yticklabels(ENV_ORDER)
     ax_heat.set_xlabel("Feature")
     ax_heat.set_ylabel("Train environment")
-    ax_heat.set_title("Signed coefficients by source environment", fontsize=11)
-    midpoint = 0.0
-    if coef_matrix.shape[1] <= 15:
-        for row_idx in range(coef_matrix.shape[0]):
-            for col_idx in range(coef_matrix.shape[1]):
-                value = coef_matrix.iat[row_idx, col_idx]
+    ax_heat.set_title("Signed feature weights by source environment" if uses_signed_weights else "Feature importances by source environment", fontsize=11)
+    if weight_matrix.shape[1] <= 15:
+        threshold = 0.55 * max(vmax, 1e-6)
+        for row_idx in range(weight_matrix.shape[0]):
+            for col_idx in range(weight_matrix.shape[1]):
+                value = weight_matrix.iat[row_idx, col_idx]
                 if not np.isfinite(value):
                     continue
-                ax_heat.text(
-                    col_idx,
-                    row_idx,
-                    f"{value:+.2f}",
-                    ha="center",
-                    va="center",
-                    fontsize=7.1,
-                    color="white" if abs(value) > 0.55 * max(vmax, 1e-6) and value != midpoint else "black",
-                )
-    fig.colorbar(heat, ax=ax_heat, fraction=0.046, pad=0.04, label="Coefficient")
+                if uses_signed_weights:
+                    color = "white" if abs(value) > threshold else "black"
+                    label = f"{value:+.2f}"
+                else:
+                    color = "white" if value > threshold else "black"
+                    label = f"{value:.2f}"
+                ax_heat.text(col_idx, row_idx, label, ha="center", va="center", fontsize=7.1, color=color)
+    fig.colorbar(heat, ax=ax_heat, fraction=0.046, pad=0.04, label="Coefficient" if uses_signed_weights else "Importance")
 
     target_title = target_title_lookup.get(target_name, TARGET_SPECS[target_name]["title"])
+    importance_title = "Coefficient-based feature importance" if uses_signed_weights else f"{model_family_title} feature importance"
     fig.suptitle(
-        f"{target_title} | {feature_space_title}\nCoefficient-based feature importance",
+        f"{target_title} | {feature_run_title}\n{importance_title}",
         fontsize=13,
     )
-    out_path = save_figure(fig, target_name=target_name, feature_space=feature_space, suffix="feature_importance")
+    out_path = save_figure(fig, target_name=target_name, feature_run_key=feature_run_key, suffix="feature_importance")
     if out_path is not None:
         print(f"Saved {out_path}")
     plt.show()
@@ -578,30 +820,60 @@ def plot_feature_importances(
 
 
 overview_df = build_feature_space_overview(transfer_metrics_df)
+ood_auroc_summary_table_df = (
+    overview_df.loc[:, [
+        "feature_run_title",
+        "feature_run_key",
+        "target_short_label",
+        "mean_ood_auroc",
+        "min_ood_auroc",
+    ]]
+    .rename(
+        columns={
+            "feature_run_title": "feature_run",
+            "feature_run_key": "feature_run_key",
+            "target_short_label": "target",
+        }
+    )
+    .sort_values(["target", "mean_ood_auroc", "min_ood_auroc"], ascending=[True, False, False])
+    .reset_index(drop=True)
+)
+
+
+# %% [markdown]
+# ## OOD AUROC Summary
+#
+# Compact table across saved feature runs and targets.
+
+# %%
+display(ood_auroc_summary_table_df)
 
 
 # %% [markdown]
 # ## Overview Tables
 #
 # The tables below summarize the saved transfer metrics for each target and
-# feature-space variant. If a directory exists under `model_selection/<target>`
-# but does not have rows in `all_transfer_metrics.csv`, it is listed as
-# "without transfer rows" and is skipped for the matrix/confusion plots.
+# saved `(feature_space, feature_size)` run. If a directory exists under
+# `model_selection/<target>/<feature_space>/<size_label>` but does not have rows
+# in `all_transfer_metrics.csv`, it is listed as "without transfer rows" and is
+# skipped for the matrix/confusion plots.
 
 # %%
 for target_name in TARGET_SPECS:
     md(f"### {target_title_lookup.get(target_name, TARGET_SPECS[target_name]['title'])}")
     display(
         overview_df.loc[overview_df["target_name"].eq(target_name), [
-            "feature_space",
-            "feature_space_title",
+            "feature_run_key",
+            "feature_run_title",
             "feature_family_group",
+            "feature_space_attention_subset_title",
             "selected_feature_count",
             "mean_val_accuracy",
             "mean_ood_accuracy",
             "min_ood_accuracy",
             "mean_ood_balanced_accuracy",
             "mean_ood_auroc",
+            "min_ood_auroc",
         ]].reset_index(drop=True)
     )
     missing_dirs = missing_transfer_directories.get(target_name, [])
@@ -613,13 +885,12 @@ for target_name in TARGET_SPECS:
 
 
 # %% [markdown]
-# ## Per-Feature-Space Reports
+# ## Per-Run Reports
 #
-# For every target and saved feature-space run with transfer rows, the notebook
-# shows:
+# For every target and saved feature run with transfer rows, the notebook shows:
 # - a transfer AUROC matrix
 # - a summed OOD confusion matrix
-# - coefficient-based feature-importance plots
+# - saved feature-weight plots
 # - the corresponding top-feature summary table
 
 # %%
@@ -627,55 +898,70 @@ for target_name in TARGET_SPECS:
     target_title = target_title_lookup.get(target_name, TARGET_SPECS[target_name]["title"])
     md(f"# {target_title}")
 
-    for feature_space in transfer_feature_spaces[target_name]:
-        feature_space_title = feature_space_title_lookup.get(feature_space, feature_space)
-        md(f"## {feature_space_title}  \n`{feature_space}`")
+    target_runs_df = overview_df.loc[overview_df["target_name"].eq(target_name)].copy()
+    target_runs_df = target_runs_df.sort_values(["mean_ood_auroc", "mean_val_auroc"], ascending=[False, False]).reset_index(drop=True)
+
+    for row in target_runs_df.itertuples(index=False):
+        md(f"## {row.feature_run_title}  \n`{row.feature_run_key}`")
 
         display(
             overview_df.loc[
-                overview_df["target_name"].eq(target_name) & overview_df["feature_space"].eq(feature_space)
+                overview_df["target_name"].eq(target_name)
+                & overview_df["feature_run_key"].eq(row.feature_run_key)
             ].reset_index(drop=True)
         )
-        display(build_source_env_summary(transfer_metrics_df, target_name=target_name, feature_space=feature_space))
+        display(
+            build_source_env_summary(
+                transfer_metrics_df,
+                target_name=target_name,
+                feature_space=str(row.feature_space),
+                feature_size_label=str(row.feature_size_label),
+            )
+        )
 
         auroc_matrix_df = build_transfer_matrix(
             transfer_metrics_df,
             target_name=target_name,
-            feature_space=feature_space,
+            feature_space=str(row.feature_space),
+            feature_size_label=str(row.feature_size_label),
             metric="auroc",
         )
         ood_confusion_df = build_ood_confusion_matrix(
             transfer_metrics_df,
             target_name=target_name,
-            feature_space=feature_space,
+            feature_space=str(row.feature_space),
+            feature_size_label=str(row.feature_size_label),
         )
         plot_auroc_and_confusion(
             auroc_matrix_df,
             ood_confusion_df,
             target_name=target_name,
-            feature_space=feature_space,
-            feature_space_title=feature_space_title,
+            feature_run_key=str(row.feature_run_key),
+            feature_run_title=str(row.feature_run_title),
         )
 
-        feature_long_df, feature_summary_df = load_feature_importance_data(
+        feature_long_df, feature_summary_df, weight_kind, model_family_title = load_feature_importance_data(
             model_selection_df,
             target_name=target_name,
-            feature_space=feature_space,
+            feature_space=str(row.feature_space),
+            feature_size_label=str(row.feature_size_label),
         )
         plot_feature_importances(
             feature_long_df,
             feature_summary_df,
             target_name=target_name,
-            feature_space=feature_space,
-            feature_space_title=feature_space_title,
+            feature_run_key=str(row.feature_run_key),
+            feature_run_title=str(row.feature_run_title),
+            model_family_title=model_family_title,
+            weight_kind=weight_kind,
             top_n=TOP_N_FEATURES,
         )
 
         display(
             feature_summary_df.loc[:, [
                 "feature",
-                "mean_coefficient",
-                "mean_abs_coefficient",
+                "mean_weight",
+                "mean_abs_weight",
                 "selected_in_sources",
                 "global_rank",
                 "selected_rank",
@@ -684,6 +970,8 @@ for target_name in TARGET_SPECS:
                 "feature_root",
                 "family",
                 "metric_name",
+                "metric_group",
+                "attention_feature_group",
             ]].head(TOP_N_FEATURES).reset_index(drop=True)
         )
 
