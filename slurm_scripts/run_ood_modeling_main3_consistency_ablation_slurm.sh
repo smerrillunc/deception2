@@ -3,8 +3,8 @@
 #SBATCH --output=ood_main3_%j.out
 #SBATCH --error=ood_main3_%j.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=128g
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64g
 #SBATCH --time=1-12:00:00
 
 set -euo pipefail
@@ -182,11 +182,11 @@ if [[ "$TRAIN_MODEL_FAMILY" == "xgboost" ]]; then
 fi
 
 DATASET_ROOT="${DATASET_ROOT:-$PROJECT_ROOT/DatasetMain}"
-RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/Results/OOD_Modeling_main3_consistency}"
+RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/Results/OOD_Modeling_main3_consistency_FINAL}"
 RUN_TAG="${RUN_TAG:-baseline}"
 RUN_NAME="${RUN_NAME:-${MODEL_KEY}__${TRAIN_MODEL_KEY}__${RUN_TAG}}"
 
-FEATURE_SIZES="${FEATURE_SIZES:-32,64,128,256}"
+FEATURE_SIZES="${FEATURE_SIZES:-128}"
 ATTENTION_TOP_K="${ATTENTION_TOP_K:-}"
 LOGREG_C="${LOGREG_C:-}"
 if [[ -z "$LOGREG_C" && -n "${C_GRID:-}" ]]; then
