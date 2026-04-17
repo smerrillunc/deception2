@@ -3,9 +3,11 @@ from __future__ import annotations
 import math
 import os
 import re
+import textwrap
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -16,6 +18,7 @@ DEFAULT_OUTPUT_BUNDLE_GLOB = "OOD_Modeling_main3_consistency_ablation_outputs__*
 
 ENV_ORDER = ["AdvisorAudit", "BS", "CarSales", "Gridworld", "Interview"]
 TARGET_ORDER = ["delta_pos_gt_0_3", "delta_neg_lt_neg_0_3", "delta_abs_gt_0_3"]
+MAIN_PAPER_TARGET_ORDER = ["delta_pos_gt_0_3", "delta_neg_lt_neg_0_3"]
 MODEL_ORDER = ["GPT-OSS-20B", "Llama-8B", "Qwen-7B", "Qwen-14B"]
 
 TARGET_TITLE_OVERRIDES = {
@@ -53,6 +56,9 @@ ATTENTION_SUBSET_FEATURE_ORDER = [
 ]
 
 FEATURE_SET_ALIASES = {
+    "baseline_raw_final": "Baseline (Activation only: raw)",
+    "baseline: raw final": "Baseline (Activation only: raw)",
+    "baseline (activation only: raw)": "Baseline (Activation only: raw)",
     "activation_raw": "Baseline (Activation only: raw)",
     "activation raw": "Baseline (Activation only: raw)",
     "activation: raw": "Baseline (Activation only: raw)",
@@ -426,6 +432,15 @@ def target_rows(summary_df: pd.DataFrame, metrics_df: pd.DataFrame) -> list[tupl
     return rows
 
 
+def main_paper_target_rows(summary_df: pd.DataFrame, metrics_df: pd.DataFrame) -> list[tuple[str, str]]:
+    target_lookup = {target_name: target_title for target_name, target_title in target_rows(summary_df, metrics_df)}
+    rows: list[tuple[str, str]] = []
+    for target_name in MAIN_PAPER_TARGET_ORDER:
+        if target_name in target_lookup:
+            rows.append((target_name, target_lookup[target_name]))
+    return rows
+
+
 def build_feature_summary_table(
     summary_df: pd.DataFrame,
     metrics_df: pd.DataFrame,
@@ -533,6 +548,387 @@ def build_environment_summary_table(
     return pd.DataFrame(rows)
 
 
+def _format_auroc_with_se(value: Any, se_value: Any) -> str:
+    mean_numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(mean_numeric):
+        return ""
+    se_numeric = pd.to_numeric(pd.Series([se_value]), errors="coerce").iloc[0]
+    if pd.isna(se_numeric):
+        return f"{float(mean_numeric):.3f}"
+    return f"{float(mean_numeric):.3f} +/- {float(se_numeric):.3f}"
+
+
+def build_main_paper_ood_matrix(
+    summary_df: pd.DataFrame,
+    metrics_df: pd.DataFrame,
+    *,
+    target_name: str,
+    feature_order: list[str] | None = None,
+) -> pd.DataFrame:
+    feature_order = CORE_FEATURE_ORDER if feature_order is None else feature_order
+    source_df = build_feature_summary_table(
+        summary_df,
+        metrics_df,
+        target_name=target_name,
+        feature_order=feature_order,
+    )
+    if source_df.empty:
+        return pd.DataFrame(columns=["Model", *feature_order])
+
+    models = [model_name for model_name in MODEL_ORDER if model_name in set(source_df["Model"].astype(str))]
+    extra_models = sorted(
+        [model_name for model_name in source_df["Model"].dropna().astype(str).unique().tolist() if model_name not in models],
+        key=_model_sort_key,
+    )
+    ordered_models = [*models, *extra_models]
+
+    rows: list[dict[str, str]] = []
+    for model_name in ordered_models:
+        row: dict[str, str] = {"Model": model_name}
+        model_slice = source_df.loc[source_df["Model"].eq(model_name)].copy()
+        for feature_set in feature_order:
+            feature_slice = model_slice.loc[model_slice["Feature Set"].eq(feature_set)]
+            if feature_slice.empty:
+                row[feature_set] = ""
+                continue
+            first_row = feature_slice.iloc[0]
+            row[feature_set] = _format_auroc_with_se(
+                first_row.get("Mean OOD AUROC"),
+                first_row.get("Mean OOD AUROC SE"),
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def resolve_feature_set_choice(
+    requested_feature_set: str,
+    *,
+    feature_order: list[str],
+) -> str:
+    resolved_feature_set = canonical_feature_set(requested_feature_set, requested_feature_set)
+    if resolved_feature_set in feature_order:
+        return resolved_feature_set
+
+    clean_requested = _clean_key(requested_feature_set)
+    for feature_set in feature_order:
+        if _clean_key(feature_set) == clean_requested:
+            return feature_set
+
+    raise ValueError(
+        "Unknown feature set for main-paper heatmaps: "
+        f"{requested_feature_set!r}. "
+        f"Choose one of: {', '.join(feature_order)}"
+    )
+
+
+def select_main_paper_heatmap_feature_sets(
+    summary_df: pd.DataFrame,
+    metrics_df: pd.DataFrame,
+    *,
+    target_name: str,
+    feature_order: list[str] | None = None,
+    requested_feature_set: str | None = None,
+) -> pd.DataFrame:
+    feature_order = CORE_FEATURE_ORDER if feature_order is None else feature_order
+    source_df = build_feature_summary_table(
+        summary_df,
+        metrics_df,
+        target_name=target_name,
+        feature_order=feature_order,
+    )
+    if source_df.empty:
+        return pd.DataFrame(columns=["Model", "Feature Set", "Mean OOD AUROC", "Mean OOD AUROC SE"])
+
+    if requested_feature_set is not None:
+        resolved_feature_set = resolve_feature_set_choice(
+            requested_feature_set,
+            feature_order=feature_order,
+        )
+        selected_df = (
+            source_df.loc[source_df["Feature Set"].eq(resolved_feature_set)]
+            .reset_index(drop=True)
+        )
+        return selected_df.loc[:, ["Model", "Feature Set", "Mean OOD AUROC", "Mean OOD AUROC SE"]]
+
+    feature_rank = {feature_name: idx for idx, feature_name in enumerate(feature_order)}
+    ranked_df = source_df.copy()
+    ranked_df["_model_sort"] = pd.Categorical(
+        ranked_df["Model"],
+        categories=MODEL_ORDER,
+        ordered=True,
+    )
+    ranked_df["_feature_rank"] = [
+        feature_rank.get(str(feature_set), len(feature_rank))
+        for feature_set in ranked_df["Feature Set"]
+    ]
+    ranked_df = ranked_df.sort_values(
+        ["_model_sort", "Model", "Mean OOD AUROC", "_feature_rank", "Feature Set"],
+        ascending=[True, True, False, True, True],
+        na_position="last",
+        kind="mergesort",
+    )
+    selected_df = (
+        ranked_df.drop_duplicates(subset=["Model"], keep="first")
+        .drop(columns=["_model_sort", "_feature_rank"])
+        .reset_index(drop=True)
+    )
+    return selected_df.loc[:, ["Model", "Feature Set", "Mean OOD AUROC", "Mean OOD AUROC SE"]]
+
+
+def build_model_train_eval_auroc_matrices(
+    metrics_df: pd.DataFrame,
+    *,
+    target_name: str,
+    model_name: str,
+    feature_set: str,
+    env_order: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    env_order = ENV_ORDER if env_order is None else env_order
+    mean_df = pd.DataFrame(np.nan, index=env_order, columns=env_order, dtype=float)
+    se_df = pd.DataFrame(np.nan, index=env_order, columns=env_order, dtype=float)
+
+    if metrics_df.empty:
+        return mean_df, se_df
+
+    subset = metrics_df.loc[
+        metrics_df["target_name"].eq(target_name)
+        & metrics_df["Model"].eq(model_name)
+        & metrics_df["feature_set"].eq(feature_set)
+    ].copy()
+    if subset.empty:
+        return mean_df, se_df
+
+    for train_env in env_order:
+        val_slice = subset.loc[
+            subset["eval_role"].eq("val")
+            & subset["train_env"].eq(train_env)
+        ]
+        if not val_slice.empty:
+            val_mean, val_se = _bundle_mean_and_se(val_slice, "auroc")
+            mean_df.loc[train_env, train_env] = val_mean
+            se_df.loc[train_env, train_env] = val_se
+
+        for eval_env in env_order:
+            if train_env == eval_env:
+                continue
+            ood_slice = subset.loc[
+                subset["eval_role"].eq("ood")
+                & subset["train_env"].eq(train_env)
+                & subset["test_env"].eq(eval_env)
+            ]
+            if ood_slice.empty:
+                continue
+            ood_mean, ood_se = _bundle_mean_and_se(ood_slice, "auroc")
+            mean_df.loc[train_env, eval_env] = ood_mean
+            se_df.loc[train_env, eval_env] = ood_se
+
+    return mean_df, se_df
+
+
+def _paper_heatmap_limits(mean_matrices: list[pd.DataFrame]) -> tuple[float, float]:
+    finite_values = np.asarray(
+        np.concatenate([matrix.to_numpy(dtype=float).ravel() for matrix in mean_matrices]),
+        dtype=float,
+    )
+    finite_values = finite_values[np.isfinite(finite_values)]
+    if finite_values.size == 0:
+        return 0.0, 1.0
+
+    vmin = max(0.0, float(finite_values.min()) - 0.02)
+    vmax = min(1.0, float(finite_values.max()) + 0.02)
+    if vmax - vmin < 0.08:
+        midpoint = (vmin + vmax) / 2.0
+        vmin = max(0.0, midpoint - 0.04)
+        vmax = min(1.0, midpoint + 0.04)
+    return vmin, vmax
+
+
+def _format_heatmap_annotation(mean_value: Any, se_value: Any) -> str:
+    mean_numeric = pd.to_numeric(pd.Series([mean_value]), errors="coerce").iloc[0]
+    if pd.isna(mean_numeric):
+        return "NA"
+    se_numeric = pd.to_numeric(pd.Series([se_value]), errors="coerce").iloc[0]
+    if pd.isna(se_numeric):
+        return f"{float(mean_numeric):.3f}"
+    return f"{float(mean_numeric):.3f}\n+/- {float(se_numeric):.3f}"
+
+
+def _annotation_color(cmap: Any, *, value: float, vmin: float, vmax: float) -> str:
+    if not math.isfinite(value):
+        return "#555555"
+    if vmax <= vmin:
+        return "black"
+    normalized = (float(value) - vmin) / (vmax - vmin)
+    normalized = min(max(normalized, 0.0), 1.0)
+    r, g, b, _ = cmap(normalized)
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return "black" if luminance > 0.58 else "white"
+
+
+def _wrap_panel_title(text: str, *, width: int = 26) -> str:
+    return textwrap.fill(str(text), width=width, break_long_words=False)
+
+
+def plot_main_paper_model_heatmaps(
+    summary_df: pd.DataFrame,
+    metrics_df: pd.DataFrame,
+    *,
+    target_name: str,
+    target_title: str,
+    feature_order: list[str] | None = None,
+    shared_feature_set: str | None = None,
+    env_order: list[str] | None = None,
+    nrows: int = 2,
+    ncols: int = 2,
+) -> tuple[plt.Figure, pd.DataFrame]:
+    feature_order = CORE_FEATURE_ORDER if feature_order is None else feature_order
+    env_order = ENV_ORDER if env_order is None else env_order
+    selected_df = select_main_paper_heatmap_feature_sets(
+        summary_df,
+        metrics_df,
+        target_name=target_name,
+        feature_order=feature_order,
+        requested_feature_set=shared_feature_set,
+    )
+    if selected_df.empty:
+        fig, ax = plt.subplots(figsize=(7.0, 4.0))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No heatmap data available.", ha="center", va="center", fontsize=12)
+        return fig, selected_df
+
+    resolved_shared_feature_set = None
+    if shared_feature_set is not None:
+        resolved_shared_feature_set = resolve_feature_set_choice(
+            shared_feature_set,
+            feature_order=feature_order,
+        )
+
+    panel_count = int(nrows) * int(ncols)
+    ordered_models = selected_df["Model"].dropna().astype(str).tolist()
+    if len(ordered_models) > panel_count:
+        raise ValueError(
+            f"Requested a {nrows}x{ncols} heatmap grid for {len(ordered_models)} models. "
+            "Increase `nrows` or `ncols`."
+        )
+
+    matrix_lookup: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    mean_matrices: list[pd.DataFrame] = []
+    for _, row in selected_df.iterrows():
+        mean_df, se_df = build_model_train_eval_auroc_matrices(
+            metrics_df,
+            target_name=target_name,
+            model_name=str(row["Model"]),
+            feature_set=str(row["Feature Set"]),
+            env_order=env_order,
+        )
+        matrix_lookup[str(row["Model"])] = (mean_df, se_df)
+        mean_matrices.append(mean_df)
+
+    vmin, vmax = _paper_heatmap_limits(mean_matrices)
+    cmap = plt.cm.YlGnBu.copy()
+    cmap.set_bad(color="#f3f4f6")
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(13.8, 10.6),
+        constrained_layout=True,
+    )
+    axes = np.asarray(axes).reshape(nrows, ncols)
+    image = None
+
+    for idx, ax in enumerate(axes.flat):
+        panel_label = chr(ord("A") + idx)
+        ax.text(
+            -0.16,
+            1.08,
+            panel_label,
+            transform=ax.transAxes,
+            fontsize=14,
+            fontweight="bold",
+            va="bottom",
+        )
+
+        if idx >= len(selected_df):
+            ax.set_facecolor("#fafafa")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_linestyle((0, (3, 3)))
+                spine.set_linewidth(1.0)
+                spine.set_edgecolor("#9ca3af")
+            ax.text(
+                0.5,
+                0.5,
+                "Reserved for\nfuture model",
+                ha="center",
+                va="center",
+                fontsize=12,
+                color="#6b7280",
+            )
+            continue
+
+        row = selected_df.iloc[idx]
+        model_name = str(row["Model"])
+        feature_set = str(row["Feature Set"])
+        mean_df, se_df = matrix_lookup[model_name]
+        matrix = np.ma.masked_invalid(mean_df.to_numpy(dtype=float))
+        image = ax.imshow(matrix, cmap=cmap, vmin=vmin, vmax=vmax, aspect="equal")
+        ax.set_facecolor("#f8fafc")
+        ax.set_xticks(np.arange(len(env_order)))
+        ax.set_xticklabels(env_order, rotation=35, ha="right", fontsize=9)
+        ax.set_yticks(np.arange(len(env_order)))
+        ax.set_yticklabels(env_order, fontsize=9)
+        ax.tick_params(length=0)
+        ax.set_xticks(np.arange(-0.5, len(env_order), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(env_order), 1), minor=True)
+        ax.grid(which="minor", color="white", linestyle="-", linewidth=1.3)
+        ax.tick_params(which="minor", bottom=False, left=False)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        if resolved_shared_feature_set is None:
+            panel_title = f"{model_name}\n{_wrap_panel_title(feature_set)}"
+        else:
+            panel_title = model_name
+        ax.set_title(panel_title, fontsize=11.5, fontweight="bold", pad=10)
+
+        for row_idx in range(mean_df.shape[0]):
+            for col_idx in range(mean_df.shape[1]):
+                mean_value = mean_df.iat[row_idx, col_idx]
+                se_value = se_df.iat[row_idx, col_idx]
+                ax.text(
+                    col_idx,
+                    row_idx,
+                    _format_heatmap_annotation(mean_value, se_value),
+                    ha="center",
+                    va="center",
+                    fontsize=8.0,
+                    color=_annotation_color(cmap, value=float(mean_value), vmin=vmin, vmax=vmax),
+                    linespacing=1.15,
+                )
+
+    title_lines = [target_title]
+    if resolved_shared_feature_set is not None:
+        title_lines.append(f"Feature set: {resolved_shared_feature_set}")
+    #title_lines.append("Diagonal = validation AUROC; off-diagonal = OOD AUROC")
+    fig.suptitle("\n".join(title_lines), fontsize=16, fontweight="bold")
+    fig.supxlabel("Evaluation Environment", fontsize=13)
+    fig.supylabel("Training Environment", fontsize=13)
+
+    if image is not None:
+        fig.colorbar(
+            image,
+            ax=axes.ravel().tolist(),
+            fraction=0.03,
+            pad=0.02,
+            shrink=0.92,
+            label="AUROC",
+        )
+
+    return fig, selected_df
+
+
 def style_metric_table(df: pd.DataFrame):
     if df.empty:
         return df
@@ -542,6 +938,12 @@ def style_metric_table(df: pd.DataFrame):
         if "AUROC" in column
     }
     return df.style.hide(axis="index").format(format_map)
+
+
+def style_text_table(df: pd.DataFrame):
+    if df.empty:
+        return df
+    return df.style.hide(axis="index")
 
 
 def missing_feature_sets(table_df: pd.DataFrame) -> dict[str, list[str]]:
