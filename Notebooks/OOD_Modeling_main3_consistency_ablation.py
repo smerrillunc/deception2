@@ -2,14 +2,14 @@
 # %% [markdown]
 # # OOD Modeling Main 3: Fast Cross-Environment Consistency + Activation Baselines
 #
-# This notebook-style script keeps the `train on one environment / test on all`
-# evaluation pattern, but makes the activation baselines use the raw `.h5`
-# sentence-end activations instead of the scalar parquet activation summaries.
+# This notebook-style script supports two evaluation scenarios:
+# - train on 1 environment and evaluate OOD on the other 4
+# - train on 4 environments and evaluate OOD on the held-out environment
 #
 # Main choices in this version:
 # - only predict `delta > 0.3` and `delta < -0.3`
-# - rank attention features globally by cross-environment consistency and keep the top 256
-# - sweep feature sizes `[32, 64, 128, 256]`
+# - reduce attention features by layer-band aggregation, then keep all features with `same_sign_all=True`
+# - sweep feature sizes `[32, 64, 128, 256]` only for PCA-based activation dimensions
 # - support either logistic regression or XGBoost as the modeling family with fixed defaults
 # - include all-attention plus grounding/concentration and transition-only attention ablations
 # - activation baselines use `.h5` final-layer sentence activations:
@@ -17,9 +17,9 @@
 #   2. PCA-k of z-standardized final-sentence activations
 #   3. PCA-k of z-standardized (final - previous) activations
 #   4. PCA-k of z-standardized (final - mean(previous up to 4)) activations
-# - attention + activation uses k ranked attention features plus k PCA dimensions
+# - attention + activation uses all same-sign attention features plus k PCA dimensions
 # - report explicit selected-feature tables and coefficient tables for every trained model
-# - summarize confusion matrices in raw prediction counts with target-aware labels
+# - save source-validation and OOD transfer metrics, confusion summaries, and panel exports
 
 # %%
 from __future__ import annotations
@@ -143,6 +143,13 @@ def env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(int(part) for part in parts)
 
 
+def env_str_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return tuple(str(value) for value in default)
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def _first_csv_item(raw: str) -> str:
     parts = [part.strip() for part in str(raw).split(",") if part.strip()]
     if not parts:
@@ -184,6 +191,26 @@ def normalize_model_family(raw_value: str | None) -> str:
     )
 
 
+def normalize_scenario_key(raw_value: str | None) -> str:
+    value = slugify(str(raw_value or "single_source_ood"))
+    aliases = {
+        "single_source_ood": "single_source_ood",
+        "train_one_eval_all": "single_source_ood",
+        "single_env_ood": "single_source_ood",
+        "one_to_all": "single_source_ood",
+        "holdout_env_ood": "holdout_env_ood",
+        "train_four_holdout_one": "holdout_env_ood",
+        "leave_one_env_out": "holdout_env_ood",
+        "four_to_one": "holdout_env_ood",
+    }
+    if value not in aliases:
+        raise ValueError(
+            f"Unsupported scenario key {raw_value!r}. "
+            "Expected one of ['single_source_ood', 'holdout_env_ood']."
+        )
+    return aliases[value]
+
+
 # %%
 DATASET_ROOT = Path(
     os.environ.get(
@@ -214,6 +241,10 @@ VAL_SIZE = env_float("OOD_MAIN3_COMPANION_VAL_SIZE", env_float("OOD_MAIN3_VAL_SI
 DELTA_THRESHOLD = env_float("OOD_MAIN3_COMPANION_DELTA_THRESHOLD", env_float("OOD_MAIN3_DELTA_THRESHOLD", 0.30))
 FEATURE_SIZE_GRID = env_int_tuple("OOD_MAIN3_COMPANION_FEATURE_SIZES", (32, 64, 128, 256))
 ATTENTION_TOP_K = env_int("OOD_MAIN3_COMPANION_ATTENTION_TOP_K", max(FEATURE_SIZE_GRID))
+SCENARIO_KEYS = tuple(
+    normalize_scenario_key(raw_key)
+    for raw_key in env_str_tuple("OOD_MAIN3_COMPANION_SCENARIOS", ("single_source_ood",))
+)
 MODEL_FAMILY = normalize_model_family(
     os.environ.get(
         "OOD_MAIN3_COMPANION_MODEL_FAMILY",
@@ -259,6 +290,18 @@ FORCE_REBUILD_REDUCTIONS = os.environ.get("OOD_MAIN3_COMPANION_FORCE_REBUILD", "
 DISABLE_TQDM = os.environ.get("OOD_MAIN3_COMPANION_DISABLE_TQDM", "0") == "1"
 TOP_FEATURES_TO_SHOW = env_int("OOD_MAIN3_COMPANION_TOP_FEATURES_TO_SHOW", 20)
 
+SCENARIO_TITLES = OrderedDict(
+    [
+        ("single_source_ood", "Train on 1 environment; evaluate OOD on the other 4"),
+        ("holdout_env_ood", "Train on 4 environments; evaluate OOD on the held-out environment"),
+    ]
+)
+unknown_scenarios = sorted(set(SCENARIO_KEYS) - set(SCENARIO_TITLES))
+if unknown_scenarios:
+    raise ValueError(f"Unsupported scenarios requested: {', '.join(unknown_scenarios)}")
+SELECTED_SCENARIO_TITLES = OrderedDict((scenario_key, SCENARIO_TITLES[scenario_key]) for scenario_key in SCENARIO_KEYS)
+SCENARIO_SLUG = "__".join(slugify(scenario_key) for scenario_key in SCENARIO_KEYS)
+
 if MODEL_FAMILY == "xgboost" and XGBClassifier is None:
     raise ImportError("xgboost is not installed, but MODEL_FAMILY='xgboost' was requested.")
 
@@ -267,7 +310,7 @@ OUTPUT_ROOT = Path(
         "OOD_MAIN3_COMPANION_OUTPUT_ROOT",
         str(
             NOTEBOOK_ROOT
-            / f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(MODEL_DIRNAME)}__{slugify(MODEL_FAMILY)}"
+            / f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(MODEL_DIRNAME)}__{slugify(MODEL_FAMILY)}__{SCENARIO_SLUG}"
         ),
     )
 )
@@ -318,12 +361,14 @@ config_df = pd.DataFrame(
         {"setting": "dataset_root", "value": str(DATASET_ROOT)},
         {"setting": "output_root", "value": str(OUTPUT_ROOT)},
         {"setting": "env_order", "value": ", ".join(ENV_ORDER)},
+        {"setting": "scenario_keys", "value": ", ".join(SCENARIO_KEYS)},
         {"setting": "val_size", "value": VAL_SIZE},
         {"setting": "delta_threshold", "value": DELTA_THRESHOLD},
         {"setting": "model_family", "value": MODEL_FAMILY},
         {"setting": "model_family_title", "value": MODEL_FAMILY_TITLE},
         {"setting": "model_weight_kind", "value": MODEL_WEIGHT_KIND},
-        {"setting": "attention_top_k", "value": ATTENTION_TOP_K},
+        {"setting": "attention_pool_mode", "value": "all_same_sign_all_features"},
+        {"setting": "attention_top_k_legacy", "value": ATTENTION_TOP_K},
         {"setting": "feature_size_grid", "value": ", ".join(str(value) for value in FEATURE_SIZE_GRID)},
         {"setting": "model_search_mode", "value": "fixed_defaults"},
         {"setting": "logreg_c", "value": LOGREG_C},
@@ -337,7 +382,7 @@ config_df = pd.DataFrame(
         {"setting": "xgb_gamma", "value": XGB_GAMMA},
         {"setting": "xgb_n_jobs", "value": XGB_N_JOBS},
         {"setting": "xgb_importance_type", "value": XGB_IMPORTANCE_TYPE},
-        {"setting": "per_root_limit", "value": PER_ROOT_LIMIT},
+        {"setting": "per_root_limit_legacy", "value": PER_ROOT_LIMIT},
         {"setting": "root_batch_size", "value": ROOT_BATCH_SIZE},
         {"setting": "activation_pca_dim", "value": ACTIVATION_PCA_DIM},
         {"setting": "model_selection_objective", "value": MODEL_SELECTION_OBJECTIVE},
@@ -1154,23 +1199,11 @@ def build_consistency_ranking(
     return effects_df
 
 
-def select_ranked_feature_pool(
-    ranking_df: pd.DataFrame,
-    *,
-    max_features: int,
-    per_root_limit: int,
-) -> list[str]:
-    selected: list[str] = []
-    root_counts: dict[str, int] = {}
-    for row in ranking_df.itertuples(index=False):
-        root_name = str(row.feature_root)
-        if root_counts.get(root_name, 0) >= int(per_root_limit):
-            continue
-        selected.append(str(row.feature))
-        root_counts[root_name] = root_counts.get(root_name, 0) + 1
-        if len(selected) >= int(max_features):
-            break
-    return selected
+def select_same_sign_attention_pool(ranking_df: pd.DataFrame) -> list[str]:
+    filtered_df = ranking_df.loc[ranking_df["same_sign_all"].eq(True)].copy().reset_index(drop=True)
+    if filtered_df.empty:
+        raise ValueError("No attention features satisfied same_sign_all after consistency filtering.")
+    return filtered_df["feature"].astype(str).tolist()
 
 
 def make_activation_lookup(
@@ -1547,19 +1580,24 @@ def build_attention_matrix_cache(selected_features: list[str]) -> dict[str, dict
 
 def build_activation_matrix_bundle(
     *,
-    train_env: str,
+    source_envs: tuple[str, ...],
+    train_env_label: str,
     feature_space_name: str,
     feature_space: FeatureSpaceSpec,
 ) -> ActivationMatrixBundle:
     if feature_space.activation_variant is None:
         raise ValueError(f"{feature_space_name} does not define an activation variant.")
 
-    raw_train = activation_stores[train_env].load_matrix(
-        split_cache_by_env[train_env]["train_row_idx"],
-        variant=str(feature_space.activation_variant),
-    )
-    if raw_train.size == 0:
-        raise ValueError(f"{train_env} has no activation rows for {feature_space_name}.")
+    raw_train_parts: list[np.ndarray] = []
+    for env_name in source_envs:
+        env_train = activation_stores[env_name].load_matrix(
+            split_cache_by_env[env_name]["train_row_idx"],
+            variant=str(feature_space.activation_variant),
+        )
+        if env_train.size == 0:
+            raise ValueError(f"{env_name} has no activation rows for {feature_space_name}.")
+        raw_train_parts.append(np.asarray(env_train, dtype=np.float32))
+    raw_train = np.concatenate(raw_train_parts, axis=0)
 
     imputer = SimpleImputer(strategy="median")
     scaler = StandardScaler()
@@ -1572,7 +1610,7 @@ def build_activation_matrix_bundle(
         effective_pca_dim = int(min(int(ACTIVATION_PCA_DIM), train_scaled.shape[0] - 1, train_scaled.shape[1]))
         if effective_pca_dim < 1:
             raise ValueError(
-                f"Effective PCA dim < 1 for {feature_space_name} / {train_env}. "
+                f"Effective PCA dim < 1 for {feature_space_name} / {train_env_label}. "
                 f"train_rows={train_scaled.shape[0]}, hidden_dim={train_scaled.shape[1]}"
             )
         pca = PCA(
@@ -1648,10 +1686,8 @@ for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Rank targets", to
             target_name=target_name,
         )
         attention_rankings_by_subset[subset_key] = attention_ranking_df
-        attention_pools_by_target_subset[(target_name, subset_key)] = select_ranked_feature_pool(
+        attention_pools_by_target_subset[(target_name, subset_key)] = select_same_sign_attention_pool(
             attention_ranking_df,
-            max_features=int(ATTENTION_TOP_K),
-            per_root_limit=int(PER_ROOT_LIMIT),
         )
 
     for feature_space_name, feature_space in FEATURE_SPACES.items():
@@ -1732,14 +1768,81 @@ for target_name in maybe_tqdm(
 
 
 # %%
-def feature_size_to_label(feature_size: int | None) -> str:
-    return "raw_final" if feature_size is None else f"k{int(feature_size):03d}"
+def feature_size_to_label(feature_size: int) -> str:
+    return f"k{int(feature_size):03d}"
+
+
+def selected_feature_size_label(feature_space: FeatureSpaceSpec, feature_size: int | None) -> str:
+    if feature_space.family_title == "baseline":
+        return "raw_final"
+    if feature_space.family_title == "attention_only":
+        return "all_attention"
+    if feature_size is None:
+        return "all_features"
+    return feature_size_to_label(int(feature_size))
 
 
 def feature_size_options_for_space(feature_space: FeatureSpaceSpec) -> tuple[int | None, ...]:
-    if feature_space.family_title == "baseline":
+    if feature_space.family_title in {"baseline", "attention_only"}:
         return (None,)
     return tuple(int(value) for value in FEATURE_SIZE_GRID)
+
+
+@dataclass(frozen=True)
+class ExperimentRunSpec:
+    scenario_name: str
+    scenario_title: str
+    train_env_label: str
+    source_envs: tuple[str, ...]
+    source_envs_label: str
+    ood_envs: tuple[str, ...]
+    heldout_env: str | None
+
+
+def build_experiment_run_specs() -> tuple[list[ExperimentRunSpec], dict[str, list[str]]]:
+    run_specs: list[ExperimentRunSpec] = []
+    train_axis_labels_by_scenario: dict[str, list[str]] = {}
+    for scenario_name, scenario_title in SELECTED_SCENARIO_TITLES.items():
+        scenario_labels: list[str] = []
+        if scenario_name == "single_source_ood":
+            for env_name in ENV_ORDER:
+                scenario_labels.append(env_name)
+                run_specs.append(
+                    ExperimentRunSpec(
+                        scenario_name=scenario_name,
+                        scenario_title=scenario_title,
+                        train_env_label=env_name,
+                        source_envs=(env_name,),
+                        source_envs_label=env_name,
+                        ood_envs=tuple(other_env for other_env in ENV_ORDER if other_env != env_name),
+                        heldout_env=None,
+                    )
+                )
+            train_axis_labels_by_scenario[scenario_name] = scenario_labels
+            continue
+        if scenario_name == "holdout_env_ood":
+            for heldout_env in ENV_ORDER:
+                train_env_label = f"All except {heldout_env}"
+                source_envs = tuple(env_name for env_name in ENV_ORDER if env_name != heldout_env)
+                scenario_labels.append(train_env_label)
+                run_specs.append(
+                    ExperimentRunSpec(
+                        scenario_name=scenario_name,
+                        scenario_title=scenario_title,
+                        train_env_label=train_env_label,
+                        source_envs=source_envs,
+                        source_envs_label=", ".join(source_envs),
+                        ood_envs=(heldout_env,),
+                        heldout_env=heldout_env,
+                    )
+                )
+            train_axis_labels_by_scenario[scenario_name] = scenario_labels
+            continue
+        raise ValueError(f"Unsupported scenario_name={scenario_name!r}")
+    return run_specs, train_axis_labels_by_scenario
+
+
+EXPERIMENT_RUN_SPECS, TRAIN_AXIS_LABELS_BY_SCENARIO = build_experiment_run_specs()
 
 
 def assemble_split_matrix(
@@ -1767,7 +1870,7 @@ def assemble_split_matrix(
 all_transfer_metric_rows: list[dict[str, Any]] = []
 all_model_selection_rows: list[dict[str, Any]] = []
 all_coefficient_frames: list[pd.DataFrame] = []
-activation_bundle_cache: dict[tuple[str, str], ActivationMatrixBundle] = {}
+activation_bundle_cache: dict[tuple[str, str, str], ActivationMatrixBundle] = {}
 completed_model_selection_count = 0
 
 
@@ -1789,6 +1892,33 @@ def persist_core_artifacts(
         coefficients_df.to_csv(OUTPUT_ROOT / "all_coefficients.csv", index=False)
 
     return transfer_df, model_selection_df, coefficients_df
+
+
+def concatenate_source_split_matrices(
+    env_pool_cache: dict[str, dict[str, np.ndarray]],
+    *,
+    source_envs: tuple[str, ...],
+    split_name: str,
+    feature_space: FeatureSpaceSpec,
+    attention_dim: int,
+    activation_dim: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    x_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    for env_name in source_envs:
+        env_cache = env_pool_cache[env_name]
+        x_parts.append(
+            assemble_split_matrix(
+                env_cache,
+                split_name=split_name,
+                feature_space=feature_space,
+                attention_dim=attention_dim,
+                activation_dim=activation_dim,
+            )
+        )
+        y_parts.append(np.asarray(env_cache[f"y_{split_name}"], dtype=np.int8))
+    return np.concatenate(x_parts, axis=0), np.concatenate(y_parts, axis=0)
+
 
 try:
     for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Model targets", total=len(TARGET_SPECS), disable=DISABLE_TQDM):
@@ -1819,19 +1949,20 @@ try:
             )
             size_options = feature_size_options_for_space(feature_space)
 
-            for train_env in maybe_tqdm(
-                ENV_ORDER,
-                desc=f"Train envs:{target_name}:{feature_space_name}",
-                total=len(ENV_ORDER),
+            for run_spec in maybe_tqdm(
+                EXPERIMENT_RUN_SPECS,
+                desc=f"Runs:{target_name}:{feature_space_name}",
+                total=len(EXPERIMENT_RUN_SPECS),
                 disable=DISABLE_TQDM,
             ):
                 activation_bundle: ActivationMatrixBundle | None = None
                 if feature_space.activation_variant is not None:
-                    bundle_key = (train_env, feature_space_name)
+                    bundle_key = (run_spec.scenario_name, run_spec.train_env_label, feature_space_name)
                     activation_bundle = activation_bundle_cache.get(bundle_key)
                     if activation_bundle is None:
                         activation_bundle = build_activation_matrix_bundle(
-                            train_env=train_env,
+                            source_envs=run_spec.source_envs,
+                            train_env_label=run_spec.train_env_label,
                             feature_space_name=feature_space_name,
                             feature_space=feature_space,
                         )
@@ -1863,15 +1994,14 @@ try:
                     env_pool_cache[env_name] = env_entry
 
                 for feature_size in size_options:
-                    size_label = feature_size_to_label(feature_size)
+                    size_label = selected_feature_size_label(feature_space, feature_size)
                     attention_dim = 0
                     activation_dim = 0
                     current_feature_names: list[str] = []
 
                     if feature_space.uses_attention:
-                        requested_attention = len(attention_feature_pool) if feature_size is None else int(feature_size)
-                        attention_dim = int(min(len(attention_feature_pool), requested_attention))
-                        current_feature_names.extend(attention_feature_pool[:attention_dim])
+                        attention_dim = int(len(attention_feature_pool))
+                        current_feature_names.extend(attention_feature_pool)
 
                     if activation_bundle is not None:
                         if feature_space.activation_use_pca:
@@ -1884,19 +2014,20 @@ try:
 
                     if not current_feature_names:
                         raise ValueError(
-                            f"No features constructed for {target_name} / {feature_space_name} / {train_env} / {size_label}."
+                            f"No features constructed for {target_name} / {feature_space_name} / {run_spec.train_env_label} / {size_label}."
                         )
 
-                    train_cache = env_pool_cache[train_env]
-                    x_train = assemble_split_matrix(
-                        train_cache,
+                    x_train, y_train = concatenate_source_split_matrices(
+                        env_pool_cache,
+                        source_envs=run_spec.source_envs,
                         split_name="train",
                         feature_space=feature_space,
                         attention_dim=attention_dim,
                         activation_dim=activation_dim,
                     )
-                    x_val = assemble_split_matrix(
-                        train_cache,
+                    x_val, y_val = concatenate_source_split_matrices(
+                        env_pool_cache,
+                        source_envs=run_spec.source_envs,
                         split_name="val",
                         feature_space=feature_space,
                         attention_dim=attention_dim,
@@ -1904,9 +2035,9 @@ try:
                     )
                     fitted_models, candidate_df = fit_candidate_classifiers(
                         x_train,
-                        train_cache["y_train"],
+                        y_train,
                         x_val,
-                        train_cache["y_val"],
+                        y_val,
                     )
 
                     best_model: FittedBinaryModel | None = None
@@ -1917,9 +2048,7 @@ try:
                     for fitted_model in fitted_models:
                         oracle_aurocs: list[float] = []
                         oracle_average_precisions: list[float] = []
-                        for test_env in ENV_ORDER:
-                            if test_env == train_env:
-                                continue
+                        for test_env in run_spec.ood_envs:
                             eval_cache = env_pool_cache[test_env]
                             x_eval = assemble_split_matrix(
                                 eval_cache,
@@ -1959,24 +2088,32 @@ try:
                             best_candidate_oracle_metrics = oracle_metrics
 
                     if best_model is None or best_candidate_oracle_metrics is None:
-                        raise RuntimeError(f"Failed to select model for {target_name} / {feature_space_name} / {train_env} / {size_label}.")
+                        raise RuntimeError(
+                            f"Failed to select model for {target_name} / {feature_space_name} / {run_spec.train_env_label} / {size_label}."
+                        )
 
-                    selection_dir = OUTPUT_ROOT / "model_selection" / target_name / feature_space_name / size_label
+                    selection_dir = OUTPUT_ROOT / "model_selection" / run_spec.scenario_name / target_name / feature_space_name / size_label
                     selection_dir.mkdir(parents=True, exist_ok=True)
-                    candidate_path = selection_dir / f"{slugify(train_env)}__candidates.csv"
+                    candidate_path = selection_dir / f"{slugify(run_spec.train_env_label)}__candidates.csv"
                     candidate_df = candidate_df.merge(
                         pd.DataFrame(oracle_rows),
                         on="candidate_key",
                         how="left",
                         validate="one_to_one",
                     )
+                    candidate_df["scenario_name"] = run_spec.scenario_name
+                    candidate_df["scenario_title"] = run_spec.scenario_title
                     candidate_df["target_name"] = target_name
                     candidate_df["feature_space"] = feature_space_name
                     candidate_df["feature_space_title"] = feature_space.title
                     candidate_df["feature_family_group"] = feature_space.family_title
                     candidate_df["feature_space_attention_subset_key"] = feature_space_attention_subset_key
                     candidate_df["feature_space_attention_subset_title"] = feature_space_attention_subset_title
-                    candidate_df["train_env"] = train_env
+                    candidate_df["train_env"] = run_spec.train_env_label
+                    candidate_df["source_envs"] = run_spec.source_envs_label
+                    candidate_df["source_env_count"] = int(len(run_spec.source_envs))
+                    candidate_df["heldout_env"] = run_spec.heldout_env if run_spec.heldout_env is not None else pd.NA
+                    candidate_df["ood_env_count"] = int(len(run_spec.ood_envs))
                     candidate_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
                     candidate_df["feature_size_label"] = size_label
                     candidate_df["attention_feature_count"] = int(attention_dim)
@@ -1987,10 +2124,10 @@ try:
                     )
                     candidate_df.to_csv(candidate_path, index=False)
 
-                    selected_path = selection_dir / f"{slugify(train_env)}__selected_features.csv"
-                    coefficients_path = selection_dir / f"{slugify(train_env)}__coefficients.csv"
-                    selection_summary_path = selection_dir / f"{slugify(train_env)}__selection_summary.csv"
-                    transfer_metrics_path = selection_dir / f"{slugify(train_env)}__transfer_metrics.csv"
+                    selected_path = selection_dir / f"{slugify(run_spec.train_env_label)}__selected_features.csv"
+                    coefficients_path = selection_dir / f"{slugify(run_spec.train_env_label)}__coefficients.csv"
+                    selection_summary_path = selection_dir / f"{slugify(run_spec.train_env_label)}__selection_summary.csv"
+                    transfer_metrics_path = selection_dir / f"{slugify(run_spec.train_env_label)}__transfer_metrics.csv"
 
                     selected_df = pd.DataFrame(
                         {
@@ -2005,13 +2142,18 @@ try:
                             how="left",
                             validate="one_to_one",
                         )
+                    selected_df["scenario_name"] = run_spec.scenario_name
+                    selected_df["scenario_title"] = run_spec.scenario_title
                     selected_df["target_name"] = target_name
                     selected_df["feature_space"] = feature_space_name
                     selected_df["feature_space_title"] = feature_space.title
                     selected_df["feature_family_group"] = feature_space.family_title
                     selected_df["feature_space_attention_subset_key"] = feature_space_attention_subset_key
                     selected_df["feature_space_attention_subset_title"] = feature_space_attention_subset_title
-                    selected_df["train_env"] = train_env
+                    selected_df["train_env"] = run_spec.train_env_label
+                    selected_df["source_envs"] = run_spec.source_envs_label
+                    selected_df["source_env_count"] = int(len(run_spec.source_envs))
+                    selected_df["heldout_env"] = run_spec.heldout_env if run_spec.heldout_env is not None else pd.NA
                     selected_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
                     selected_df["feature_size_label"] = size_label
                     selected_df["attention_feature_count"] = int(attention_dim)
@@ -2024,12 +2166,17 @@ try:
                         feature_names=current_feature_names,
                         target_name=target_name,
                         feature_space=feature_space_name,
-                        train_env=train_env,
+                        train_env=run_spec.train_env_label,
                     )
+                    coefficient_df["scenario_name"] = run_spec.scenario_name
+                    coefficient_df["scenario_title"] = run_spec.scenario_title
                     coefficient_df["feature_space_title"] = feature_space.title
                     coefficient_df["feature_family_group"] = feature_space.family_title
                     coefficient_df["feature_space_attention_subset_key"] = feature_space_attention_subset_key
                     coefficient_df["feature_space_attention_subset_title"] = feature_space_attention_subset_title
+                    coefficient_df["source_envs"] = run_spec.source_envs_label
+                    coefficient_df["source_env_count"] = int(len(run_spec.source_envs))
+                    coefficient_df["heldout_env"] = run_spec.heldout_env if run_spec.heldout_env is not None else pd.NA
                     coefficient_df["feature_size"] = pd.NA if feature_size is None else int(feature_size)
                     coefficient_df["feature_size_label"] = size_label
                     coefficient_df["attention_feature_count"] = int(attention_dim)
@@ -2039,6 +2186,8 @@ try:
                     all_coefficient_frames.append(coefficient_df)
 
                     selection_summary_row = {
+                        "scenario_name": run_spec.scenario_name,
+                        "scenario_title": run_spec.scenario_title,
                         "target_name": target_name,
                         "target_title": target_title,
                         "feature_space": feature_space_name,
@@ -2046,7 +2195,11 @@ try:
                         "feature_family_group": feature_space.family_title,
                         "feature_space_attention_subset_key": feature_space_attention_subset_key,
                         "feature_space_attention_subset_title": feature_space_attention_subset_title,
-                        "train_env": train_env,
+                        "train_env": run_spec.train_env_label,
+                        "source_envs": run_spec.source_envs_label,
+                        "source_env_count": int(len(run_spec.source_envs)),
+                        "heldout_env": run_spec.heldout_env if run_spec.heldout_env is not None else pd.NA,
+                        "ood_env_count": int(len(run_spec.ood_envs)),
                         "feature_size": pd.NA if feature_size is None else int(feature_size),
                         "feature_size_label": size_label,
                         "attention_feature_count": int(attention_dim),
@@ -2081,59 +2234,65 @@ try:
                     all_model_selection_rows.append(selection_summary_row)
 
                     current_transfer_rows: list[dict[str, Any]] = []
-                    for test_env in ENV_ORDER:
-                        eval_cache = env_pool_cache[test_env]
-                        x_eval = assemble_split_matrix(
-                            eval_cache,
-                            split_name="val",
-                            feature_space=feature_space,
-                            attention_dim=attention_dim,
-                            activation_dim=activation_dim,
-                        )
-                        eval_scores = best_model.estimator.predict_proba(x_eval)[:, 1].astype(np.float32)
-                        eval_metrics = summarize_score_metrics(
-                            eval_cache["y_val"],
-                            eval_scores,
-                            decision_threshold=float(best_model.decision_threshold),
-                        )
-                        transfer_row = {
-                            "target_name": target_name,
-                            "target_title": target_title,
-                            "feature_space": feature_space_name,
-                            "feature_space_title": feature_space.title,
-                            "feature_family_group": feature_space.family_title,
-                            "feature_space_attention_subset_key": feature_space_attention_subset_key,
-                            "feature_space_attention_subset_title": feature_space_attention_subset_title,
-                            "train_env": train_env,
-                            "test_env": test_env,
-                            "eval_role": "val" if train_env == test_env else "ood",
-                            "feature_size": pd.NA if feature_size is None else int(feature_size),
-                            "feature_size_label": size_label,
-                            "attention_feature_count": int(attention_dim),
-                            "activation_feature_count": int(activation_dim),
-                            "selected_feature_count": len(current_feature_names),
-                            "model_family": best_model.model_family,
-                            "model_family_title": best_model.model_family_title,
-                            "model_weight_kind": best_model.model_weight_kind,
-                            "candidate_key": best_model.candidate_key,
-                            "candidate_label": best_model.candidate_label,
-                            "candidate_complexity": float(best_model.candidate_complexity),
-                            "candidate_params_json": serialize_candidate_params(best_model.candidate_params),
-                            "chosen_c": pd.NA if best_model.chosen_c is None else float(best_model.chosen_c),
-                            "chosen_max_depth": pd.NA if best_model.candidate_max_depth is None else int(best_model.candidate_max_depth),
-                            "decision_threshold": float(best_model.decision_threshold),
-                            "effective_activation_pca_dim": (
-                                pd.NA if activation_bundle is None or activation_bundle.effective_pca_dim is None else int(activation_bundle.effective_pca_dim)
-                            ),
-                            "model_selection_objective": MODEL_SELECTION_OBJECTIVE,
-                            "oracle_mean_ood_auroc_selected": float(best_candidate_oracle_metrics["oracle_mean_ood_auroc"]),
-                            "selected_features_path": str(selected_path),
-                            "coefficients_path": str(coefficients_path),
-                            "transfer_metrics_path": str(transfer_metrics_path),
-                            **eval_metrics,
-                        }
-                        current_transfer_rows.append(transfer_row)
-                        all_transfer_metric_rows.append(transfer_row)
+                    for eval_role, eval_envs in (("val", run_spec.source_envs), ("ood", run_spec.ood_envs)):
+                        for test_env in eval_envs:
+                            eval_cache = env_pool_cache[test_env]
+                            x_eval = assemble_split_matrix(
+                                eval_cache,
+                                split_name="val",
+                                feature_space=feature_space,
+                                attention_dim=attention_dim,
+                                activation_dim=activation_dim,
+                            )
+                            eval_scores = best_model.estimator.predict_proba(x_eval)[:, 1].astype(np.float32)
+                            eval_metrics = summarize_score_metrics(
+                                eval_cache["y_val"],
+                                eval_scores,
+                                decision_threshold=float(best_model.decision_threshold),
+                            )
+                            transfer_row = {
+                                "scenario_name": run_spec.scenario_name,
+                                "scenario_title": run_spec.scenario_title,
+                                "target_name": target_name,
+                                "target_title": target_title,
+                                "feature_space": feature_space_name,
+                                "feature_space_title": feature_space.title,
+                                "feature_family_group": feature_space.family_title,
+                                "feature_space_attention_subset_key": feature_space_attention_subset_key,
+                                "feature_space_attention_subset_title": feature_space_attention_subset_title,
+                                "train_env": run_spec.train_env_label,
+                                "source_envs": run_spec.source_envs_label,
+                                "source_env_count": int(len(run_spec.source_envs)),
+                                "heldout_env": run_spec.heldout_env if run_spec.heldout_env is not None else pd.NA,
+                                "test_env": test_env,
+                                "eval_role": eval_role,
+                                "feature_size": pd.NA if feature_size is None else int(feature_size),
+                                "feature_size_label": size_label,
+                                "attention_feature_count": int(attention_dim),
+                                "activation_feature_count": int(activation_dim),
+                                "selected_feature_count": len(current_feature_names),
+                                "model_family": best_model.model_family,
+                                "model_family_title": best_model.model_family_title,
+                                "model_weight_kind": best_model.model_weight_kind,
+                                "candidate_key": best_model.candidate_key,
+                                "candidate_label": best_model.candidate_label,
+                                "candidate_complexity": float(best_model.candidate_complexity),
+                                "candidate_params_json": serialize_candidate_params(best_model.candidate_params),
+                                "chosen_c": pd.NA if best_model.chosen_c is None else float(best_model.chosen_c),
+                                "chosen_max_depth": pd.NA if best_model.candidate_max_depth is None else int(best_model.candidate_max_depth),
+                                "decision_threshold": float(best_model.decision_threshold),
+                                "effective_activation_pca_dim": (
+                                    pd.NA if activation_bundle is None or activation_bundle.effective_pca_dim is None else int(activation_bundle.effective_pca_dim)
+                                ),
+                                "model_selection_objective": MODEL_SELECTION_OBJECTIVE,
+                                "oracle_mean_ood_auroc_selected": float(best_candidate_oracle_metrics["oracle_mean_ood_auroc"]),
+                                "selected_features_path": str(selected_path),
+                                "coefficients_path": str(coefficients_path),
+                                "transfer_metrics_path": str(transfer_metrics_path),
+                                **eval_metrics,
+                            }
+                            current_transfer_rows.append(transfer_row)
+                            all_transfer_metric_rows.append(transfer_row)
 
                     pd.DataFrame(current_transfer_rows).to_csv(transfer_metrics_path, index=False)
 
@@ -2154,9 +2313,20 @@ finally:
 
 
 # %%
+def family_uses_requested_feature_size(feature_family_group: str) -> bool:
+    return feature_family_group in {"activation_only", "attention_plus_activation"}
+
+
+def optional_float(value: Any) -> float:
+    return float(value) if pd.notna(value) else float("nan")
+
+
+# %%
 def summarize_transfer_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
     summary_rows: list[dict[str, Any]] = []
     group_cols = [
+        "scenario_name",
+        "scenario_title",
         "target_name",
         "target_title",
         "feature_space",
@@ -2166,12 +2336,24 @@ def summarize_transfer_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
         "feature_size_label",
     ]
     for group_values, group_df in metrics_df.groupby(group_cols, dropna=False, sort=False):
-        target_name, target_title, feature_space, feature_space_title, feature_family_group, feature_size, feature_size_label = group_values
+        (
+            scenario_name,
+            scenario_title,
+            target_name,
+            target_title,
+            feature_space,
+            feature_space_title,
+            feature_family_group,
+            feature_size,
+            feature_size_label,
+        ) = group_values
         diagonal_df = group_df.loc[group_df["eval_role"].eq("val")].copy()
         ood_df = group_df.loc[group_df["eval_role"].eq("ood")].copy()
         meta = group_df.iloc[0]
         summary_rows.append(
             {
+                "scenario_name": scenario_name,
+                "scenario_title": scenario_title,
                 "target_name": target_name,
                 "target_title": target_title,
                 "feature_space": feature_space,
@@ -2183,6 +2365,8 @@ def summarize_transfer_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
                 "activation_feature_count": int(meta["activation_feature_count"]),
                 "selected_feature_count": int(meta["selected_feature_count"]),
                 "effective_activation_pca_dim": meta.get("effective_activation_pca_dim", pd.NA),
+                "n_source_val_envs": int(diagonal_df["test_env"].nunique()),
+                "n_ood_envs": int(ood_df["test_env"].nunique()),
                 "mean_val_auroc": safe_metric_mean(diagonal_df["auroc"]),
                 "min_val_auroc": safe_metric_min(diagonal_df["auroc"]),
                 "mean_ood_auroc": safe_metric_mean(ood_df["auroc"]),
@@ -2199,8 +2383,8 @@ def summarize_transfer_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(summary_rows)
     out["_feature_size_sort"] = pd.to_numeric(out["feature_size"], errors="coerce").fillna(-1).astype(int)
     out = out.sort_values(
-        ["target_name", "_feature_size_sort", "mean_ood_auroc", "min_ood_auroc", "mean_val_auroc"],
-        ascending=[True, True, False, False, False],
+        ["scenario_name", "target_name", "_feature_size_sort", "mean_ood_auroc", "min_ood_auroc", "mean_val_auroc"],
+        ascending=[True, True, True, False, False, False],
     ).drop(columns="_feature_size_sort")
     return out.reset_index(drop=True)
 
@@ -2208,6 +2392,8 @@ def summarize_transfer_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
 def summarize_train_env_models(metrics_df: pd.DataFrame) -> pd.DataFrame:
     summary_rows: list[dict[str, Any]] = []
     group_cols = [
+        "scenario_name",
+        "scenario_title",
         "target_name",
         "target_title",
         "feature_space",
@@ -2216,9 +2402,14 @@ def summarize_train_env_models(metrics_df: pd.DataFrame) -> pd.DataFrame:
         "feature_size",
         "feature_size_label",
         "train_env",
+        "source_envs",
+        "source_env_count",
+        "heldout_env",
     ]
     for group_values, group_df in metrics_df.groupby(group_cols, dropna=False, sort=False):
         (
+            scenario_name,
+            scenario_title,
             target_name,
             target_title,
             feature_space,
@@ -2227,12 +2418,17 @@ def summarize_train_env_models(metrics_df: pd.DataFrame) -> pd.DataFrame:
             feature_size,
             feature_size_label,
             train_env,
+            source_envs,
+            source_env_count,
+            heldout_env,
         ) = group_values
         diagonal_df = group_df.loc[group_df["eval_role"].eq("val")].copy()
         ood_df = group_df.loc[group_df["eval_role"].eq("ood")].copy()
         selection_meta = group_df.iloc[0]
         summary_rows.append(
             {
+                "scenario_name": scenario_name,
+                "scenario_title": scenario_title,
                 "target_name": target_name,
                 "target_title": target_title,
                 "feature_space": feature_space,
@@ -2241,21 +2437,28 @@ def summarize_train_env_models(metrics_df: pd.DataFrame) -> pd.DataFrame:
                 "feature_size": feature_size,
                 "feature_size_label": feature_size_label,
                 "train_env": train_env,
+                "source_envs": source_envs,
+                "source_env_count": int(source_env_count),
+                "heldout_env": heldout_env,
                 "model_selection_objective": selection_meta.get("model_selection_objective", MODEL_SELECTION_OBJECTIVE),
                 "source_val_auroc": safe_metric_mean(diagonal_df["auroc"]),
                 "source_val_average_precision": safe_metric_mean(diagonal_df["average_precision"]),
+                "source_val_balanced_accuracy": safe_metric_mean(diagonal_df["balanced_accuracy"]),
                 "mean_ood_auroc": safe_metric_mean(ood_df["auroc"]),
                 "min_ood_auroc": safe_metric_min(ood_df["auroc"]),
                 "std_ood_auroc": safe_metric_std(ood_df["auroc"]),
                 "mean_ood_average_precision": safe_metric_mean(ood_df["average_precision"]),
                 "mean_ood_balanced_accuracy": safe_metric_mean(ood_df["balanced_accuracy"]),
+                "n_source_val_envs": int(diagonal_df["test_env"].nunique()),
+                "n_ood_envs": int(ood_df["test_env"].nunique()),
                 "attention_feature_count": int(selection_meta["attention_feature_count"]),
                 "activation_feature_count": int(selection_meta["activation_feature_count"]),
                 "selected_feature_count": int(selection_meta["selected_feature_count"]),
-                "chosen_c": float(selection_meta["chosen_c"]),
+                "chosen_c": optional_float(selection_meta.get("chosen_c", pd.NA)),
+                "chosen_max_depth": optional_float(selection_meta.get("chosen_max_depth", pd.NA)),
                 "decision_threshold": float(selection_meta["decision_threshold"]),
                 "effective_activation_pca_dim": selection_meta.get("effective_activation_pca_dim", pd.NA),
-                "oracle_mean_ood_auroc_selected": float(selection_meta.get("oracle_mean_ood_auroc_selected", float("nan"))),
+                "oracle_mean_ood_auroc_selected": optional_float(selection_meta.get("oracle_mean_ood_auroc_selected", pd.NA)),
                 "selected_features_path": str(selection_meta["selected_features_path"]),
                 "coefficients_path": str(selection_meta.get("coefficients_path", "")),
             }
@@ -2265,8 +2468,8 @@ def summarize_train_env_models(metrics_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(summary_rows)
     out["_feature_size_sort"] = pd.to_numeric(out["feature_size"], errors="coerce").fillna(-1).astype(int)
     out = out.sort_values(
-        ["target_name", "_feature_size_sort", "mean_ood_auroc", "min_ood_auroc", "source_val_auroc"],
-        ascending=[True, True, False, False, False],
+        ["scenario_name", "target_name", "_feature_size_sort", "mean_ood_auroc", "min_ood_auroc", "source_val_auroc"],
+        ascending=[True, True, True, False, False, False],
     ).drop(columns="_feature_size_sort")
     return out.reset_index(drop=True)
 
@@ -2274,6 +2477,8 @@ def summarize_train_env_models(metrics_df: pd.DataFrame) -> pd.DataFrame:
 def summarize_confusion_counts(metrics_df: pd.DataFrame) -> pd.DataFrame:
     summary_rows: list[dict[str, Any]] = []
     group_cols = [
+        "scenario_name",
+        "scenario_title",
         "target_name",
         "target_title",
         "feature_space",
@@ -2285,6 +2490,8 @@ def summarize_confusion_counts(metrics_df: pd.DataFrame) -> pd.DataFrame:
     ]
     for group_values, group_df in metrics_df.groupby(group_cols, dropna=False, sort=False):
         (
+            scenario_name,
+            scenario_title,
             target_name,
             target_title,
             feature_space,
@@ -2297,6 +2504,8 @@ def summarize_confusion_counts(metrics_df: pd.DataFrame) -> pd.DataFrame:
         meta = group_df.iloc[0]
         summary_rows.append(
             {
+                "scenario_name": scenario_name,
+                "scenario_title": scenario_title,
                 "target_name": target_name,
                 "target_title": target_title,
                 "feature_space": feature_space,
@@ -2320,8 +2529,8 @@ def summarize_confusion_counts(metrics_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(summary_rows)
     out["_feature_size_sort"] = pd.to_numeric(out["feature_size"], errors="coerce").fillna(-1).astype(int)
     out = out.sort_values(
-        ["target_name", "_feature_size_sort", "eval_role", "feature_space"],
-        ascending=[True, True, True, True],
+        ["scenario_name", "target_name", "_feature_size_sort", "eval_role", "feature_space"],
+        ascending=[True, True, True, True, True],
     ).drop(columns="_feature_size_sort")
     return out.reset_index(drop=True)
 
@@ -2330,7 +2539,10 @@ def summarize_coefficients(coefficients_df: pd.DataFrame, ranking_df: pd.DataFra
     if coefficients_df.empty:
         return pd.DataFrame()
     coefficient_summary_df = (
-        coefficients_df.groupby(["target_name", "feature_space", "feature_size", "feature_size_label", "feature"], as_index=False)
+        coefficients_df.groupby(
+            ["scenario_name", "scenario_title", "target_name", "feature_space", "feature_size", "feature_size_label", "feature"],
+            as_index=False,
+        )
         .agg(
             mean_coefficient=("coefficient", "mean"),
             mean_abs_coefficient=("abs_coefficient", "mean"),
@@ -2338,8 +2550,8 @@ def summarize_coefficients(coefficients_df: pd.DataFrame, ranking_df: pd.DataFra
             selected_in_sources=("train_env", "nunique"),
         )
         .sort_values(
-            ["target_name", "feature_space", "feature_size_label", "mean_abs_coefficient"],
-            ascending=[True, True, True, False],
+            ["scenario_name", "target_name", "feature_space", "feature_size_label", "mean_abs_coefficient"],
+            ascending=[True, True, True, True, False],
         )
         .reset_index(drop=True)
     )
@@ -2377,52 +2589,56 @@ def summarize_coefficients(coefficients_df: pd.DataFrame, ranking_df: pd.DataFra
 def build_family_panel_selection(transfer_summary_df: pd.DataFrame) -> pd.DataFrame:
     family_sort = {family: idx for idx, family in enumerate(FAMILY_PANEL_ORDER)}
     rows: list[dict[str, Any]] = []
-    for target_name, target_spec in TARGET_SPECS.items():
-        target_title = str(target_spec["title"])
-        for requested_feature_size in FEATURE_SIZE_GRID:
-            for family in FAMILY_PANEL_ORDER:
-                subset = transfer_summary_df.loc[
-                    transfer_summary_df["target_name"].eq(target_name)
-                    & transfer_summary_df["feature_family_group"].eq(family)
-                ].copy()
-                if family != "baseline":
-                    subset = subset.loc[pd.to_numeric(subset["feature_size"], errors="coerce").eq(int(requested_feature_size))]
-                if subset.empty:
-                    continue
-                subset = subset.sort_values(
-                    ["mean_ood_auroc", "min_ood_auroc", "mean_val_auroc", "selected_feature_count"],
-                    ascending=[False, False, False, True],
-                ).reset_index(drop=True)
-                best = subset.iloc[0]
-                rows.append(
-                    {
-                        "target_name": target_name,
-                        "target_title": target_title,
-                        "requested_feature_size": int(requested_feature_size),
-                        "requested_feature_size_label": feature_size_to_label(int(requested_feature_size)),
-                        "feature_family_group": family,
-                        "selected_feature_space": str(best["feature_space"]),
-                        "selected_feature_space_title": str(best["feature_space_title"]),
-                        "source_feature_size": best["feature_size"],
-                        "source_feature_size_label": str(best["feature_size_label"]),
-                        "attention_feature_count": int(best["attention_feature_count"]),
-                        "activation_feature_count": int(best["activation_feature_count"]),
-                        "selected_feature_count": int(best["selected_feature_count"]),
-                        "effective_activation_pca_dim": best.get("effective_activation_pca_dim", pd.NA),
-                        "mean_val_auroc": float(best["mean_val_auroc"]),
-                        "mean_ood_auroc": float(best["mean_ood_auroc"]),
-                        "min_ood_auroc": float(best["min_ood_auroc"]),
-                        "std_ood_auroc": float(best["std_ood_auroc"]),
-                        "mean_ood_average_precision": float(best["mean_ood_average_precision"]),
-                    }
-                )
+    for scenario_name, scenario_title in SELECTED_SCENARIO_TITLES.items():
+        for target_name, target_spec in TARGET_SPECS.items():
+            target_title = str(target_spec["title"])
+            for requested_feature_size in FEATURE_SIZE_GRID:
+                for family in FAMILY_PANEL_ORDER:
+                    subset = transfer_summary_df.loc[
+                        transfer_summary_df["scenario_name"].eq(scenario_name)
+                        & transfer_summary_df["target_name"].eq(target_name)
+                        & transfer_summary_df["feature_family_group"].eq(family)
+                    ].copy()
+                    if family_uses_requested_feature_size(family):
+                        subset = subset.loc[pd.to_numeric(subset["feature_size"], errors="coerce").eq(int(requested_feature_size))]
+                    if subset.empty:
+                        continue
+                    subset = subset.sort_values(
+                        ["mean_ood_auroc", "min_ood_auroc", "mean_val_auroc", "selected_feature_count"],
+                        ascending=[False, False, False, True],
+                    ).reset_index(drop=True)
+                    best = subset.iloc[0]
+                    rows.append(
+                        {
+                            "scenario_name": scenario_name,
+                            "scenario_title": scenario_title,
+                            "target_name": target_name,
+                            "target_title": target_title,
+                            "requested_feature_size": int(requested_feature_size),
+                            "requested_feature_size_label": feature_size_to_label(int(requested_feature_size)),
+                            "feature_family_group": family,
+                            "selected_feature_space": str(best["feature_space"]),
+                            "selected_feature_space_title": str(best["feature_space_title"]),
+                            "source_feature_size": best["feature_size"],
+                            "source_feature_size_label": str(best["feature_size_label"]),
+                            "attention_feature_count": int(best["attention_feature_count"]),
+                            "activation_feature_count": int(best["activation_feature_count"]),
+                            "selected_feature_count": int(best["selected_feature_count"]),
+                            "effective_activation_pca_dim": best.get("effective_activation_pca_dim", pd.NA),
+                            "mean_val_auroc": float(best["mean_val_auroc"]),
+                            "mean_ood_auroc": float(best["mean_ood_auroc"]),
+                            "min_ood_auroc": float(best["min_ood_auroc"]),
+                            "std_ood_auroc": float(best["std_ood_auroc"]),
+                            "mean_ood_average_precision": float(best["mean_ood_average_precision"]),
+                        }
+                    )
     if not rows:
         return pd.DataFrame()
     out = pd.DataFrame(rows)
     out["_family_sort"] = out["feature_family_group"].map(family_sort).fillna(len(family_sort)).astype(int)
     out = out.sort_values(
-        ["target_name", "requested_feature_size", "_family_sort", "mean_ood_auroc"],
-        ascending=[True, True, True, False],
+        ["scenario_name", "target_name", "requested_feature_size", "_family_sort", "mean_ood_auroc"],
+        ascending=[True, True, True, True, False],
     ).drop(columns="_family_sort")
     return out.reset_index(drop=True)
 
@@ -2434,7 +2650,8 @@ def build_best_family_models(
     rows: list[dict[str, Any]] = []
     for panel_row in panel_selection_df.itertuples(index=False):
         subset = train_env_model_summary_df.loc[
-            train_env_model_summary_df["target_name"].eq(panel_row.target_name)
+            train_env_model_summary_df["scenario_name"].eq(panel_row.scenario_name)
+            & train_env_model_summary_df["target_name"].eq(panel_row.target_name)
             & train_env_model_summary_df["feature_space"].eq(panel_row.selected_feature_space)
             & train_env_model_summary_df["feature_size_label"].eq(panel_row.source_feature_size_label)
         ].copy()
@@ -2447,6 +2664,8 @@ def build_best_family_models(
         best = subset.iloc[0]
         rows.append(
             {
+                "scenario_name": panel_row.scenario_name,
+                "scenario_title": panel_row.scenario_title,
                 "target_name": panel_row.target_name,
                 "target_title": panel_row.target_title,
                 "requested_feature_size": int(panel_row.requested_feature_size),
@@ -2457,6 +2676,9 @@ def build_best_family_models(
                 "feature_size": best["feature_size"],
                 "feature_size_label": str(best["feature_size_label"]),
                 "train_env": str(best["train_env"]),
+                "source_envs": str(best["source_envs"]),
+                "source_env_count": int(best["source_env_count"]),
+                "heldout_env": best["heldout_env"],
                 "source_val_auroc": float(best["source_val_auroc"]),
                 "mean_ood_auroc": float(best["mean_ood_auroc"]),
                 "min_ood_auroc": float(best["min_ood_auroc"]),
@@ -2466,7 +2688,8 @@ def build_best_family_models(
                 "attention_feature_count": int(best["attention_feature_count"]),
                 "activation_feature_count": int(best["activation_feature_count"]),
                 "selected_feature_count": int(best["selected_feature_count"]),
-                "chosen_c": float(best["chosen_c"]),
+                "chosen_c": optional_float(best["chosen_c"]),
+                "chosen_max_depth": optional_float(best["chosen_max_depth"]),
                 "decision_threshold": float(best["decision_threshold"]),
                 "effective_activation_pca_dim": best.get("effective_activation_pca_dim", pd.NA),
                 "selected_features_path": str(best["selected_features_path"]),
@@ -2479,8 +2702,8 @@ def build_best_family_models(
     family_sort = {family: idx for idx, family in enumerate(FAMILY_PANEL_ORDER)}
     out["_family_sort"] = out["feature_family_group"].map(family_sort).fillna(len(family_sort)).astype(int)
     out = out.sort_values(
-        ["target_name", "requested_feature_size", "_family_sort", "mean_ood_auroc"],
-        ascending=[True, True, True, False],
+        ["scenario_name", "target_name", "requested_feature_size", "_family_sort", "mean_ood_auroc"],
+        ascending=[True, True, True, True, False],
     ).drop(columns="_family_sort")
     return out.reset_index(drop=True)
 
@@ -2494,7 +2717,8 @@ def build_selected_panel_confusion_summary(
     rows: list[dict[str, Any]] = []
     for panel_row in panel_selection_df.itertuples(index=False):
         subset = metrics_df.loc[
-            metrics_df["target_name"].eq(panel_row.target_name)
+            metrics_df["scenario_name"].eq(panel_row.scenario_name)
+            & metrics_df["target_name"].eq(panel_row.target_name)
             & metrics_df["feature_space"].eq(panel_row.selected_feature_space)
             & metrics_df["feature_size_label"].eq(panel_row.source_feature_size_label)
             & metrics_df["eval_role"].eq(eval_role)
@@ -2503,6 +2727,8 @@ def build_selected_panel_confusion_summary(
             continue
         rows.append(
             {
+                "scenario_name": panel_row.scenario_name,
+                "scenario_title": panel_row.scenario_title,
                 "target_name": panel_row.target_name,
                 "target_title": panel_row.target_title,
                 "requested_feature_size": int(panel_row.requested_feature_size),
@@ -2525,8 +2751,8 @@ def build_selected_panel_confusion_summary(
     out = pd.DataFrame(rows)
     out["_family_sort"] = out["feature_family_group"].map(family_sort).fillna(len(family_sort)).astype(int)
     out = out.sort_values(
-        ["target_name", "requested_feature_size", "_family_sort"],
-        ascending=[True, True, True],
+        ["scenario_name", "target_name", "requested_feature_size", "eval_role", "_family_sort"],
+        ascending=[True, True, True, True, True],
     ).drop(columns="_family_sort")
     return out.reset_index(drop=True)
 
@@ -2537,11 +2763,20 @@ confusion_summary_df = summarize_confusion_counts(all_transfer_metrics_df)
 coefficient_summary_df = summarize_coefficients(all_coefficients_df, ranking_df_all)
 family_panel_selection_df = build_family_panel_selection(transfer_summary_df)
 best_family_models_df = build_best_family_models(train_env_model_summary_df, family_panel_selection_df)
+selected_panel_confusion_val_df = build_selected_panel_confusion_summary(
+    all_transfer_metrics_df,
+    family_panel_selection_df,
+    eval_role="val",
+)
 selected_panel_confusion_ood_df = build_selected_panel_confusion_summary(
     all_transfer_metrics_df,
     family_panel_selection_df,
     eval_role="ood",
 )
+selected_panel_confusion_df = pd.concat(
+    [selected_panel_confusion_val_df, selected_panel_confusion_ood_df],
+    ignore_index=True,
+) if not selected_panel_confusion_val_df.empty or not selected_panel_confusion_ood_df.empty else pd.DataFrame()
 
 top_feature_tables: list[pd.DataFrame] = []
 top_feature_dir = OUTPUT_ROOT / "best_features"
@@ -2549,7 +2784,8 @@ top_feature_dir.mkdir(parents=True, exist_ok=True)
 for row in best_family_models_df.itertuples(index=False):
     feature_table = (
         all_coefficients_df.loc[
-            all_coefficients_df["target_name"].eq(row.target_name)
+            all_coefficients_df["scenario_name"].eq(row.scenario_name)
+            & all_coefficients_df["target_name"].eq(row.target_name)
             & all_coefficients_df["feature_space"].eq(row.feature_space)
             & all_coefficients_df["feature_size_label"].eq(row.feature_size_label)
             & all_coefficients_df["train_env"].eq(row.train_env)
@@ -2568,14 +2804,18 @@ for row in best_family_models_df.itertuples(index=False):
     )
     if feature_table.empty:
         continue
+    feature_table["scenario_name"] = row.scenario_name
+    feature_table["scenario_title"] = row.scenario_title
     feature_table["requested_feature_size"] = int(row.requested_feature_size)
     feature_table["requested_feature_size_label"] = row.requested_feature_size_label
     feature_table["feature_family_group"] = row.feature_family_group
     feature_table.insert(0, "importance_rank", np.arange(1, len(feature_table) + 1, dtype=int))
     top_feature_df = feature_table.head(int(TOP_FEATURES_TO_SHOW)).copy()
     top_feature_tables.append(top_feature_df)
+    scenario_dir = top_feature_dir / str(row.scenario_name)
+    scenario_dir.mkdir(parents=True, exist_ok=True)
     out_name = f"{row.target_name}__{row.feature_family_group}__{row.requested_feature_size_label}__top_features.csv"
-    top_feature_df.to_csv(top_feature_dir / out_name, index=False)
+    top_feature_df.to_csv(scenario_dir / out_name, index=False)
 
 top_features_for_best_models_df = pd.concat(top_feature_tables, ignore_index=True) if top_feature_tables else pd.DataFrame()
 
@@ -2584,6 +2824,8 @@ display(train_env_model_summary_df)
 display(confusion_summary_df)
 display(family_panel_selection_df)
 display(best_family_models_df)
+display(selected_panel_confusion_val_df)
+display(selected_panel_confusion_ood_df)
 display(top_features_for_best_models_df)
 
 transfer_summary_df.to_csv(OUTPUT_ROOT / "transfer_summary.csv", index=False)
@@ -2592,7 +2834,9 @@ confusion_summary_df.to_csv(OUTPUT_ROOT / "confusion_summary.csv", index=False)
 coefficient_summary_df.to_csv(OUTPUT_ROOT / "coefficient_summary.csv", index=False)
 family_panel_selection_df.to_csv(OUTPUT_ROOT / "best_feature_space_by_target_size_family.csv", index=False)
 best_family_models_df.to_csv(OUTPUT_ROOT / "best_model_by_target_size_family.csv", index=False)
+selected_panel_confusion_val_df.to_csv(OUTPUT_ROOT / "selected_panel_confusion_val.csv", index=False)
 selected_panel_confusion_ood_df.to_csv(OUTPUT_ROOT / "selected_panel_confusion_ood.csv", index=False)
+selected_panel_confusion_df.to_csv(OUTPUT_ROOT / "selected_panel_confusion_all.csv", index=False)
 top_features_for_best_models_df.to_csv(OUTPUT_ROOT / "top_features_for_best_models.csv", index=False)
 
 
@@ -2605,16 +2849,19 @@ def target_confusion_labels(target_name: str) -> tuple[str, str]:
 def build_transfer_matrix_for_selection(
     metrics_df: pd.DataFrame,
     *,
+    scenario_name: str,
     target_name: str,
     feature_space: str,
     feature_size_label: str,
 ) -> pd.DataFrame:
     subset = metrics_df.loc[
-        metrics_df["target_name"].eq(target_name)
+        metrics_df["scenario_name"].eq(scenario_name)
+        & metrics_df["target_name"].eq(target_name)
         & metrics_df["feature_space"].eq(feature_space)
         & metrics_df["feature_size_label"].eq(feature_size_label)
     ].copy()
-    matrix = pd.DataFrame(index=ENV_ORDER, columns=ENV_ORDER, dtype=float)
+    row_labels = TRAIN_AXIS_LABELS_BY_SCENARIO[str(scenario_name)]
+    matrix = pd.DataFrame(index=row_labels, columns=ENV_ORDER, dtype=float)
     for row in subset.itertuples(index=False):
         matrix.loc[str(row.train_env), str(row.test_env)] = float(row.auroc) if pd.notna(row.auroc) else float("nan")
     return matrix
@@ -2623,14 +2870,18 @@ def build_transfer_matrix_for_selection(
 def build_confusion_matrix_df(
     confusion_df: pd.DataFrame,
     *,
+    scenario_name: str,
     target_name: str,
     requested_feature_size: int,
     feature_family_group: str,
+    eval_role: str,
 ) -> pd.DataFrame | None:
     subset = confusion_df.loc[
-        confusion_df["target_name"].eq(target_name)
+        confusion_df["scenario_name"].eq(scenario_name)
+        & confusion_df["target_name"].eq(target_name)
         & confusion_df["requested_feature_size"].eq(int(requested_feature_size))
         & confusion_df["feature_family_group"].eq(feature_family_group)
+        & confusion_df["eval_role"].eq(eval_role)
     ].copy()
     if subset.empty:
         return None
@@ -2655,11 +2906,12 @@ def export_selected_family_panel_tables(
     export_root.mkdir(parents=True, exist_ok=True)
     manifest_rows: list[dict[str, Any]] = []
     for panel_row in panel_selection_df.itertuples(index=False):
-        panel_dir = export_root / panel_row.target_name / str(panel_row.requested_feature_size_label)
+        panel_dir = export_root / str(panel_row.scenario_name) / panel_row.target_name / str(panel_row.requested_feature_size_label)
         panel_dir.mkdir(parents=True, exist_ok=True)
 
         matrix_df = build_transfer_matrix_for_selection(
             metrics_df,
+            scenario_name=str(panel_row.scenario_name),
             target_name=str(panel_row.target_name),
             feature_space=str(panel_row.selected_feature_space),
             feature_size_label=str(panel_row.source_feature_size_label),
@@ -2667,18 +2919,34 @@ def export_selected_family_panel_tables(
         matrix_path = panel_dir / f"{panel_row.feature_family_group}__auroc_matrix.csv"
         matrix_df.to_csv(matrix_path, index=True)
 
-        confusion_matrix_df = build_confusion_matrix_df(
+        val_confusion_matrix_df = build_confusion_matrix_df(
             confusion_df,
+            scenario_name=str(panel_row.scenario_name),
             target_name=str(panel_row.target_name),
             requested_feature_size=int(panel_row.requested_feature_size),
             feature_family_group=str(panel_row.feature_family_group),
+            eval_role="val",
         )
-        confusion_path = panel_dir / f"{panel_row.feature_family_group}__ood_confusion_counts.csv"
-        if confusion_matrix_df is not None:
-            confusion_matrix_df.to_csv(confusion_path, index=True)
+        val_confusion_path = panel_dir / f"{panel_row.feature_family_group}__val_confusion_counts.csv"
+        if val_confusion_matrix_df is not None:
+            val_confusion_matrix_df.to_csv(val_confusion_path, index=True)
+
+        ood_confusion_matrix_df = build_confusion_matrix_df(
+            confusion_df,
+            scenario_name=str(panel_row.scenario_name),
+            target_name=str(panel_row.target_name),
+            requested_feature_size=int(panel_row.requested_feature_size),
+            feature_family_group=str(panel_row.feature_family_group),
+            eval_role="ood",
+        )
+        ood_confusion_path = panel_dir / f"{panel_row.feature_family_group}__ood_confusion_counts.csv"
+        if ood_confusion_matrix_df is not None:
+            ood_confusion_matrix_df.to_csv(ood_confusion_path, index=True)
 
         manifest_rows.append(
             {
+                "scenario_name": panel_row.scenario_name,
+                "scenario_title": panel_row.scenario_title,
                 "target_name": panel_row.target_name,
                 "target_title": panel_row.target_title,
                 "requested_feature_size": int(panel_row.requested_feature_size),
@@ -2691,7 +2959,8 @@ def export_selected_family_panel_tables(
                 "activation_feature_count": int(panel_row.activation_feature_count),
                 "selected_feature_count": int(panel_row.selected_feature_count),
                 "auroc_matrix_path": str(matrix_path),
-                "ood_confusion_counts_path": str(confusion_path if confusion_matrix_df is not None else ""),
+                "val_confusion_counts_path": str(val_confusion_path if val_confusion_matrix_df is not None else ""),
+                "ood_confusion_counts_path": str(ood_confusion_path if ood_confusion_matrix_df is not None else ""),
             }
         )
     pd.DataFrame(manifest_rows).to_csv(export_root / "panel_table_manifest.csv", index=False)
@@ -2701,12 +2970,14 @@ def plot_feature_size_family_transfer_panels(
     metrics_df: pd.DataFrame,
     panel_selection_df: pd.DataFrame,
     *,
+    scenario_name: str,
     target_name: str,
     requested_feature_size: int,
 ) -> None:
     selection_subset = (
         panel_selection_df.loc[
-            panel_selection_df["target_name"].eq(target_name)
+            panel_selection_df["scenario_name"].eq(scenario_name)
+            & panel_selection_df["target_name"].eq(target_name)
             & panel_selection_df["requested_feature_size"].eq(int(requested_feature_size))
         ]
         .set_index("feature_family_group")
@@ -2715,11 +2986,13 @@ def plot_feature_size_family_transfer_panels(
     )
     matrices: dict[str, pd.DataFrame] = {}
     finite_values_list: list[np.ndarray] = []
+    row_labels = TRAIN_AXIS_LABELS_BY_SCENARIO[str(scenario_name)]
     for row in selection_subset.itertuples(index=False):
         if pd.isna(row.selected_feature_space):
             continue
         matrix_df = build_transfer_matrix_for_selection(
             metrics_df,
+            scenario_name=str(scenario_name),
             target_name=target_name,
             feature_space=str(row.selected_feature_space),
             feature_size_label=str(row.source_feature_size_label),
@@ -2745,15 +3018,15 @@ def plot_feature_size_family_transfer_panels(
             ax.axis("off")
             continue
         row = row_df.iloc[0]
-        matrix_df = matrices[family].reindex(index=ENV_ORDER, columns=ENV_ORDER)
+        matrix_df = matrices[family].reindex(index=row_labels, columns=ENV_ORDER)
         matrix = np.ma.masked_invalid(matrix_df.to_numpy(dtype=float))
         image = ax.imshow(matrix, cmap=cmap, vmin=vmin, vmax=vmax)
         ax.set_xticks(np.arange(len(ENV_ORDER)))
         ax.set_xticklabels(ENV_ORDER, rotation=35, ha="right")
-        ax.set_yticks(np.arange(len(ENV_ORDER)))
-        ax.set_yticklabels(ENV_ORDER)
-        ax.set_xlabel("Test env")
-        ax.set_ylabel("Train env")
+        ax.set_yticks(np.arange(len(row_labels)))
+        ax.set_yticklabels(row_labels)
+        ax.set_xlabel("Evaluation env")
+        ax.set_ylabel("Training source(s)")
         title = (
             f"{FAMILY_DISPLAY_TITLES.get(family, str(row['feature_family_group']))}\n"
             f"{row['selected_feature_space_title']}\n"
@@ -2771,12 +3044,20 @@ def plot_feature_size_family_transfer_panels(
     if image is not None:
         fig.colorbar(image, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02, label="AUROC")
 
+    scenario_note = (
+        "source-env columns = validation AUROC; held-out column = OOD AUROC"
+        if scenario_name == "holdout_env_ood"
+        else "diagonal = source validation AUROC; off-diagonal = OOD AUROC"
+    )
     fig.suptitle(
+        f"{SELECTED_SCENARIO_TITLES[str(scenario_name)]}\n"
         f"{TARGET_SPECS[target_name]['title']} | feature size {requested_feature_size}\n"
-        "(diagonal = source validation AUROC, off-diagonal = OOD AUROC)",
+        f"{scenario_note}",
         fontsize=14,
     )
-    out_path = OUTPUT_ROOT / f"{target_name}__k{int(requested_feature_size):03d}__family_transfer_heatmaps.png"
+    plot_dir = OUTPUT_ROOT / "plots" / str(scenario_name)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    out_path = plot_dir / f"{target_name}__k{int(requested_feature_size):03d}__family_transfer_heatmaps.png"
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.show()
 
@@ -2784,13 +3065,17 @@ def plot_feature_size_family_transfer_panels(
 def plot_feature_size_family_confusion_panels(
     confusion_df: pd.DataFrame,
     *,
+    scenario_name: str,
     target_name: str,
     requested_feature_size: int,
+    eval_role: str,
 ) -> None:
     subset = (
         confusion_df.loc[
-            confusion_df["target_name"].eq(target_name)
+            confusion_df["scenario_name"].eq(scenario_name)
+            & confusion_df["target_name"].eq(target_name)
             & confusion_df["requested_feature_size"].eq(int(requested_feature_size))
+            & confusion_df["eval_role"].eq(eval_role)
         ]
         .set_index("feature_family_group")
         .reindex(list(FAMILY_PANEL_ORDER))
@@ -2848,11 +3133,15 @@ def plot_feature_size_family_confusion_panels(
 
     if image is not None:
         fig.colorbar(image, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02, label="Count")
+    eval_role_title = "Source validation" if eval_role == "val" else "OOD"
     fig.suptitle(
-        f"Summed OOD raw confusion counts for {TARGET_SPECS[target_name]['title']} | feature size {requested_feature_size}",
+        f"{SELECTED_SCENARIO_TITLES[str(scenario_name)]}\n"
+        f"Summed {eval_role_title.lower()} raw confusion counts for {TARGET_SPECS[target_name]['title']} | feature size {requested_feature_size}",
         fontsize=14,
     )
-    out_path = OUTPUT_ROOT / f"{target_name}__k{int(requested_feature_size):03d}__ood_family_confusion_counts.png"
+    plot_dir = OUTPUT_ROOT / "plots" / str(scenario_name)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    out_path = plot_dir / f"{target_name}__k{int(requested_feature_size):03d}__{eval_role}_family_confusion_counts.png"
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.show()
 
@@ -2860,39 +3149,53 @@ def plot_feature_size_family_confusion_panels(
 export_selected_family_panel_tables(
     all_transfer_metrics_df,
     family_panel_selection_df,
-    selected_panel_confusion_ood_df,
+    selected_panel_confusion_df,
 )
 
 
-for target_name in TARGET_SPECS:
-    print(f"\nTarget: {TARGET_SPECS[target_name]['title']}")
-    for requested_feature_size in FEATURE_SIZE_GRID:
-        print(f"\nFeature size: {requested_feature_size}")
-        selection_view = family_panel_selection_df.loc[
-            family_panel_selection_df["target_name"].eq(target_name)
-            & family_panel_selection_df["requested_feature_size"].eq(int(requested_feature_size))
-        ]
-        display(selection_view)
-        plot_feature_size_family_transfer_panels(
-            all_transfer_metrics_df,
-            family_panel_selection_df,
-            target_name=target_name,
-            requested_feature_size=int(requested_feature_size),
-        )
-        plot_feature_size_family_confusion_panels(
-            selected_panel_confusion_ood_df,
-            target_name=target_name,
-            requested_feature_size=int(requested_feature_size),
-        )
+for scenario_name, scenario_title in SELECTED_SCENARIO_TITLES.items():
+    print(f"\nScenario: {scenario_title}")
+    for target_name in TARGET_SPECS:
+        print(f"\nTarget: {TARGET_SPECS[target_name]['title']}")
+        for requested_feature_size in FEATURE_SIZE_GRID:
+            print(f"\nFeature size: {requested_feature_size}")
+            selection_view = family_panel_selection_df.loc[
+                family_panel_selection_df["scenario_name"].eq(scenario_name)
+                & family_panel_selection_df["target_name"].eq(target_name)
+                & family_panel_selection_df["requested_feature_size"].eq(int(requested_feature_size))
+            ]
+            display(selection_view)
+            plot_feature_size_family_transfer_panels(
+                all_transfer_metrics_df,
+                family_panel_selection_df,
+                scenario_name=scenario_name,
+                target_name=target_name,
+                requested_feature_size=int(requested_feature_size),
+            )
+            plot_feature_size_family_confusion_panels(
+                selected_panel_confusion_val_df,
+                scenario_name=scenario_name,
+                target_name=target_name,
+                requested_feature_size=int(requested_feature_size),
+                eval_role="val",
+            )
+            plot_feature_size_family_confusion_panels(
+                selected_panel_confusion_ood_df,
+                scenario_name=scenario_name,
+                target_name=target_name,
+                requested_feature_size=int(requested_feature_size),
+                eval_role="ood",
+            )
 
+print(f"Scenarios: {', '.join(SELECTED_SCENARIO_TITLES.values())}")
 print(f"Model selection objective: {MODEL_SELECTION_OBJECTIVE}")
 print(f"Fixed logistic C: {LOGREG_C:g}")
 print(f"Fixed XGBoost max_depth: {XGB_MAX_DEPTH}")
-print("\nBest feature-space variant by target, feature size, and family:")
+print("\nBest feature-space variant by scenario, target, feature size, and family:")
 display(family_panel_selection_df)
-print("\nBest train-env model by target, feature size, and family:")
+print("\nBest train-env model by scenario, target, feature size, and family:")
 display(best_family_models_df)
-print(f"\nTop {TOP_FEATURES_TO_SHOW} features for the best model in each target/size/family panel:")
+print(f"\nTop {TOP_FEATURES_TO_SHOW} features for the best model in each scenario/target/size/family panel:")
 display(top_features_for_best_models_df)
 print("\nOutputs written to:")
 print(OUTPUT_ROOT)

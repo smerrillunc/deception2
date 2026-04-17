@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         default=None,
-        help="Optional explicit output directory. Defaults to the notebook's family-aware output path.",
+        help="Optional explicit output directory. Defaults to the notebook's scenario-aware output path.",
     )
     parser.add_argument(
         "--model-family",
@@ -44,13 +44,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--feature-sizes",
         default="32,64,128,256",
-        help="Comma-separated feature-size sweep for attention and PCA activation features.",
+        help="Comma-separated PCA feature-size sweep for activation-based feature spaces.",
+    )
+    parser.add_argument(
+        "--scenarios",
+        default="single_source_ood",
+        help=(
+            "Comma-separated scenario keys. Supported: single_source_ood, holdout_env_ood. "
+            "Example: single_source_ood,holdout_env_ood"
+        ),
     )
     parser.add_argument(
         "--attention-top-k",
         type=int,
         default=None,
-        help="Maximum ranked attention features to cache before slicing to each feature size.",
+        help="Legacy attention cache limit; ignored by the current hard same-sign-all attention pool.",
     )
     parser.add_argument(
         "--logreg-c",
@@ -96,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         "--per-root-limit",
         type=int,
         default=4,
-        help="Max ranked attention features taken from the same feature root.",
+        help="Legacy attention root cap; ignored by the current hard same-sign-all attention pool.",
     )
     parser.add_argument(
         "--root-batch-size",
@@ -163,6 +171,27 @@ def normalize_model_family(raw_value: str) -> str:
     raise ValueError(f"Unsupported model family: {raw_value!r}")
 
 
+def normalize_scenario_key(raw_value: str) -> str:
+    value = slugify(str(raw_value or "single_source_ood"))
+    aliases = {
+        "single_source_ood": "single_source_ood",
+        "train_one_eval_all": "single_source_ood",
+        "single_env_ood": "single_source_ood",
+        "one_to_all": "single_source_ood",
+        "holdout_env_ood": "holdout_env_ood",
+        "train_four_holdout_one": "holdout_env_ood",
+        "leave_one_env_out": "holdout_env_ood",
+        "four_to_one": "holdout_env_ood",
+    }
+    if value not in aliases:
+        raise ValueError(f"Unsupported scenario key: {raw_value!r}")
+    return aliases[value]
+
+
+def parse_scenarios(raw_value: str) -> list[str]:
+    return [normalize_scenario_key(part.strip()) for part in str(raw_value).split(",") if part.strip()]
+
+
 def first_csv_item(raw_value: str, *, cast: type[float] | type[int]) -> float | int:
     parts = [part.strip() for part in str(raw_value).split(",") if part.strip()]
     if not parts:
@@ -175,12 +204,14 @@ def resolve_output_root(
     source_path: Path,
     model_dirname: str,
     model_family: str,
+    scenarios: list[str],
     explicit_output_root: str | None,
 ) -> Path:
     if explicit_output_root:
         return Path(explicit_output_root)
+    scenario_slug = "__".join(slugify(scenario_name) for scenario_name in scenarios)
     return source_path.parent / (
-        f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(model_dirname)}__{slugify(model_family)}"
+        f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(model_dirname)}__{slugify(model_family)}__{scenario_slug}"
     )
 
 
@@ -195,6 +226,7 @@ def main() -> None:
 
     model_family = normalize_model_family(args.model_family)
     feature_sizes = [int(part.strip()) for part in str(args.feature_sizes).split(",") if part.strip()]
+    scenarios = parse_scenarios(args.scenarios)
     attention_top_k = int(args.attention_top_k) if args.attention_top_k is not None else max(feature_sizes)
     logreg_c = float(args.logreg_c)
     if args.c_grid:
@@ -206,6 +238,7 @@ def main() -> None:
         source_path=source_path,
         model_dirname=str(args.model_dirname),
         model_family=model_family,
+        scenarios=scenarios,
         explicit_output_root=args.output_root,
     )
 
@@ -216,6 +249,7 @@ def main() -> None:
     set_env("OOD_MAIN3_COMPANION_NOTEBOOK_ROOT", str(source_path.parent))
     set_env("OOD_MAIN3_COMPANION_OUTPUT_ROOT", str(output_root))
     set_env("OOD_MAIN3_COMPANION_FEATURE_SIZES", ",".join(str(value) for value in feature_sizes))
+    set_env("OOD_MAIN3_COMPANION_SCENARIOS", ",".join(scenarios))
     set_env("OOD_MAIN3_COMPANION_ATTENTION_TOP_K", str(attention_top_k))
     set_env("OOD_MAIN3_COMPANION_LOGREG_C", str(logreg_c))
     set_env("OOD_MAIN3_COMPANION_XGB_MAX_DEPTH", str(xgb_max_depth))
@@ -236,8 +270,9 @@ def main() -> None:
     print(f"Source: {source_path}")
     print(f"Model: {args.model_dirname}")
     print(f"Model family: {model_family}")
+    print(f"Scenarios: {scenarios}")
     print(f"Feature sizes: {feature_sizes}")
-    print(f"Attention top-k cache: {attention_top_k}")
+    print(f"Attention top-k cache (legacy): {attention_top_k}")
     print(f"Fixed logistic C: {logreg_c:g}")
     print(f"Fixed XGBoost max_depth: {xgb_max_depth}")
     if args.dataset_root:
