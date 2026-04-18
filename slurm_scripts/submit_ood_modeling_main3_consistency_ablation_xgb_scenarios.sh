@@ -19,8 +19,34 @@ DISABLE_TQDM="${DISABLE_TQDM:-1}"
 SHOW_PLOTS="${SHOW_PLOTS:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
-MODELS=(qwen7b gptoss20b llama8b)
-SCENARIOS=(single_source_ood holdout_env_ood)
+MODEL_PRESETS_CSV="${MODEL_PRESETS_CSV:-qwen7b,gptoss20b,llama8b}"
+SCENARIO_KEYS_CSV="${SCENARIO_KEYS_CSV:-single_source_ood,holdout_env_ood}"
+
+parse_csv_list() {
+  local raw="$1"
+  local part=""
+  local out=()
+  IFS=',' read -r -a parts <<< "$raw"
+  for part in "${parts[@]}"; do
+    part="${part//[[:space:]]/}"
+    if [[ -n "$part" ]]; then
+      out+=("$part")
+    fi
+  done
+  printf '%s\n' "${out[@]}"
+}
+
+mapfile -t MODELS < <(parse_csv_list "$MODEL_PRESETS_CSV")
+mapfile -t SCENARIOS < <(parse_csv_list "$SCENARIO_KEYS_CSV")
+
+if [[ ${#MODELS[@]} -eq 0 ]]; then
+  echo "MODEL_PRESETS_CSV did not contain any model presets." >&2
+  exit 1
+fi
+if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
+  echo "SCENARIO_KEYS_CSV did not contain any scenarios." >&2
+  exit 1
+fi
 
 slugify() {
   local raw="$1"
@@ -57,6 +83,8 @@ echo "Dataset root: $DATASET_ROOT"
 echo "Results root: $RESULTS_ROOT"
 echo "Log root: $LOG_ROOT"
 echo "Feature sizes: $FEATURE_SIZES"
+echo "Model presets: ${MODELS[*]}"
+echo "Scenarios: ${SCENARIOS[*]}"
 echo "CPUs per task: $CPUS_PER_TASK"
 echo "Memory: $MEMORY"
 echo "Time limit: $TIME_LIMIT"
