@@ -4,7 +4,7 @@
 #SBATCH --error=ood_main3_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64g
+#SBATCH --mem=100g
 #SBATCH --time=1-12:00:00
 
 set -euo pipefail
