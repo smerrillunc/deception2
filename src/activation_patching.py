@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
@@ -235,49 +236,229 @@ def replace_hidden_in_output(output: Any, new_hidden: torch.Tensor) -> Any:
     raise TypeError(f"Unsupported hooked output type: {type(output)}")
 
 
-def capture_last_token_hidden(
+def _sequence_slice(start: int, stop: int) -> slice:
+    if int(stop) < int(start):
+        raise ValueError(f"Invalid slice bounds: start={start}, stop={stop}")
+    return slice(int(start), int(stop))
+
+
+def _find_sequence_dim(tensor: torch.Tensor, expected_total_len: int | None = None) -> int:
+    if tensor.ndim < 2:
+        raise ValueError(f"Expected tensor with sequence axis, got shape={tuple(tensor.shape)}")
+    if expected_total_len is not None:
+        candidates = [idx for idx, size in enumerate(tensor.shape) if int(size) == int(expected_total_len)]
+        if candidates:
+            return candidates[-1]
+    if tensor.ndim == 3:
+        return 1
+    if tensor.ndim == 4:
+        return 2
+    return max(1, tensor.ndim - 2)
+
+
+def _slice_sequence_tensor(
+    tensor: torch.Tensor,
+    seq_slice: slice,
+    *,
+    expected_total_len: int | None = None,
+) -> torch.Tensor:
+    seq_dim = _find_sequence_dim(tensor, expected_total_len=expected_total_len)
+    index = [slice(None)] * tensor.ndim
+    index[seq_dim] = seq_slice
+    return tensor[tuple(index)].detach().clone()
+
+
+def _resize_sequence_tensor(
+    tensor: torch.Tensor,
+    target_len: int,
+    *,
+    expected_total_len: int | None = None,
+) -> torch.Tensor:
+    seq_dim = _find_sequence_dim(tensor, expected_total_len=expected_total_len)
+    current_len = int(tensor.shape[seq_dim])
+    if current_len == int(target_len):
+        return tensor.detach().clone()
+    if current_len <= 0 or int(target_len) <= 0:
+        raise ValueError(f"Cannot resize sequence length {current_len} -> {target_len}")
+
+    moved = tensor.movedim(seq_dim, -1)
+    flat = moved.reshape(-1, current_len).unsqueeze(1).to(dtype=torch.float32)
+    resized = F.interpolate(flat, size=int(target_len), mode="linear", align_corners=False)
+    restored = resized.squeeze(1).reshape(*moved.shape[:-1], int(target_len)).movedim(-1, seq_dim)
+    return restored.to(device=tensor.device, dtype=tensor.dtype)
+
+
+def _replace_sequence_slice(
+    target_tensor: torch.Tensor,
+    seq_slice: slice,
+    source_tensor: torch.Tensor,
+    *,
+    expected_total_len: int | None = None,
+) -> torch.Tensor:
+    seq_dim = _find_sequence_dim(target_tensor, expected_total_len=expected_total_len)
+    target_len = int(seq_slice.stop) - int(seq_slice.start)
+    replacement = _resize_sequence_tensor(
+        source_tensor,
+        target_len,
+        expected_total_len=None,
+    ).to(device=target_tensor.device, dtype=target_tensor.dtype)
+    out = target_tensor.clone()
+    index = [slice(None)] * out.ndim
+    index[seq_dim] = seq_slice
+    out[tuple(index)] = replacement
+    return out
+
+
+def _get_layer_cache_pair(past_key_values: Any, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        return past_key_values.key_cache[int(layer_idx)], past_key_values.value_cache[int(layer_idx)]
+    layer_cache = past_key_values[int(layer_idx)]
+    if isinstance(layer_cache, (list, tuple)) and len(layer_cache) >= 2:
+        return layer_cache[0], layer_cache[1]
+    raise TypeError(f"Unsupported cache structure for layer {layer_idx}: {type(layer_cache)}")
+
+
+def _set_layer_cache_pair(
+    past_key_values: Any,
+    layer_idx: int,
+    key_tensor: torch.Tensor,
+    value_tensor: torch.Tensor,
+) -> Any:
+    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        past_key_values.key_cache[int(layer_idx)] = key_tensor
+        past_key_values.value_cache[int(layer_idx)] = value_tensor
+        return past_key_values
+
+    outer = list(past_key_values)
+    inner = list(outer[int(layer_idx)])
+    inner[0] = key_tensor
+    inner[1] = value_tensor
+    outer[int(layer_idx)] = tuple(inner) if isinstance(outer[int(layer_idx)], tuple) else inner
+    return tuple(outer) if isinstance(past_key_values, tuple) else outer
+
+
+def _sample_next_token(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    top_p: float,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    logits = logits[:, -1, :] if logits.ndim == 3 else logits
+    if float(temperature) <= 0.0:
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    scaled = logits / max(float(temperature), 1e-5)
+    probs = torch.softmax(scaled, dim=-1)
+    if float(top_p) < 1.0:
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        mask = cumulative - sorted_probs > float(top_p)
+        sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+        denom = sorted_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        sorted_probs = sorted_probs / denom
+        sampled_sorted = torch.multinomial(sorted_probs, num_samples=1, generator=generator)
+        return sorted_indices.gather(-1, sampled_sorted)
+    return torch.multinomial(probs, num_samples=1, generator=generator)
+
+
+def _run_prefill_with_capture(
+    model: Any,
+    encoded: dict[str, torch.Tensor],
+    *,
+    capture_layers: Iterable[int],
+    capture_slice: slice,
+) -> tuple[dict[int, torch.Tensor], dict[int, tuple[torch.Tensor, torch.Tensor]]]:
+    layers, _ = resolve_decoder_layers(model)
+    seq_len = int(encoded["input_ids"].shape[1])
+    hidden_by_layer: dict[int, torch.Tensor] = {}
+    hooks = []
+
+    for layer_idx in capture_layers:
+        layer_idx = int(layer_idx)
+
+        def hook(_module: Any, _inputs: Any, output: Any, layer_idx: int = layer_idx) -> Any:
+            hidden = hidden_from_output(output)
+            hidden_by_layer[layer_idx] = _slice_sequence_tensor(
+                hidden,
+                capture_slice,
+                expected_total_len=seq_len,
+            )
+            return output
+
+        hooks.append(layers[layer_idx].register_forward_hook(hook))
+
+    try:
+        with torch.no_grad():
+            outputs = model(**encoded, use_cache=True, return_dict=True)
+    finally:
+        for handle in hooks:
+            handle.remove()
+
+    cache_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for layer_idx in capture_layers:
+        key_tensor, value_tensor = _get_layer_cache_pair(outputs.past_key_values, int(layer_idx))
+        cache_by_layer[int(layer_idx)] = (
+            _slice_sequence_tensor(key_tensor, capture_slice, expected_total_len=seq_len),
+            _slice_sequence_tensor(value_tensor, capture_slice, expected_total_len=seq_len),
+        )
+    return hidden_by_layer, cache_by_layer
+
+
+def prepare_sentence_patch_source(
     model: Any,
     tokenizer: Any,
-    text: str,
-    layer_idx: int,
     *,
+    donor_full_text: str,
+    donor_prefix_boundary_text: str,
     max_model_length: int,
-) -> torch.Tensor:
-    layers, _ = resolve_decoder_layers(model)
-    layer_module = layers[layer_idx]
+) -> dict[str, Any]:
     device = resolve_model_device(model)
-    encoded = encode_text_for_model(
+    donor_encoded = encode_text_for_model(
         tokenizer,
-        text,
+        donor_full_text,
         device=device,
         max_input_tokens=max_model_length,
     )
+    donor_boundary_encoded = encode_text_for_model(
+        tokenizer,
+        donor_prefix_boundary_text,
+        device=device,
+        max_input_tokens=max_model_length,
+    )
+    donor_boundary_len = int(donor_boundary_encoded["input_ids"].shape[1])
+    donor_total_len = int(donor_encoded["input_ids"].shape[1])
+    donor_sentence_slice = _sequence_slice(donor_boundary_len, donor_total_len)
+    layers, _ = resolve_decoder_layers(model)
+    capture_layers = tuple(range(len(layers)))
+    hidden_by_layer, cache_by_layer = _run_prefill_with_capture(
+        model,
+        donor_encoded,
+        capture_layers=capture_layers,
+        capture_slice=donor_sentence_slice,
+    )
+    return {
+        "full_text": donor_full_text,
+        "prefix_boundary_text": donor_prefix_boundary_text,
+        "encoded": donor_encoded,
+        "boundary_len": donor_boundary_len,
+        "total_len": donor_total_len,
+        "sentence_slice": donor_sentence_slice,
+        "sentence_token_count": donor_total_len - donor_boundary_len,
+        "hidden_by_layer": hidden_by_layer,
+        "cache_by_layer": cache_by_layer,
+    }
 
-    captured: dict[str, torch.Tensor] = {}
 
-    def hook(_module: Any, _inputs: Any, output: Any) -> Any:
-        hidden = hidden_from_output(output)
-        captured["hidden"] = hidden[:, -1, :].detach().clone()
-        return output
-
-    handle = layer_module.register_forward_hook(hook)
-    try:
-        with torch.no_grad():
-            model(**encoded, use_cache=True)
-    finally:
-        handle.remove()
-
-    return captured["hidden"]
-
-
-def generate_with_optional_patch(
+def generate_with_sentence_patch(
     model: Any,
     tokenizer: Any,
     *,
     target_text: str,
-    donor_text: str | None,
-    layer_idx: int | None,
-    donor_hidden: torch.Tensor | None,
+    target_prefix_boundary_text: str,
+    patch_label: str | None,
+    layer_indices: tuple[int, ...] | None,
+    donor_source: dict[str, Any] | None,
     max_model_length: int,
     max_new_tokens: int,
     temperature: float,
@@ -293,67 +474,117 @@ def generate_with_optional_patch(
         max_input_tokens=max_model_length,
     )
     target_len = int(encoded["input_ids"].shape[1])
-
+    target_boundary_encoded = encode_text_for_model(
+        tokenizer,
+        target_prefix_boundary_text,
+        device=device,
+        max_input_tokens=max_model_length,
+    )
+    target_boundary_len = int(target_boundary_encoded["input_ids"].shape[1])
+    target_sentence_slice = _sequence_slice(target_boundary_len, target_len)
     layers, layer_path = resolve_decoder_layers(model)
-    patch_handle = None
+    hooks = []
+    selected_layers = tuple(int(idx) for idx in (layer_indices or ()))
+    if selected_layers and donor_source is None:
+        raise ValueError("donor_source is required when patching layers.")
 
-    if layer_idx is not None:
-        if donor_text is None:
-            raise ValueError("donor_text is required when layer_idx is provided.")
-        if donor_hidden is None:
-            donor_hidden = capture_last_token_hidden(
-                model,
-                tokenizer,
-                donor_text,
-                int(layer_idx),
-                max_model_length=max_model_length,
-            )
-        patched_once = {"done": False}
+    for layer_idx in selected_layers:
+        donor_hidden = donor_source["hidden_by_layer"][layer_idx]
 
-        def patch_hook(_module: Any, _inputs: Any, output: Any) -> Any:
+        def patch_hook(_module: Any, _inputs: Any, output: Any, donor_hidden: torch.Tensor = donor_hidden) -> Any:
             hidden = hidden_from_output(output)
-            if (not patched_once["done"]) and hidden.shape[1] == target_len:
-                patched = hidden.clone()
-                patched[:, -1, :] = donor_hidden.to(device=hidden.device, dtype=hidden.dtype)
-                patched_once["done"] = True
-                return replace_hidden_in_output(output, patched)
-            return output
+            if int(hidden.shape[1]) != int(target_len):
+                return output
+            patched = _replace_sequence_slice(
+                hidden,
+                target_sentence_slice,
+                donor_hidden,
+                expected_total_len=target_len,
+            )
+            return replace_hidden_in_output(output, patched)
 
-        patch_handle = layers[int(layer_idx)].register_forward_hook(patch_hook)
+        hooks.append(layers[layer_idx].register_forward_hook(patch_hook))
 
     try:
         with torch.no_grad():
-            generated_ids = model.generate(
-                **encoded,
-                do_sample=True,
-                temperature=float(temperature),
-                top_p=float(top_p),
-                max_new_tokens=int(max_new_tokens),
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,
-            )
+            outputs = model(**encoded, use_cache=True, return_dict=True)
     finally:
-        if patch_handle is not None:
-            patch_handle.remove()
+        for handle in hooks:
+            handle.remove()
 
-    full_ids = generated_ids[0]
-    new_ids = full_ids[target_len:]
-    ended_with_eos = False
-    if tokenizer.eos_token_id is not None and int(full_ids.numel()) > 0:
-        ended_with_eos = int(full_ids[-1]) == int(tokenizer.eos_token_id)
-    n_new_tokens = int(new_ids.shape[0])
+    past_key_values = outputs.past_key_values
+    for layer_idx in selected_layers:
+        donor_key, donor_value = donor_source["cache_by_layer"][layer_idx]
+        key_tensor, value_tensor = _get_layer_cache_pair(past_key_values, layer_idx)
+        past_key_values = _set_layer_cache_pair(
+            past_key_values,
+            layer_idx,
+            _replace_sequence_slice(
+                key_tensor,
+                target_sentence_slice,
+                donor_key,
+                expected_total_len=target_len,
+            ),
+            _replace_sequence_slice(
+                value_tensor,
+                target_sentence_slice,
+                donor_value,
+                expected_total_len=target_len,
+            ),
+        )
+
+    generator_device = device if device.type != "cpu" else torch.device("cpu")
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(int(seed))
+
+    generated_token_ids: list[torch.Tensor] = []
+    next_token = _sample_next_token(
+        outputs.logits[:, -1, :],
+        temperature=float(temperature),
+        top_p=float(top_p),
+        generator=generator,
+    )
+    generated_token_ids.append(next_token)
+    ended_with_eos = tokenizer.eos_token_id is not None and int(next_token.item()) == int(tokenizer.eos_token_id)
+
+    while len(generated_token_ids) < int(max_new_tokens) and not ended_with_eos:
+        with torch.no_grad():
+            step_outputs = model(
+                input_ids=generated_token_ids[-1],
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+        past_key_values = step_outputs.past_key_values
+        next_token = _sample_next_token(
+            step_outputs.logits[:, -1, :],
+            temperature=float(temperature),
+            top_p=float(top_p),
+            generator=generator,
+        )
+        generated_token_ids.append(next_token)
+        ended_with_eos = tokenizer.eos_token_id is not None and int(next_token.item()) == int(tokenizer.eos_token_id)
+
+    if generated_token_ids:
+        new_ids = torch.cat(generated_token_ids, dim=1)
+    else:
+        new_ids = torch.empty((1, 0), dtype=encoded["input_ids"].dtype, device=encoded["input_ids"].device)
+    full_ids = torch.cat([encoded["input_ids"], new_ids], dim=1)[0]
+    n_new_tokens = int(new_ids.shape[1])
     hit_token_cap = n_new_tokens >= int(max_new_tokens)
     likely_truncated = bool(hit_token_cap and not ended_with_eos)
     return {
-        "generated_text": tokenizer.decode(new_ids, skip_special_tokens=True),
+        "generated_text": tokenizer.decode(new_ids[0], skip_special_tokens=True),
         "full_text": tokenizer.decode(full_ids, skip_special_tokens=True),
         "target_len": target_len,
+        "target_sentence_token_count": int(target_sentence_slice.stop) - int(target_sentence_slice.start),
         "n_new_tokens": n_new_tokens,
         "ended_with_eos": ended_with_eos,
         "hit_token_cap": hit_token_cap,
         "likely_truncated": likely_truncated,
-        "layer_idx": layer_idx,
+        "layer_idx": layer_indices[0] if layer_indices and len(layer_indices) == 1 else None,
+        "layer_indices": list(layer_indices or []),
+        "patch_label": patch_label,
         "layer_path": layer_path,
     }
 
@@ -635,9 +866,10 @@ def run_generation_condition(
     *,
     condition_name: str,
     target_text: str,
-    donor_text: str | None,
-    layer_idx: int | None,
-    donor_hidden: torch.Tensor | None,
+    target_prefix_boundary_text: str,
+    patch_label: str | None,
+    layer_indices: tuple[int, ...] | None,
+    donor_source: dict[str, Any] | None,
     required_rank: int,
     max_model_length: int,
     max_new_tokens: int,
@@ -645,13 +877,14 @@ def run_generation_condition(
     top_p: float,
     seed: int,
 ) -> dict[str, Any]:
-    generation = generate_with_optional_patch(
+    generation = generate_with_sentence_patch(
         model,
         tokenizer,
         target_text=target_text,
-        donor_text=donor_text,
-        layer_idx=layer_idx,
-        donor_hidden=donor_hidden,
+        target_prefix_boundary_text=target_prefix_boundary_text,
+        patch_label=patch_label,
+        layer_indices=layer_indices,
+        donor_source=donor_source,
         max_model_length=max_model_length,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
@@ -662,14 +895,18 @@ def run_generation_condition(
     first_sentence, remainder_text = extract_first_sentence(generation["generated_text"])
     return {
         "condition_name": condition_name,
-        "layer_idx": layer_idx,
+        "patch_label": generation["patch_label"],
+        "layer_idx": generation["layer_idx"],
+        "layer_indices": generation["layer_indices"],
+        "layer_count": len(generation["layer_indices"]),
         "seed": seed,
         "target_text": target_text,
-        "donor_text": donor_text,
+        "target_prefix_boundary_text": target_prefix_boundary_text,
         "first_generated_sentence": first_sentence,
         "remainder_text": remainder_text,
         "generated_text": generation["generated_text"],
         "full_text": generation["full_text"],
+        "target_sentence_token_count": generation["target_sentence_token_count"],
         "n_new_tokens": generation["n_new_tokens"],
         "ended_with_eos": generation["ended_with_eos"],
         "hit_token_cap": generation["hit_token_cap"],
@@ -703,9 +940,10 @@ def run_generation_condition_samples(
     *,
     condition_name: str,
     target_text: str,
-    donor_text: str | None,
-    layer_idx: int | None,
-    donor_hidden: torch.Tensor | None,
+    target_prefix_boundary_text: str,
+    patch_label: str | None,
+    layer_indices: tuple[int, ...] | None,
+    donor_source: dict[str, Any] | None,
     required_rank: int,
     max_model_length: int,
     max_new_tokens: int,
@@ -733,9 +971,10 @@ def run_generation_condition_samples(
             tokenizer,
             condition_name=condition_name,
             target_text=target_text,
-            donor_text=donor_text,
-            layer_idx=layer_idx,
-            donor_hidden=donor_hidden,
+            target_prefix_boundary_text=target_prefix_boundary_text,
+            patch_label=patch_label,
+            layer_indices=layer_indices,
+            donor_source=donor_source,
             required_rank=required_rank,
             max_model_length=max_model_length,
             max_new_tokens=max_new_tokens,
@@ -752,8 +991,8 @@ def run_generation_condition_samples(
 
 def summarize_deception_rate_samples(samples_df: pd.DataFrame) -> pd.DataFrame:
     summary_rows: list[dict[str, Any]] = []
-    grouped = samples_df.groupby(["condition_name", "layer_idx"], dropna=False, sort=False)
-    for (condition_name, layer_idx), group in grouped:
+    grouped = samples_df.groupby(["condition_name", "patch_label"], dropna=False, sort=False)
+    for (condition_name, patch_label), group in grouped:
         valid_df = group.loc[group["is_valid"].eq(True)].copy()
         n_samples = int(len(group))
         n_valid = int(len(valid_df))
@@ -766,7 +1005,10 @@ def summarize_deception_rate_samples(samples_df: pd.DataFrame) -> pd.DataFrame:
         summary_rows.append(
             {
                 "condition_name": condition_name,
-                "layer_idx": layer_idx,
+                "patch_label": patch_label,
+                "layer_idx": group["layer_idx"].dropna().iloc[0] if group["layer_idx"].notna().any() else pd.NA,
+                "layer_indices": json.dumps(group["layer_indices"].iloc[0]),
+                "layer_count": int(group["layer_count"].iloc[0]),
                 "n_samples": n_samples,
                 "n_valid": n_valid,
                 "n_invalid": n_invalid,
@@ -780,7 +1022,7 @@ def summarize_deception_rate_samples(samples_df: pd.DataFrame) -> pd.DataFrame:
         )
     summary_df = pd.DataFrame(summary_rows)
     if not summary_df.empty:
-        summary_df = summary_df.sort_values(["layer_idx", "condition_name"], na_position="first").reset_index(
+        summary_df = summary_df.sort_values(["patch_label", "condition_name"], na_position="first").reset_index(
             drop=True
         )
     return summary_df
@@ -799,14 +1041,48 @@ def build_default_layer_candidates(n_layers: int) -> list[int]:
     return sorted(set([0, n_layers // 4, n_layers // 2, (3 * n_layers) // 4, n_layers - 1]))
 
 
+def build_layer_group_conditions(n_layers: int) -> list[dict[str, Any]]:
+    layer_splits = [tuple(int(idx) for idx in split.tolist()) for split in np.array_split(np.arange(n_layers), 3)]
+    group_map = {
+        "Early": layer_splits[0],
+        "Mid": layer_splits[1],
+        "Late": layer_splits[2],
+    }
+
+    def merged(*names: str) -> tuple[int, ...]:
+        layers: list[int] = []
+        for name in names:
+            layers.extend(group_map[name])
+        return tuple(sorted(set(int(layer_idx) for layer_idx in layers)))
+
+    specs = [
+        ("patched_early", "Early", merged("Early")),
+        ("patched_mid", "Mid", merged("Mid")),
+        ("patched_late", "Late", merged("Late")),
+        ("patched_all", "All", tuple(range(int(n_layers)))),
+        ("patched_early_mid", "Early + Mid", merged("Early", "Mid")),
+        ("patched_early_late", "Early + Late", merged("Early", "Late")),
+        ("patched_mid_late", "Mid + Late", merged("Mid", "Late")),
+    ]
+    return [
+        {
+            "condition_name": str(condition_name),
+            "patch_label": str(patch_label),
+            "layer_indices": tuple(int(layer_idx) for layer_idx in layer_indices),
+        }
+        for condition_name, patch_label, layer_indices in specs
+        if layer_indices
+    ]
+
+
 def normalize_plot_rate_summary(rate_summary_df: pd.DataFrame) -> pd.DataFrame:
-    plot_df = rate_summary_df.dropna(subset=["layer_idx"]).copy()
+    plot_df = rate_summary_df.copy()
     if plot_df.empty:
         return plot_df
-    plot_df["layer_idx"] = plot_df["layer_idx"].astype(int)
+    plot_df["patch_label"] = plot_df["patch_label"].astype(str)
     for col in ("deception_rate", "ci_low", "ci_high"):
         plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
-    plot_df = plot_df.dropna(subset=["deception_rate", "ci_low", "ci_high"]).copy()
+    plot_df = plot_df.dropna(subset=["patch_label", "deception_rate", "ci_low", "ci_high"]).copy()
     if plot_df.empty:
         return plot_df
 
@@ -817,7 +1093,18 @@ def normalize_plot_rate_summary(rate_summary_df: pd.DataFrame) -> pd.DataFrame:
 
     for col in ("deception_rate", "ci_low", "ci_high"):
         plot_df[col] = plot_df[col].clip(lower=0.0, upper=1.0)
-    plot_df = plot_df.sort_values("layer_idx").reset_index(drop=True)
+    preferred_order = [
+        "Early",
+        "Mid",
+        "Late",
+        "All",
+        "Early + Mid",
+        "Early + Late",
+        "Mid + Late",
+    ]
+    rank_map = {label: idx for idx, label in enumerate(preferred_order)}
+    plot_df["_plot_rank"] = plot_df["patch_label"].map(lambda label: rank_map.get(label, len(rank_map)))
+    plot_df = plot_df.sort_values(["_plot_rank", "patch_label"]).reset_index(drop=True)
     return plot_df
 
 
@@ -829,9 +1116,10 @@ def plot_rate_summary(rate_summary_df: pd.DataFrame, *, out_path: Path, sample_c
     upper_err = np.maximum(plot_df["ci_high"] - plot_df["deception_rate"], 0.0)
     yerr = np.vstack([lower_err.to_numpy(dtype=float), upper_err.to_numpy(dtype=float)])
 
-    plt.figure(figsize=(7.6, 4.6))
+    x_positions = np.arange(len(plot_df))
+    plt.figure(figsize=(9.0, 4.8))
     plt.errorbar(
-        plot_df["layer_idx"],
+        x_positions,
         plot_df["deception_rate"],
         yerr=yerr,
         fmt="o-",
@@ -840,9 +1128,10 @@ def plot_rate_summary(rate_summary_df: pd.DataFrame, *, out_path: Path, sample_c
         markersize=7,
     )
     plt.ylim(-0.02, 1.02)
-    plt.xlabel("Patched layer")
+    plt.xticks(x_positions, plot_df["patch_label"], rotation=25, ha="right")
+    plt.xlabel("Patched layer group")
     plt.ylabel(f"Deception rate across {sample_count} samples")
-    plt.title("Activation patching: deception rate by patched layer")
+    plt.title("Activation patching: deception rate by patched layer group")
     plt.grid(axis="y", alpha=0.25)
     plt.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close()
@@ -1040,9 +1329,7 @@ def main(argv: list[str] | None = None) -> None:
 
     layers, layer_path = resolve_decoder_layers(model)
     n_layers = len(layers)
-    layer_candidates = parse_layer_candidates(args.layer_candidates)
-    if layer_candidates is None:
-        layer_candidates = build_default_layer_candidates(n_layers)
+    patch_conditions = build_layer_group_conditions(n_layers)
 
     token_debug_df = pd.DataFrame(
         [
@@ -1066,6 +1353,31 @@ def main(argv: list[str] | None = None) -> None:
             ),
         ]
     )
+    target_shared_boundary_text = target_commitment_prompt + shared_context_text
+    donor_shared_boundary_text = donor_prompt_text + donor_shared_prefix_text
+    target_sentence_token_count = (
+        int(
+            encode_text_for_model(
+                tokenizer,
+                target_model_input,
+                max_input_tokens=int(args.max_model_length),
+            )["input_ids"].shape[1]
+        )
+        - int(
+            encode_text_for_model(
+                tokenizer,
+                target_shared_boundary_text,
+                max_input_tokens=int(args.max_model_length),
+            )["input_ids"].shape[1]
+        )
+    )
+    donor_source = prepare_sentence_patch_source(
+        model,
+        tokenizer,
+        donor_full_text=donor_model_input,
+        donor_prefix_boundary_text=donor_shared_boundary_text,
+        max_model_length=int(args.max_model_length),
+    )
     token_debug_df.to_csv(output_root / "token_debug.csv", index=False)
 
     run_config = {
@@ -1083,7 +1395,14 @@ def main(argv: list[str] | None = None) -> None:
         "requested_total_tokens": requested_total_tokens,
         "decoder_layer_path": layer_path,
         "n_layers": int(n_layers),
-        "layer_candidates": [int(layer_idx) for layer_idx in layer_candidates],
+        "patch_conditions": [
+            {
+                "condition_name": condition["condition_name"],
+                "patch_label": condition["patch_label"],
+                "layer_indices": [int(layer_idx) for layer_idx in condition["layer_indices"]],
+            }
+            for condition in patch_conditions
+        ],
         "example_id": payload["example_id"],
         "required_rank": required_rank,
         "shared_context_sentence_pos": left_pos,
@@ -1091,6 +1410,8 @@ def main(argv: list[str] | None = None) -> None:
         "shared_context_deception_rate": float(shared_context_entry["deception_rate"]),
         "commitment_deception_rate": float(target_commitment_entry["deception_rate"]),
         "commitment_delta": commitment_delta,
+        "target_sentence_token_count": int(target_sentence_token_count),
+        "donor_sentence_token_count": int(donor_source["sentence_token_count"]),
         "selected_donor_generation_idx": int(selected_donor_row["gen_idx"]),
         "selected_donor_sentence": donor_sentence,
         "selected_donor_cards_played": to_json_safe(selected_donor_row.get("cards_played")),
@@ -1104,38 +1425,41 @@ def main(argv: list[str] | None = None) -> None:
     debug_conditions = [
         {
             "condition_name": "unpatched_deceptive_prefix",
+            "patch_label": "Unpatched deceptive prefix",
             "target_text": target_model_input,
-            "donor_text": None,
-            "layer_idx": None,
+            "target_prefix_boundary_text": target_shared_boundary_text,
+            "layer_indices": (),
             "seed": int(args.base_seed),
         },
         {
             "condition_name": "unpatched_truthful_donor_prefix",
+            "patch_label": "Unpatched truthful donor prefix",
             "target_text": donor_model_input,
-            "donor_text": None,
-            "layer_idx": None,
+            "target_prefix_boundary_text": donor_shared_boundary_text,
+            "layer_indices": (),
             "seed": int(args.base_seed) + 100,
         },
     ]
-    for offset, layer_idx in enumerate(layer_candidates):
+    for offset, condition in enumerate(patch_conditions):
         debug_conditions.append(
             {
-                "condition_name": f"patched_layer_{int(layer_idx)}",
+                "condition_name": str(condition["condition_name"]),
+                "patch_label": str(condition["patch_label"]),
                 "target_text": target_model_input,
-                "donor_text": donor_model_input,
-                "layer_idx": int(layer_idx),
+                "target_prefix_boundary_text": target_shared_boundary_text,
+                "layer_indices": tuple(int(layer_idx) for layer_idx in condition["layer_indices"]),
                 "seed": int(args.base_seed) + 1_000 + offset,
             }
         )
 
     print(
-        f"Activation patching run for {payload['example_id']} with {len(layer_candidates)} patched layers "
-        f"and {int(args.rate_sample_count)} rate samples per layer."
+        f"Activation patching run for {payload['example_id']} with {len(patch_conditions)} patch conditions "
+        f"and {int(args.rate_sample_count)} rate samples per condition."
     )
     print(
         "Rate sweep workload: "
-        f"{len(layer_candidates)} layers x {int(args.rate_sample_count)} samples = "
-        f"{len(layer_candidates) * int(args.rate_sample_count)} generations "
+        f"{len(patch_conditions)} conditions x {int(args.rate_sample_count)} samples = "
+        f"{len(patch_conditions) * int(args.rate_sample_count)} generations "
         f"(max_new_tokens={int(args.max_new_tokens)})."
     )
 
@@ -1143,14 +1467,20 @@ def main(argv: list[str] | None = None) -> None:
         [
             {
                 "condition_name": "localization_shared_context_reference",
+                "patch_label": "Localization shared context",
                 "layer_idx": pd.NA,
+                "layer_indices": "[]",
+                "layer_count": 0,
                 "reference_deception_rate": float(shared_context_entry["deception_rate"]),
                 "n_valid": int(shared_context_entry["num_valid"]),
                 "n_deceptive": int(shared_context_entry["num_valid"] - shared_context_entry["num_truthful"]),
             },
             {
                 "condition_name": "localization_deceptive_prefix_reference",
+                "patch_label": "Localization deceptive prefix",
                 "layer_idx": pd.NA,
+                "layer_indices": "[]",
+                "layer_count": 0,
                 "reference_deception_rate": float(target_commitment_entry["deception_rate"]),
                 "n_valid": int(target_commitment_entry["num_valid"]),
                 "n_deceptive": int(target_commitment_entry["num_valid"] - target_commitment_entry["num_truthful"]),
@@ -1174,9 +1504,10 @@ def main(argv: list[str] | None = None) -> None:
                 tokenizer,
                 condition_name=str(condition["condition_name"]),
                 target_text=str(condition["target_text"]),
-                donor_text=condition["donor_text"],
-                layer_idx=condition["layer_idx"],
-                donor_hidden=None,
+                target_prefix_boundary_text=str(condition["target_prefix_boundary_text"]),
+                patch_label=condition["patch_label"],
+                layer_indices=tuple(int(layer_idx) for layer_idx in condition["layer_indices"]),
+                donor_source=donor_source if condition["layer_indices"] else None,
                 required_rank=required_rank,
                 max_model_length=int(args.max_model_length),
                 max_new_tokens=int(args.max_new_tokens),
@@ -1189,43 +1520,26 @@ def main(argv: list[str] | None = None) -> None:
     debug_df.to_csv(output_root / "debug_generations.csv", index=False)
     write_jsonl(output_root / "debug_generations.jsonl", debug_rows)
 
-    donor_hidden_map: dict[int, torch.Tensor] = {}
-    donor_capture_iter = maybe_tqdm(
-        layer_candidates,
-        desc="Capture donor activations",
-        total=len(layer_candidates),
-        disable=bool(args.disable_tqdm),
-        leave=False,
-    )
-    for layer_idx in donor_capture_iter:
-        donor_hidden_map[int(layer_idx)] = capture_last_token_hidden(
-            model,
-            tokenizer,
-            donor_model_input,
-            int(layer_idx),
-            max_model_length=int(args.max_model_length),
-        )
-
     rate_sample_frames: list[pd.DataFrame] = []
-    total_rate_samples = len(layer_candidates) * int(args.rate_sample_count)
+    total_rate_samples = len(patch_conditions) * int(args.rate_sample_count)
     if bool(args.disable_tqdm) or _tqdm is None:
         rate_progress = None
     else:
         rate_progress = _tqdm(total=total_rate_samples, desc="Rate sweep generations", leave=True)
     try:
-        for offset, layer_idx in enumerate(layer_candidates):
-            layer_idx = int(layer_idx)
+        for offset, condition in enumerate(patch_conditions):
             if rate_progress is not None:
-                rate_progress.set_postfix_str(f"layer={layer_idx}")
+                rate_progress.set_postfix_str(str(condition["patch_label"]))
             rate_sample_frames.append(
                 run_generation_condition_samples(
                     model,
                     tokenizer,
-                    condition_name=f"patched_layer_{layer_idx}",
+                    condition_name=str(condition["condition_name"]),
                     target_text=target_model_input,
-                    donor_text=donor_model_input,
-                    layer_idx=layer_idx,
-                    donor_hidden=donor_hidden_map[layer_idx],
+                    target_prefix_boundary_text=target_shared_boundary_text,
+                    patch_label=str(condition["patch_label"]),
+                    layer_indices=tuple(int(layer_idx) for layer_idx in condition["layer_indices"]),
+                    donor_source=donor_source,
                     required_rank=required_rank,
                     max_model_length=int(args.max_model_length),
                     max_new_tokens=int(args.max_new_tokens),
@@ -1235,7 +1549,7 @@ def main(argv: list[str] | None = None) -> None:
                     n_samples=int(args.rate_sample_count),
                     disable_tqdm=bool(args.disable_tqdm),
                     progress_bar=rate_progress,
-                    progress_desc=f"patched_layer_{layer_idx}",
+                    progress_desc=str(condition["patch_label"]),
                 )
             )
     finally:
