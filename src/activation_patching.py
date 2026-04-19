@@ -799,20 +799,41 @@ def build_default_layer_candidates(n_layers: int) -> list[int]:
     return sorted(set([0, n_layers // 4, n_layers // 2, (3 * n_layers) // 4, n_layers - 1]))
 
 
-def plot_rate_summary(rate_summary_df: pd.DataFrame, *, out_path: Path, sample_count: int) -> None:
+def normalize_plot_rate_summary(rate_summary_df: pd.DataFrame) -> pd.DataFrame:
     plot_df = rate_summary_df.dropna(subset=["layer_idx"]).copy()
     if plot_df.empty:
-        return
+        return plot_df
     plot_df["layer_idx"] = plot_df["layer_idx"].astype(int)
-    plot_df = plot_df.sort_values("layer_idx")
-    lower_err = plot_df["deception_rate"] - plot_df["ci_low"]
-    upper_err = plot_df["ci_high"] - plot_df["deception_rate"]
+    for col in ("deception_rate", "ci_low", "ci_high"):
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+    plot_df = plot_df.dropna(subset=["deception_rate", "ci_low", "ci_high"]).copy()
+    if plot_df.empty:
+        return plot_df
+
+    # Numerical noise can occasionally make the CI endpoints cross the point estimate
+    # by tiny amounts; clamp them into a valid closed interval for plotting.
+    plot_df["ci_low"] = np.minimum(plot_df["ci_low"], plot_df["deception_rate"])
+    plot_df["ci_high"] = np.maximum(plot_df["ci_high"], plot_df["deception_rate"])
+
+    for col in ("deception_rate", "ci_low", "ci_high"):
+        plot_df[col] = plot_df[col].clip(lower=0.0, upper=1.0)
+    plot_df = plot_df.sort_values("layer_idx").reset_index(drop=True)
+    return plot_df
+
+
+def plot_rate_summary(rate_summary_df: pd.DataFrame, *, out_path: Path, sample_count: int) -> None:
+    plot_df = normalize_plot_rate_summary(rate_summary_df)
+    if plot_df.empty:
+        return
+    lower_err = np.maximum(plot_df["deception_rate"] - plot_df["ci_low"], 0.0)
+    upper_err = np.maximum(plot_df["ci_high"] - plot_df["deception_rate"], 0.0)
+    yerr = np.vstack([lower_err.to_numpy(dtype=float), upper_err.to_numpy(dtype=float)])
 
     plt.figure(figsize=(7.6, 4.6))
     plt.errorbar(
         plot_df["layer_idx"],
         plot_df["deception_rate"],
-        yerr=np.vstack([lower_err, upper_err]),
+        yerr=yerr,
         fmt="o-",
         capsize=4,
         linewidth=2,
@@ -829,7 +850,7 @@ def plot_rate_summary(rate_summary_df: pd.DataFrame, *, out_path: Path, sample_c
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Activation patching sweep for BS localization examples.")
-    parser.add_argument("--localization-path", type=str, required=True)
+    parser.add_argument("--localization-path", type=str, default="")
     parser.add_argument(
         "--model-name-or-path",
         type=str,
@@ -866,10 +887,37 @@ def main(argv: list[str] | None = None) -> None:
         default=str(ROOT_DIR / "Results" / "activation_patching"),
     )
     parser.add_argument("--run-tag", type=str, default="")
+    parser.add_argument(
+        "--plot-only-run-dir",
+        type=str,
+        default="",
+        help="Skip generation and rebuild the rate-summary plot from an existing run directory.",
+    )
     parser.add_argument("--disable-tqdm", action="store_true", default=False)
     args = parser.parse_args(argv)
 
+    if args.plot_only_run_dir.strip():
+        run_dir = Path(args.plot_only_run_dir).expanduser().resolve()
+        rate_summary_path = run_dir / "rate_summary.csv"
+        run_config_path = run_dir / "run_config.json"
+        if not rate_summary_path.exists():
+            raise FileNotFoundError(rate_summary_path)
+        rate_summary_df = pd.read_csv(rate_summary_path)
+        sample_count = 0
+        if run_config_path.exists():
+            run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+            sample_count = int(run_config.get("rate_sample_count", 0) or 0)
+        plot_rate_summary(
+            rate_summary_df,
+            out_path=run_dir / "rate_summary.png",
+            sample_count=sample_count,
+        )
+        print(f"Rebuilt rate summary plot at {run_dir / 'rate_summary.png'}")
+        return
+
     localization_path = Path(args.localization_path).expanduser().resolve()
+    if not args.localization_path.strip():
+        raise ValueError("--localization-path is required unless --plot-only-run-dir is set.")
     if not localization_path.exists():
         raise FileNotFoundError(localization_path)
     if int(args.max_model_length) <= 0:
@@ -907,6 +955,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     output_root = Path(args.output_root).expanduser().resolve() / run_tag
     output_root.mkdir(parents=True, exist_ok=True)
+    print(f"Output root: {output_root}")
 
     shutil.copy2(localization_path, output_root / "source_localization.json")
 
@@ -974,7 +1023,7 @@ def main(argv: list[str] | None = None) -> None:
     model_kwargs = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
-        "torch_dtype": torch.bfloat16,
+        "dtype": torch.bfloat16,
         "device_map": single_gpu_device_map(cuda_device),
     }
     model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
