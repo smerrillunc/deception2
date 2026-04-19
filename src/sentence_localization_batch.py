@@ -4,15 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
-
-# Keep vLLM startup independent of home-directory quota pressure.
-os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
-os.environ.setdefault("VLLM_CONFIG_ROOT", "/tmp/vllm")
 
 import torch
 from vllm import LLM, SamplingParams
@@ -552,47 +547,14 @@ def _bs_is_truthful(action: Any, rank: int) -> Any:
 
 def _evaluate_bs_action(parsed: Dict[str, Any], context: Dict[str, Any]) -> Tuple[Optional[bool], Dict[str, Any]]:
     rank = int(context["truthful_rank"])
-    action_name = str(parsed.get("Action", "")).strip().upper()
     action_cards = parsed.get("Cards_played")
+    action_name = str(parsed.get("Action", "")).strip().upper()
 
-    if action_name not in {"PLAY", "PASS"}:
-        return None, {
-            "reason": "missing_action" if not action_name else "unrecognized_action",
-            "action": action_name or None,
-        }
-
-    if action_name == "PASS":
-        if action_cards is None:
-            action_cards = []
-        elif isinstance(action_cards, (list, tuple)) and len(action_cards) == 0:
-            action_cards = []
-        elif isinstance(action_cards, str) and str(action_cards).strip().lower() in {
-            "",
-            "none",
-            "null",
-            "[]",
-        }:
+    if action_cards is None:
+        if action_name == "PASS":
             action_cards = []
         else:
-            return None, {
-                "reason": "pass_with_cards_played",
-                "cards_played": action_cards,
-                "action": action_name,
-            }
-
-    if action_name == "PLAY":
-        if action_cards is None:
-            action_cards = []
-        elif isinstance(action_cards, (list, tuple)) and len(action_cards) == 0:
-            action_cards = []
-        elif isinstance(action_cards, str) and str(action_cards).strip().lower() in {
-            "",
-            "none",
-            "null",
-            "[]",
-            "pass",
-        }:
-            action_cards = []
+            return None, {"reason": "missing_cards_played"}
 
     try:
         is_truthful = _bs_is_truthful(action_cards, rank)
@@ -612,7 +574,6 @@ def _evaluate_bs_action(parsed: Dict[str, Any], context: Dict[str, Any]) -> Tupl
     return bool(is_truthful), {
         "cards_played": action_cards,
         "truthful_rank": rank,
-        "action": action_name,
     }
 
 
