@@ -23,6 +23,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
 
 try:
     from tqdm.auto import tqdm as _tqdm
@@ -337,6 +338,16 @@ def _set_layer_cache_pair(
     return tuple(outer) if isinstance(past_key_values, tuple) else outer
 
 
+def _ensure_decode_cache(past_key_values: Any) -> Any:
+    if past_key_values is None:
+        return None
+    if hasattr(past_key_values, "get_seq_length"):
+        return past_key_values
+    if isinstance(past_key_values, (list, tuple)):
+        return DynamicCache.from_legacy_cache(tuple(past_key_values))
+    return past_key_values
+
+
 def _sample_next_token(
     logits: torch.Tensor,
     *,
@@ -532,6 +543,7 @@ def generate_with_sentence_patch(
                 expected_total_len=target_len,
             ),
         )
+    past_key_values = _ensure_decode_cache(past_key_values)
 
     generator_device = device if device.type != "cpu" else torch.device("cpu")
     generator = torch.Generator(device=generator_device)
