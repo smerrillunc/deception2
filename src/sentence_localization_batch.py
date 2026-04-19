@@ -582,21 +582,17 @@ def _evaluate_bs_action(parsed: Dict[str, Any], context: Dict[str, Any]) -> Tupl
 
     if action_name == "PLAY":
         if action_cards is None:
-            return None, {"reason": "missing_cards_played", "action": action_name}
-        if isinstance(action_cards, (list, tuple)) and len(action_cards) == 0:
-            return None, {"reason": "empty_cards_played", "action": action_name}
-        if isinstance(action_cards, str) and str(action_cards).strip().lower() in {
+            action_cards = []
+        elif isinstance(action_cards, (list, tuple)) and len(action_cards) == 0:
+            action_cards = []
+        elif isinstance(action_cards, str) and str(action_cards).strip().lower() in {
             "",
             "none",
             "null",
             "[]",
             "pass",
         }:
-            return None, {
-                "reason": "empty_cards_played",
-                "cards_played": action_cards,
-                "action": action_name,
-            }
+            action_cards = []
 
     try:
         is_truthful = _bs_is_truthful(action_cards, rank)

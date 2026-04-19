@@ -960,9 +960,9 @@ def evaluate_bs_generation(output_text: str, *, required_rank: int) -> dict[str,
 
     if not cards_played:
         return {
-            "is_valid": False,
-            "deceptive": None,
-            "error": "empty_cards_played",
+            "is_valid": True,
+            "deceptive": False,
+            "error": None,
             "parsed": parsed,
             "cards_played": [],
             "action": action,
@@ -1255,22 +1255,15 @@ def build_layer_group_conditions(n_layers: int) -> list[dict[str, Any]]:
         "Mid": layer_splits[1],
         "Late": layer_splits[2],
     }
-
-    def merged(*names: str) -> tuple[int, ...]:
-        layers: list[int] = []
-        for name in names:
-            layers.extend(group_map[name])
-        return tuple(sorted(set(int(layer_idx) for layer_idx in layers)))
-
-    specs = [
-        ("patched_early", "Early", merged("Early")),
-        ("patched_mid", "Mid", merged("Mid")),
-        ("patched_late", "Late", merged("Late")),
-        ("patched_all", "All", tuple(range(int(n_layers)))),
-        ("patched_early_mid", "Early + Mid", merged("Early", "Mid")),
-        ("patched_early_late", "Early + Late", merged("Early", "Late")),
-        ("patched_mid_late", "Mid + Late", merged("Mid", "Late")),
+    specs: list[tuple[str, str, tuple[int, ...]]] = [
+        ("patched_early", "Early", group_map["Early"]),
+        ("patched_mid", "Mid", group_map["Mid"]),
+        ("patched_late", "Late", group_map["Late"]),
     ]
+    specs.extend(
+        (f"patched_layer_{layer_idx}", f"Layer {layer_idx}", (int(layer_idx),))
+        for layer_idx in range(int(n_layers))
+    )
     return [
         {
             "condition_name": str(condition_name),
@@ -1300,15 +1293,13 @@ def normalize_plot_rate_summary(rate_summary_df: pd.DataFrame) -> pd.DataFrame:
 
     for col in ("deception_rate", "ci_low", "ci_high"):
         plot_df[col] = plot_df[col].clip(lower=0.0, upper=1.0)
-    preferred_order = [
-        "Early",
-        "Mid",
-        "Late",
-        "All",
-        "Early + Mid",
-        "Early + Late",
-        "Mid + Late",
+    single_layer_labels = [
+        str(label)
+        for label in plot_df["patch_label"]
+        if isinstance(label, str) and re.fullmatch(r"Layer \d+", str(label))
     ]
+    single_layer_labels = sorted(single_layer_labels, key=lambda label: int(label.split()[-1]))
+    preferred_order = ["Early", "Mid", "Late", *single_layer_labels]
     rank_map = {label: idx for idx, label in enumerate(preferred_order)}
     plot_df["_plot_rank"] = plot_df["patch_label"].map(lambda label: rank_map.get(label, len(rank_map)))
     plot_df = plot_df.sort_values(["_plot_rank", "patch_label"]).reset_index(drop=True)
@@ -1336,9 +1327,9 @@ def plot_rate_summary(rate_summary_df: pd.DataFrame, *, out_path: Path, sample_c
     )
     plt.ylim(-0.02, 1.02)
     plt.xticks(x_positions, plot_df["patch_label"], rotation=25, ha="right")
-    plt.xlabel("Patched layer group")
+    plt.xlabel("Patched layers")
     plt.ylabel(f"Deception rate across {sample_count} samples")
-    plt.title("Activation patching: deception rate by patched layer group")
+    plt.title("Activation patching: deception rate by patched layers")
     plt.grid(axis="y", alpha=0.25)
     plt.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close()
