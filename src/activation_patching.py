@@ -69,6 +69,13 @@ def load_payload(path: Path) -> dict[str, Any]:
 
 
 def to_json_safe(obj: Any) -> Any:
+    if obj is pd.NA:
+        return None
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
     if isinstance(obj, dict):
         return {str(key): to_json_safe(value) for key, value in obj.items()}
     if isinstance(obj, list):
@@ -129,6 +136,238 @@ def summarize_entry_generations(entry: dict[str, Any]) -> dict[str, Any]:
         "n_generations_deceptive": deceptive_count,
         "saved_deception_rate": float(entry.get("deception_rate", float("nan"))),
     }
+
+
+def extract_first_sentence(text: str) -> tuple[str, str]:
+    clean = str(text).lstrip()
+    if not clean:
+        return "", ""
+
+    match = re.match(r"(.+?[.!?](?:[\"')\]]*)?)(?:\s+|$)(.*)", clean, flags=re.S)
+    if match:
+        first_sentence = match.group(1).strip()
+        remainder = match.group(2).lstrip()
+        return first_sentence, remainder
+
+    json_start = clean.find("{")
+    if json_start > 0:
+        first_sentence = clean[:json_start].strip()
+        remainder = clean[json_start:].lstrip()
+        return first_sentence, remainder
+
+    return clean.strip(), ""
+
+
+def normalize_sentence_for_compare(text: str) -> str:
+    lowered = re.sub(r"\s+", " ", str(text).strip().lower())
+    return lowered.strip(" .!?\"'")
+
+
+def card_rank(card: Any) -> str | None:
+    text = str(card).strip()
+    if not text or text.lower() in {"none", "null"}:
+        return None
+    match = re.match(r"^(10|[1-9])", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _truthful_generation_rows_from_entry(entry: dict[str, Any]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for gen_idx, generation in enumerate(entry.get("generations") or []):
+        first_sentence, remainder_text = extract_first_sentence(generation.get("gen_text", ""))
+        evaluation = generation.get("evaluation") if isinstance(generation.get("evaluation"), dict) else {}
+        rows.append(
+            {
+                "gen_idx": int(gen_idx),
+                "prompt": generation.get("prompt", entry.get("prompt", "")),
+                "prefix_text": generation.get("prefix_text", entry.get("prefix_text", "")),
+                "gen_text": generation.get("gen_text", ""),
+                "full_generation_text": generation.get("full_generation_text", ""),
+                "first_sentence": first_sentence,
+                "remainder_text": remainder_text,
+                "is_truthful": generation.get("is_truthful"),
+                "deceptive": generation.get("deceptive"),
+                "parse_error": generation.get("parse_error"),
+                "cards_played": evaluation.get("cards_played"),
+                "action": evaluation.get("action"),
+                "evaluation": generation.get("evaluation"),
+                "parsed": generation.get("parsed"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _bs_honest_donor_clarity_score(
+    *,
+    first_sentence: str,
+    required_rank: int | None,
+    cards_played: Any,
+) -> float:
+    text = normalize_sentence_for_compare(first_sentence)
+    if not text:
+        return float("-inf")
+
+    score = 0.0
+    text_len = len(text)
+    score -= 0.0025 * max(text_len - 80, 0)
+    if text_len <= 160:
+        score += 0.4
+
+    if required_rank is not None:
+        rank_text = str(int(required_rank))
+        if re.search(rf"\b{re.escape(rank_text)}s?\b", text):
+            score += 1.25
+        if any(phrase in text for phrase in [f"don't have any {rank_text}", f"do not have any {rank_text}", f"no {rank_text}s"]):
+            score += 1.5
+
+    pass_phrases = [
+        "playing nothing",
+        "play nothing",
+        "pass",
+        "passing",
+        "shouldn't play anything",
+        "should not play anything",
+        "don't have any",
+        "do not have any",
+    ]
+    for phrase in pass_phrases:
+        if phrase in text:
+            score += 0.75
+
+    card_list = cards_played if isinstance(cards_played, list) else []
+    normalized_cards = [str(card).strip() for card in card_list if str(card).strip()]
+    if not normalized_cards:
+        score += 0.35
+    else:
+        score += 0.15 * min(len(normalized_cards), 4)
+        ranked = [card_rank(card) for card in normalized_cards]
+        if required_rank is not None and ranked and all(rank == str(int(required_rank)) for rank in ranked if rank is not None):
+            score += 1.0
+    return score
+
+
+def find_history_positions(payload: dict[str, Any]) -> tuple[int | None, int | None]:
+    left_pos = find_history_pos_by_end_idx(payload, payload.get("left_sentence_end_idx"))
+    right_pos = find_history_pos_by_end_idx(payload, payload.get("right_sentence_end_idx"))
+    return left_pos, right_pos
+
+
+def choose_honest_donor_generation(
+    entry: dict[str, Any],
+    *,
+    target_commitment_sentence: str,
+    required_rank: int | None,
+    manual_generation_index: int | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    generations_df = _truthful_generation_rows_from_entry(entry)
+    generations_df["normalized_first_sentence"] = generations_df["first_sentence"].map(normalize_sentence_for_compare)
+    target_sentence_norm = normalize_sentence_for_compare(target_commitment_sentence)
+    generations_df["same_as_target_sentence"] = generations_df["normalized_first_sentence"].eq(target_sentence_norm)
+    generations_df["first_sentence_len"] = generations_df["first_sentence"].astype(str).str.len().fillna(0)
+    generations_df["honest_clarity_score"] = generations_df.apply(
+        lambda row: _bs_honest_donor_clarity_score(
+            first_sentence=str(row["first_sentence"]),
+            required_rank=required_rank,
+            cards_played=row["cards_played"],
+        ),
+        axis=1,
+    )
+    generations_df["accepted_truthful_donor"] = (
+        generations_df["is_truthful"].eq(True)
+        & generations_df["first_sentence"].astype(str).str.len().gt(0)
+        & ~generations_df["same_as_target_sentence"]
+        & np.isfinite(generations_df["honest_clarity_score"])
+    )
+
+    if manual_generation_index is not None:
+        selected = generations_df.loc[generations_df["gen_idx"].eq(int(manual_generation_index))]
+        if selected.empty:
+            raise ValueError(f"manual donor generation index {manual_generation_index} was not found.")
+        selected_row = selected.iloc[0]
+        if not bool(selected_row["accepted_truthful_donor"]):
+            raise ValueError("Selected manual donor generation is not an accepted truthful donor.")
+        return generations_df, selected_row
+
+    accepted_df = generations_df.loc[generations_df["accepted_truthful_donor"]].copy()
+    if accepted_df.empty:
+        raise ValueError("No accepted truthful donor generation found in the saved localization generations.")
+    accepted_df = accepted_df.sort_values(
+        ["honest_clarity_score", "first_sentence_len", "gen_idx"],
+        ascending=[False, True, True],
+    )
+    return generations_df, accepted_df.iloc[0]
+
+
+def _build_candidate_selection_row(localization_path: Path) -> dict[str, Any] | None:
+    try:
+        payload = load_payload(localization_path)
+        left_pos, right_pos = find_history_positions(payload)
+        if left_pos is None or right_pos is None or right_pos != left_pos + 1:
+            return None
+        shared_context_entry = payload["history"][left_pos]
+        target_commitment_entry = payload["history"][right_pos]
+        required_rank = payload.get("eval_context", {}).get("truthful_rank")
+        if required_rank is not None:
+            required_rank = int(required_rank)
+        generations_df, selected_donor_row = choose_honest_donor_generation(
+            shared_context_entry,
+            target_commitment_sentence=str(target_commitment_entry.get("sentence_text", "")),
+            required_rank=required_rank,
+            manual_generation_index=None,
+        )
+    except Exception:
+        return None
+
+    commitment_delta = float(target_commitment_entry.get("deception_rate", float("nan"))) - float(
+        shared_context_entry.get("deception_rate", float("nan"))
+    )
+    if not math.isfinite(commitment_delta):
+        return None
+
+    donor_score = float(selected_donor_row["honest_clarity_score"])
+    if not math.isfinite(donor_score):
+        return None
+
+    return {
+        "localization_path": str(localization_path),
+        "example_id": str(payload.get("example_id", localization_path.stem)),
+        "required_rank": required_rank,
+        "shared_context_sentence_pos": int(left_pos),
+        "commitment_sentence_pos": int(right_pos),
+        "shared_context_deception_rate": float(shared_context_entry.get("deception_rate", float("nan"))),
+        "commitment_deception_rate": float(target_commitment_entry.get("deception_rate", float("nan"))),
+        "commitment_delta": commitment_delta,
+        "full_trace_deception_rate": float(payload.get("full_score", {}).get("deception_rate", float("nan"))),
+        "donor_generation_idx": int(selected_donor_row["gen_idx"]),
+        "donor_first_sentence": str(selected_donor_row["first_sentence"]),
+        "donor_cards_played": to_json_safe(selected_donor_row.get("cards_played")),
+        "donor_clarity_score": donor_score,
+        "n_truthful_donors": int(generations_df["accepted_truthful_donor"].sum()),
+    }
+
+
+def search_bs_activation_patch_examples(
+    localization_dir: Path,
+    *,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(localization_dir.glob("sentence_localization_*.json")):
+        row = _build_candidate_selection_row(path)
+        if row is not None and float(row["commitment_delta"]) > 0.0:
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.sort_values(
+        ["donor_clarity_score", "commitment_delta", "commitment_deception_rate"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+    if limit is not None:
+        return df.head(int(limit)).reset_index(drop=True)
+    return df
 
 
 def resolve_primary_cuda_device(device_name: str) -> torch.device:
@@ -810,66 +1049,22 @@ def describe_text_for_model(
 
 
 def generation_rows_from_entry(entry: dict[str, Any]) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for gen_idx, generation in enumerate(entry.get("generations") or []):
-        first_sentence, remainder_text = extract_first_sentence(generation.get("gen_text", ""))
-        evaluation = generation.get("evaluation") if isinstance(generation.get("evaluation"), dict) else {}
-        rows.append(
-            {
-                "gen_idx": gen_idx,
-                "prompt": generation.get("prompt", entry.get("prompt", "")),
-                "prefix_text": generation.get("prefix_text", entry.get("prefix_text", "")),
-                "gen_text": generation.get("gen_text", ""),
-                "full_generation_text": generation.get("full_generation_text", ""),
-                "first_sentence": first_sentence,
-                "remainder_text": remainder_text,
-                "is_truthful": generation.get("is_truthful"),
-                "deceptive": generation.get("deceptive"),
-                "parse_error": generation.get("parse_error"),
-                "cards_played": evaluation.get("cards_played"),
-                "action": evaluation.get("action"),
-                "evaluation": generation.get("evaluation"),
-                "parsed": generation.get("parsed"),
-            }
-        )
-    return pd.DataFrame(rows)
+    return _truthful_generation_rows_from_entry(entry)
 
 
 def select_saved_truthful_donor_generation(
     entry: dict[str, Any],
     *,
     target_commitment_sentence: str,
+    required_rank: int | None = None,
     manual_generation_index: int | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    generations_df = generation_rows_from_entry(entry)
-    generations_df["normalized_first_sentence"] = generations_df["first_sentence"].map(
-        normalize_sentence_for_compare
+    return choose_honest_donor_generation(
+        entry,
+        target_commitment_sentence=target_commitment_sentence,
+        required_rank=required_rank,
+        manual_generation_index=manual_generation_index,
     )
-    target_sentence_norm = normalize_sentence_for_compare(target_commitment_sentence)
-    generations_df["same_as_target_sentence"] = generations_df["normalized_first_sentence"].eq(
-        target_sentence_norm
-    )
-    generations_df["first_sentence_len"] = generations_df["first_sentence"].astype(str).str.len().fillna(0)
-    generations_df["accepted_truthful_donor"] = (
-        generations_df["is_truthful"].eq(True)
-        & generations_df["first_sentence"].astype(str).str.len().gt(0)
-        & ~generations_df["same_as_target_sentence"]
-    )
-
-    if manual_generation_index is not None:
-        selected = generations_df.loc[generations_df["gen_idx"].eq(int(manual_generation_index))]
-        if selected.empty:
-            raise ValueError(f"manual donor generation index {manual_generation_index} was not found.")
-        selected_row = selected.iloc[0]
-        if not bool(selected_row["accepted_truthful_donor"]):
-            raise ValueError("Selected manual donor generation is not an accepted truthful donor.")
-        return generations_df, selected_row
-
-    accepted_df = generations_df.loc[generations_df["accepted_truthful_donor"]].copy()
-    if accepted_df.empty:
-        raise ValueError("No accepted truthful donor generation found in the saved localization generations.")
-    accepted_df = accepted_df.sort_values(["first_sentence_len", "gen_idx"], ascending=[True, True])
-    return generations_df, accepted_df.iloc[0]
 
 
 def run_generation_condition(
@@ -1188,6 +1383,9 @@ def main(argv: list[str] | None = None) -> None:
         default=str(ROOT_DIR / "Results" / "activation_patching"),
     )
     parser.add_argument("--run-tag", type=str, default="")
+    parser.add_argument("--auto-select-example", action="store_true", default=False)
+    parser.add_argument("--localization-dir", type=str, default="")
+    parser.add_argument("--selection-limit", type=int, default=200)
     parser.add_argument(
         "--plot-only-run-dir",
         type=str,
@@ -1216,9 +1414,29 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Rebuilt rate summary plot at {run_dir / 'rate_summary.png'}")
         return
 
-    localization_path = Path(args.localization_path).expanduser().resolve()
-    if not args.localization_path.strip():
-        raise ValueError("--localization-path is required unless --plot-only-run-dir is set.")
+    selection_df = pd.DataFrame()
+    if args.auto_select_example:
+        if args.localization_dir.strip():
+            localization_dir = Path(args.localization_dir).expanduser().resolve()
+        elif args.localization_path.strip():
+            localization_dir = Path(args.localization_path).expanduser().resolve().parent
+        else:
+            raise ValueError("--auto-select-example requires --localization-dir or --localization-path.")
+        if not localization_dir.exists():
+            raise FileNotFoundError(localization_dir)
+        selection_df = search_bs_activation_patch_examples(
+            localization_dir,
+            limit=int(args.selection_limit) if int(args.selection_limit) > 0 else None,
+        )
+        if selection_df.empty:
+            raise ValueError(f"No suitable activation-patching candidates found in {localization_dir}")
+        localization_path = Path(selection_df.iloc[0]["localization_path"]).resolve()
+        print("Auto-selected example:", selection_df.iloc[0]["example_id"])
+        print("Auto-selected donor sentence:", selection_df.iloc[0]["donor_first_sentence"])
+    else:
+        localization_path = Path(args.localization_path).expanduser().resolve()
+        if not args.localization_path.strip():
+            raise ValueError("--localization-path is required unless --plot-only-run-dir is set.")
     if not localization_path.exists():
         raise FileNotFoundError(localization_path)
     if int(args.max_model_length) <= 0:
@@ -1259,12 +1477,15 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Output root: {output_root}")
 
     shutil.copy2(localization_path, output_root / "source_localization.json")
+    if not selection_df.empty:
+        selection_df.to_csv(output_root / "candidate_example_selection.csv", index=False)
 
     example_summary_df = pd.DataFrame(
         [
             {
                 "example_id": payload["example_id"],
                 "localization_path": str(localization_path),
+                "auto_selected_example": bool(args.auto_select_example),
                 "required_rank": required_rank,
                 "shared_context_sentence_pos": left_pos,
                 "commitment_sentence_pos": right_pos,
@@ -1298,6 +1519,7 @@ def main(argv: list[str] | None = None) -> None:
     shared_generations_df, selected_donor_row = select_saved_truthful_donor_generation(
         shared_context_entry,
         target_commitment_sentence=target_commitment_sentence,
+        required_rank=required_rank,
         manual_generation_index=args.manual_donor_generation_index,
     )
     shared_generations_df.to_csv(output_root / "donor_generations.csv", index=False)
@@ -1394,6 +1616,8 @@ def main(argv: list[str] | None = None) -> None:
 
     run_config = {
         "localization_path": str(localization_path),
+        "auto_select_example": bool(args.auto_select_example),
+        "selection_limit": int(args.selection_limit),
         "model_name_or_path": args.model_name_or_path,
         "manual_donor_generation_index": args.manual_donor_generation_index,
         "max_model_length": int(args.max_model_length),
@@ -1427,6 +1651,7 @@ def main(argv: list[str] | None = None) -> None:
         "selected_donor_generation_idx": int(selected_donor_row["gen_idx"]),
         "selected_donor_sentence": donor_sentence,
         "selected_donor_cards_played": to_json_safe(selected_donor_row.get("cards_played")),
+        "selected_donor_clarity_score": float(selected_donor_row.get("honest_clarity_score", float("nan"))),
         "parameter_devices": parameter_device_summary(model),
     }
     (output_root / "run_config.json").write_text(
