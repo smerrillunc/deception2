@@ -707,6 +707,7 @@ def generate_with_sentence_patch(
     target_text: str,
     target_prefix_boundary_text: str,
     patch_label: str | None,
+    patch_mode: str,
     layer_indices: tuple[int, ...] | None,
     donor_source: dict[str, Any] | None,
     max_model_length: int,
@@ -737,8 +738,10 @@ def generate_with_sentence_patch(
     selected_layers = tuple(int(idx) for idx in (layer_indices or ()))
     if selected_layers and donor_source is None:
         raise ValueError("donor_source is required when patching layers.")
+    apply_residual_patch = patch_mode in {"residual", "both"}
+    apply_kv_patch = patch_mode in {"kv", "both"}
 
-    for layer_idx in selected_layers:
+    for layer_idx in selected_layers if apply_residual_patch else ():
         donor_hidden = donor_source["hidden_by_layer"][layer_idx]
 
         def patch_hook(_module: Any, _inputs: Any, output: Any, donor_hidden: torch.Tensor = donor_hidden) -> Any:
@@ -763,25 +766,26 @@ def generate_with_sentence_patch(
             handle.remove()
 
     past_key_values = outputs.past_key_values
-    for layer_idx in selected_layers:
-        donor_key, donor_value = donor_source["cache_by_layer"][layer_idx]
-        key_tensor, value_tensor = _get_layer_cache_pair(past_key_values, layer_idx)
-        past_key_values = _set_layer_cache_pair(
-            past_key_values,
-            layer_idx,
-            _replace_sequence_slice(
-                key_tensor,
-                target_sentence_slice,
-                donor_key,
-                expected_total_len=target_len,
-            ),
-            _replace_sequence_slice(
-                value_tensor,
-                target_sentence_slice,
-                donor_value,
-                expected_total_len=target_len,
-            ),
-        )
+    if apply_kv_patch:
+        for layer_idx in selected_layers:
+            donor_key, donor_value = donor_source["cache_by_layer"][layer_idx]
+            key_tensor, value_tensor = _get_layer_cache_pair(past_key_values, layer_idx)
+            past_key_values = _set_layer_cache_pair(
+                past_key_values,
+                layer_idx,
+                _replace_sequence_slice(
+                    key_tensor,
+                    target_sentence_slice,
+                    donor_key,
+                    expected_total_len=target_len,
+                ),
+                _replace_sequence_slice(
+                    value_tensor,
+                    target_sentence_slice,
+                    donor_value,
+                    expected_total_len=target_len,
+                ),
+            )
     past_key_values = _ensure_decode_cache(past_key_values)
 
     generator_device = device if device.type != "cpu" else torch.device("cpu")
@@ -836,6 +840,7 @@ def generate_with_sentence_patch(
         "layer_idx": layer_indices[0] if layer_indices and len(layer_indices) == 1 else None,
         "layer_indices": list(layer_indices or []),
         "patch_label": patch_label,
+        "patch_mode": patch_mode,
         "layer_path": layer_path,
     }
 
@@ -1075,6 +1080,7 @@ def run_generation_condition(
     target_text: str,
     target_prefix_boundary_text: str,
     patch_label: str | None,
+    patch_mode: str,
     layer_indices: tuple[int, ...] | None,
     donor_source: dict[str, Any] | None,
     required_rank: int,
@@ -1090,6 +1096,7 @@ def run_generation_condition(
         target_text=target_text,
         target_prefix_boundary_text=target_prefix_boundary_text,
         patch_label=patch_label,
+        patch_mode=patch_mode,
         layer_indices=layer_indices,
         donor_source=donor_source,
         max_model_length=max_model_length,
@@ -1103,6 +1110,7 @@ def run_generation_condition(
     return {
         "condition_name": condition_name,
         "patch_label": generation["patch_label"],
+        "patch_mode": generation["patch_mode"],
         "layer_idx": generation["layer_idx"],
         "layer_indices": generation["layer_indices"],
         "layer_count": len(generation["layer_indices"]),
@@ -1198,8 +1206,8 @@ def run_generation_condition_samples(
 
 def summarize_deception_rate_samples(samples_df: pd.DataFrame) -> pd.DataFrame:
     summary_rows: list[dict[str, Any]] = []
-    grouped = samples_df.groupby(["condition_name", "patch_label"], dropna=False, sort=False)
-    for (condition_name, patch_label), group in grouped:
+    grouped = samples_df.groupby(["condition_name", "patch_label", "patch_mode"], dropna=False, sort=False)
+    for (condition_name, patch_label, patch_mode), group in grouped:
         valid_df = group.loc[group["is_valid"].eq(True)].copy()
         n_samples = int(len(group))
         n_valid = int(len(valid_df))
@@ -1213,6 +1221,7 @@ def summarize_deception_rate_samples(samples_df: pd.DataFrame) -> pd.DataFrame:
             {
                 "condition_name": condition_name,
                 "patch_label": patch_label,
+                "patch_mode": patch_mode,
                 "layer_idx": group["layer_idx"].dropna().iloc[0] if group["layer_idx"].notna().any() else pd.NA,
                 "layer_indices": json.dumps(group["layer_indices"].iloc[0]),
                 "layer_count": int(group["layer_count"].iloc[0]),
@@ -1245,32 +1254,55 @@ def parse_layer_candidates(text: str | None) -> list[int] | None:
 
 
 def build_default_layer_candidates(n_layers: int) -> list[int]:
-    return sorted(set([0, n_layers // 4, n_layers // 2, (3 * n_layers) // 4, n_layers - 1]))
+    if n_layers <= 0:
+        return []
+    candidates = list(range(0, int(n_layers), 3))
+    if candidates[-1] != int(n_layers) - 1:
+        candidates.append(int(n_layers) - 1)
+    return sorted(set(int(layer_idx) for layer_idx in candidates))
 
 
-def build_layer_group_conditions(n_layers: int) -> list[dict[str, Any]]:
+def build_layer_group_conditions(n_layers: int, *, layer_candidates: list[int] | None = None) -> list[dict[str, Any]]:
     layer_splits = [tuple(int(idx) for idx in split.tolist()) for split in np.array_split(np.arange(n_layers), 3)]
     group_map = {
         "Early": layer_splits[0],
         "Mid": layer_splits[1],
         "Late": layer_splits[2],
     }
-    specs: list[tuple[str, str, tuple[int, ...]]] = [
+    single_layers = layer_candidates if layer_candidates is not None else build_default_layer_candidates(n_layers)
+    base_specs: list[tuple[str, str, tuple[int, ...]]] = [
         ("patched_early", "Early", group_map["Early"]),
         ("patched_mid", "Mid", group_map["Mid"]),
         ("patched_late", "Late", group_map["Late"]),
     ]
-    specs.extend(
+    base_specs.extend(
         (f"patched_layer_{layer_idx}", f"Layer {layer_idx}", (int(layer_idx),))
-        for layer_idx in range(int(n_layers))
+        for layer_idx in single_layers
     )
+    patch_mode_specs = [
+        ("residual", "Residual"),
+        ("kv", "K/V"),
+        ("both", "Residual + K/V"),
+    ]
+    specs: list[tuple[str, str, str, tuple[int, ...]]] = []
+    for patch_mode, patch_mode_label in patch_mode_specs:
+        for condition_name, base_label, layer_indices in base_specs:
+            specs.append(
+                (
+                    f"{condition_name}__{patch_mode}",
+                    f"{patch_mode_label} | {base_label}",
+                    patch_mode,
+                    layer_indices,
+                )
+            )
     return [
         {
             "condition_name": str(condition_name),
             "patch_label": str(patch_label),
+            "patch_mode": str(patch_mode),
             "layer_indices": tuple(int(layer_idx) for layer_idx in layer_indices),
         }
-        for condition_name, patch_label, layer_indices in specs
+        for condition_name, patch_label, patch_mode, layer_indices in specs
         if layer_indices
     ]
 
@@ -1293,13 +1325,29 @@ def normalize_plot_rate_summary(rate_summary_df: pd.DataFrame) -> pd.DataFrame:
 
     for col in ("deception_rate", "ci_low", "ci_high"):
         plot_df[col] = plot_df[col].clip(lower=0.0, upper=1.0)
+    mode_order = ["Residual", "K/V", "Residual + K/V"]
     single_layer_labels = [
         str(label)
         for label in plot_df["patch_label"]
-        if isinstance(label, str) and re.fullmatch(r"Layer \d+", str(label))
+        if isinstance(label, str) and re.fullmatch(r"(Residual|K/V|Residual \+ K/V) \| Layer \d+", str(label))
     ]
-    single_layer_labels = sorted(single_layer_labels, key=lambda label: int(label.split()[-1]))
-    preferred_order = ["Early", "Mid", "Late", *single_layer_labels]
+    single_layer_labels = sorted(
+        single_layer_labels,
+        key=lambda label: (
+            mode_order.index(label.split(" | ")[0]) if label.split(" | ")[0] in mode_order else len(mode_order),
+            int(label.split()[-1]),
+        ),
+    )
+    preferred_order: list[str] = []
+    for mode_label in mode_order:
+        preferred_order.extend(
+            [
+                f"{mode_label} | Early",
+                f"{mode_label} | Mid",
+                f"{mode_label} | Late",
+            ]
+        )
+    preferred_order.extend(single_layer_labels)
     rank_map = {label: idx for idx, label in enumerate(preferred_order)}
     plot_df["_plot_rank"] = plot_df["patch_label"].map(lambda label: rank_map.get(label, len(rank_map)))
     plot_df = plot_df.sort_values(["_plot_rank", "patch_label"]).reset_index(drop=True)
@@ -1554,7 +1602,11 @@ def main(argv: list[str] | None = None) -> None:
 
     layers, layer_path = resolve_decoder_layers(model)
     n_layers = len(layers)
-    patch_conditions = build_layer_group_conditions(n_layers)
+    layer_candidates = parse_layer_candidates(args.layer_candidates)
+    if layer_candidates is None:
+        layer_candidates = build_default_layer_candidates(n_layers)
+    layer_candidates = [layer_idx for layer_idx in layer_candidates if 0 <= int(layer_idx) < int(n_layers)]
+    patch_conditions = build_layer_group_conditions(n_layers, layer_candidates=layer_candidates)
 
     token_debug_df = pd.DataFrame(
         [
@@ -1622,10 +1674,12 @@ def main(argv: list[str] | None = None) -> None:
         "requested_total_tokens": requested_total_tokens,
         "decoder_layer_path": layer_path,
         "n_layers": int(n_layers),
+        "layer_candidates": [int(layer_idx) for layer_idx in layer_candidates],
         "patch_conditions": [
             {
                 "condition_name": condition["condition_name"],
                 "patch_label": condition["patch_label"],
+                "patch_mode": condition["patch_mode"],
                 "layer_indices": [int(layer_idx) for layer_idx in condition["layer_indices"]],
             }
             for condition in patch_conditions
@@ -1654,6 +1708,7 @@ def main(argv: list[str] | None = None) -> None:
         {
             "condition_name": "unpatched_deceptive_prefix",
             "patch_label": "Unpatched deceptive prefix",
+            "patch_mode": "none",
             "target_text": target_model_input,
             "target_prefix_boundary_text": target_shared_boundary_text,
             "layer_indices": (),
@@ -1662,6 +1717,7 @@ def main(argv: list[str] | None = None) -> None:
         {
             "condition_name": "unpatched_truthful_donor_prefix",
             "patch_label": "Unpatched truthful donor prefix",
+            "patch_mode": "none",
             "target_text": donor_model_input,
             "target_prefix_boundary_text": donor_shared_boundary_text,
             "layer_indices": (),
@@ -1673,6 +1729,7 @@ def main(argv: list[str] | None = None) -> None:
             {
                 "condition_name": str(condition["condition_name"]),
                 "patch_label": str(condition["patch_label"]),
+                "patch_mode": str(condition["patch_mode"]),
                 "target_text": target_model_input,
                 "target_prefix_boundary_text": target_shared_boundary_text,
                 "layer_indices": tuple(int(layer_idx) for layer_idx in condition["layer_indices"]),
@@ -1734,6 +1791,7 @@ def main(argv: list[str] | None = None) -> None:
                 target_text=str(condition["target_text"]),
                 target_prefix_boundary_text=str(condition["target_prefix_boundary_text"]),
                 patch_label=condition["patch_label"],
+                patch_mode=str(condition["patch_mode"]),
                 layer_indices=tuple(int(layer_idx) for layer_idx in condition["layer_indices"]),
                 donor_source=donor_source if condition["layer_indices"] else None,
                 required_rank=required_rank,
@@ -1766,6 +1824,7 @@ def main(argv: list[str] | None = None) -> None:
                     target_text=target_model_input,
                     target_prefix_boundary_text=target_shared_boundary_text,
                     patch_label=str(condition["patch_label"]),
+                    patch_mode=str(condition["patch_mode"]),
                     layer_indices=tuple(int(layer_idx) for layer_idx in condition["layer_indices"]),
                     donor_source=donor_source,
                     required_rank=required_rank,
