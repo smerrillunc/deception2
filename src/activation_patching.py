@@ -71,6 +71,8 @@ def load_payload(path: Path) -> dict[str, Any]:
 def to_json_safe(obj: Any) -> Any:
     if obj is pd.NA:
         return None
+    if isinstance(obj, (np.ndarray, pd.Series, pd.Index)):
+        return [to_json_safe(value) for value in obj.tolist()]
     try:
         if pd.isna(obj):
             return None
@@ -1157,6 +1159,7 @@ def run_generation_condition_samples(
     target_text: str,
     target_prefix_boundary_text: str,
     patch_label: str | None,
+    patch_mode: str,
     layer_indices: tuple[int, ...] | None,
     donor_source: dict[str, Any] | None,
     required_rank: int,
@@ -1188,6 +1191,7 @@ def run_generation_condition_samples(
             target_text=target_text,
             target_prefix_boundary_text=target_prefix_boundary_text,
             patch_label=patch_label,
+            patch_mode=patch_mode,
             layer_indices=layer_indices,
             donor_source=donor_source,
             required_rank=required_rank,
