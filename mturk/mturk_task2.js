@@ -6,8 +6,8 @@
   <div id="mturk-data" style="display:none;">
     <div id="instruction-src">${instruction}</div>
     <div id="scenario-src">${scenario_description}</div>
-    <div id="question-src">${question}</div>
-    <div id="reasoning-src">${reasoning_snippet}</div>
+    <div id="question-src">${question_commitment}</div>
+    <div id="reasoning-src">${reasoning_block}</div>
   </div>
 
   <!-- Instructions -->
@@ -187,7 +187,7 @@
 
     sentences.forEach((sentence, idx) => {
       const sentenceNumber = idx + 1;
-      const optionId = `commitment_sentence_${sentenceNumber}`;
+      const optionId = "commitment_sentence_" + sentenceNumber;
 
       const wrapper = document.createElement("label");
       wrapper.setAttribute("for", optionId);
@@ -222,7 +222,7 @@
       textWrap.style.flex = "1";
 
       const num = document.createElement("div");
-      num.textContent = `Sentence ${sentenceNumber}`;
+      num.textContent = "Sentence " + sentenceNumber;
       num.style.fontWeight = "700";
       num.style.fontSize = "13px";
       num.style.color = "#374151";
