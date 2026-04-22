@@ -822,8 +822,15 @@ def _replace_sequence_slice(
 
 
 def _get_layer_cache_pair(past_key_values: Any, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
-        return past_key_values.key_cache[int(layer_idx)], past_key_values.value_cache[int(layer_idx)]
+    key_cache = getattr(past_key_values, "key_cache", None)
+    value_cache = getattr(past_key_values, "value_cache", None)
+    if key_cache is not None and value_cache is not None:
+        return key_cache[int(layer_idx)], value_cache[int(layer_idx)]
+    if hasattr(past_key_values, "to_legacy_cache"):
+        legacy_cache = past_key_values.to_legacy_cache()
+        layer_cache = legacy_cache[int(layer_idx)]
+        if isinstance(layer_cache, (list, tuple)) and len(layer_cache) >= 2:
+            return layer_cache[0], layer_cache[1]
     layer_cache = past_key_values[int(layer_idx)]
     if isinstance(layer_cache, (list, tuple)) and len(layer_cache) >= 2:
         return layer_cache[0], layer_cache[1]
@@ -890,6 +897,7 @@ def _run_prefill_with_capture(
     *,
     capture_layers: Iterable[int],
     capture_slice: slice,
+    capture_cache: bool = True,
 ) -> tuple[dict[int, torch.Tensor], dict[int, tuple[torch.Tensor, torch.Tensor]]]:
     layers, _ = resolve_decoder_layers(model)
     seq_len = int(encoded["input_ids"].shape[1])
@@ -912,18 +920,19 @@ def _run_prefill_with_capture(
 
     try:
         with torch.no_grad():
-            outputs = model(**encoded, use_cache=True, return_dict=True)
+            outputs = model(**encoded, use_cache=bool(capture_cache), return_dict=True)
     finally:
         for handle in hooks:
             handle.remove()
 
     cache_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    for layer_idx in capture_layers:
-        key_tensor, value_tensor = _get_layer_cache_pair(outputs.past_key_values, int(layer_idx))
-        cache_by_layer[int(layer_idx)] = (
-            _slice_sequence_tensor(key_tensor, capture_slice, expected_total_len=seq_len),
-            _slice_sequence_tensor(value_tensor, capture_slice, expected_total_len=seq_len),
-        )
+    if capture_cache:
+        for layer_idx in capture_layers:
+            key_tensor, value_tensor = _get_layer_cache_pair(outputs.past_key_values, int(layer_idx))
+            cache_by_layer[int(layer_idx)] = (
+                _slice_sequence_tensor(key_tensor, capture_slice, expected_total_len=seq_len),
+                _slice_sequence_tensor(value_tensor, capture_slice, expected_total_len=seq_len),
+            )
     return hidden_by_layer, cache_by_layer
 
 
@@ -935,6 +944,7 @@ def prepare_sentence_patch_source(
     donor_prefix_boundary_text: str,
     max_model_length: int,
     patch_scope: str = "sentence_span",
+    capture_cache: bool = True,
 ) -> dict[str, Any]:
     device = resolve_model_device(model)
     donor_encoded = encode_text_for_model(
@@ -960,6 +970,7 @@ def prepare_sentence_patch_source(
         donor_encoded,
         capture_layers=capture_layers,
         capture_slice=donor_patch_slice,
+        capture_cache=capture_cache,
     )
     return {
         "full_text": donor_full_text,
@@ -974,6 +985,7 @@ def prepare_sentence_patch_source(
         "patch_token_count": donor_patch_slice.stop - donor_patch_slice.start,
         "hidden_by_layer": hidden_by_layer,
         "cache_by_layer": cache_by_layer,
+        "captured_cache": bool(capture_cache),
     }
 
 
@@ -2144,6 +2156,7 @@ def run_matched_pair_patch_experiment(
                     donor_prefix_boundary_text=pair_texts["truthful_boundary_text"],
                     max_model_length=int(max_model_length),
                     patch_scope=patch_scope,
+                    capture_cache=False,
                 )
                 if needs_denoising
                 else None
@@ -2156,6 +2169,7 @@ def run_matched_pair_patch_experiment(
                     donor_prefix_boundary_text=pair_texts["deceptive_boundary_text"],
                     max_model_length=int(max_model_length),
                     patch_scope=patch_scope,
+                    capture_cache=False,
                 )
                 if needs_noising
                 else None
