@@ -2011,7 +2011,7 @@ def run_matched_pair_patch_experiment(
     model_kwargs = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
-        "dtype": torch.bfloat16,
+        "torch_dtype": torch.bfloat16,
         "device_map": single_gpu_device_map(cuda_device),
     }
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
@@ -2443,7 +2443,7 @@ def legacy_single_example_main(argv: list[str] | None = None) -> None:
     model_kwargs = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
-        "dtype": torch.bfloat16,
+        "torch_dtype": torch.bfloat16,
         "device_map": single_gpu_device_map(cuda_device),
     }
     model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
