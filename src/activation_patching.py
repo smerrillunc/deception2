@@ -989,6 +989,29 @@ def prepare_sentence_patch_source(
     }
 
 
+def _should_stop_on_valid_bs_json(
+    tokenizer: Any,
+    generated_token_ids: list[torch.Tensor],
+    *,
+    required_rank: int | None,
+    check_interval: int,
+    min_new_tokens: int,
+) -> bool:
+    n_tokens = len(generated_token_ids)
+    if required_rank is None or n_tokens < int(min_new_tokens):
+        return False
+    interval = max(int(check_interval), 1)
+    if interval > 1 and n_tokens % interval != 0:
+        return False
+    try:
+        new_ids = torch.cat(generated_token_ids, dim=1)
+        generated_text = tokenizer.decode(new_ids[0], skip_special_tokens=True)
+        evaluation = evaluate_bs_generation(generated_text, required_rank=int(required_rank))
+    except Exception:
+        return False
+    return bool(evaluation.get("is_valid") is True)
+
+
 def generate_with_sentence_patch(
     model: Any,
     tokenizer: Any,
@@ -1005,6 +1028,10 @@ def generate_with_sentence_patch(
     top_p: float,
     seed: int,
     patch_scope: str = "sentence_span",
+    early_stop_on_valid_json: bool = False,
+    early_stop_required_rank: int | None = None,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
 ) -> dict[str, Any]:
     seed_everything(seed)
     device = resolve_model_device(model)
@@ -1092,8 +1119,17 @@ def generate_with_sentence_patch(
     )
     generated_token_ids.append(next_token)
     ended_with_eos = tokenizer.eos_token_id is not None and int(next_token.item()) == int(tokenizer.eos_token_id)
+    early_stopped_on_valid_json = False
+    if early_stop_on_valid_json:
+        early_stopped_on_valid_json = _should_stop_on_valid_bs_json(
+            tokenizer,
+            generated_token_ids,
+            required_rank=early_stop_required_rank,
+            check_interval=int(early_stop_check_interval),
+            min_new_tokens=int(early_stop_min_new_tokens),
+        )
 
-    while len(generated_token_ids) < int(max_new_tokens) and not ended_with_eos:
+    while len(generated_token_ids) < int(max_new_tokens) and not ended_with_eos and not early_stopped_on_valid_json:
         with torch.no_grad():
             step_outputs = model(
                 input_ids=generated_token_ids[-1],
@@ -1110,6 +1146,14 @@ def generate_with_sentence_patch(
         )
         generated_token_ids.append(next_token)
         ended_with_eos = tokenizer.eos_token_id is not None and int(next_token.item()) == int(tokenizer.eos_token_id)
+        if early_stop_on_valid_json:
+            early_stopped_on_valid_json = _should_stop_on_valid_bs_json(
+                tokenizer,
+                generated_token_ids,
+                required_rank=early_stop_required_rank,
+                check_interval=int(early_stop_check_interval),
+                min_new_tokens=int(early_stop_min_new_tokens),
+            )
 
     if generated_token_ids:
         new_ids = torch.cat(generated_token_ids, dim=1)
@@ -1127,6 +1171,7 @@ def generate_with_sentence_patch(
         "target_patch_token_count": int(target_patch_slice.stop) - int(target_patch_slice.start),
         "n_new_tokens": n_new_tokens,
         "ended_with_eos": ended_with_eos,
+        "early_stopped_on_valid_json": early_stopped_on_valid_json,
         "hit_token_cap": hit_token_cap,
         "likely_truncated": likely_truncated,
         "layer_idx": layer_indices[0] if layer_indices and len(layer_indices) == 1 else None,
@@ -1383,6 +1428,9 @@ def run_generation_condition(
     top_p: float,
     seed: int,
     patch_scope: str = "sentence_span",
+    early_stop_on_valid_json: bool = False,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
 ) -> dict[str, Any]:
     generation = generate_with_sentence_patch(
         model,
@@ -1399,6 +1447,10 @@ def run_generation_condition(
         top_p=top_p,
         seed=seed,
         patch_scope=patch_scope,
+        early_stop_on_valid_json=early_stop_on_valid_json,
+        early_stop_required_rank=required_rank,
+        early_stop_check_interval=int(early_stop_check_interval),
+        early_stop_min_new_tokens=int(early_stop_min_new_tokens),
     )
     evaluation = evaluate_bs_generation(generation["generated_text"], required_rank=required_rank)
     first_sentence, remainder_text = extract_first_sentence(generation["generated_text"])
@@ -1421,6 +1473,7 @@ def run_generation_condition(
         "target_patch_token_count": generation["target_patch_token_count"],
         "n_new_tokens": generation["n_new_tokens"],
         "ended_with_eos": generation["ended_with_eos"],
+        "early_stopped_on_valid_json": generation["early_stopped_on_valid_json"],
         "hit_token_cap": generation["hit_token_cap"],
         "likely_truncated": generation["likely_truncated"],
         "is_valid": evaluation["is_valid"],
@@ -1466,6 +1519,9 @@ def run_generation_condition_samples(
     n_samples: int,
     disable_tqdm: bool,
     patch_scope: str = "sentence_span",
+    early_stop_on_valid_json: bool = False,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
     progress_bar: Any | None = None,
     progress_desc: str | None = None,
 ) -> pd.DataFrame:
@@ -1497,6 +1553,9 @@ def run_generation_condition_samples(
             top_p=top_p,
             seed=int(seed_start) + sample_idx,
             patch_scope=patch_scope,
+            early_stop_on_valid_json=early_stop_on_valid_json,
+            early_stop_check_interval=int(early_stop_check_interval),
+            early_stop_min_new_tokens=int(early_stop_min_new_tokens),
         )
         row["sample_idx"] = sample_idx
         rows.append(row)
@@ -1560,6 +1619,17 @@ def build_default_layer_candidates(n_layers: int) -> list[int]:
     candidates = [0]
     candidates.extend(range(2, int(n_layers), 3))
     return sorted(set(int(layer_idx) for layer_idx in candidates))
+
+
+def build_evenly_spaced_layer_candidates(n_layers: int, layer_count: int) -> list[int]:
+    n_layers = int(n_layers)
+    layer_count = int(layer_count)
+    if n_layers <= 0 or layer_count <= 0:
+        return []
+    if layer_count >= n_layers:
+        return list(range(n_layers))
+    candidates = [int(round(value)) for value in np.linspace(0, n_layers - 1, layer_count)]
+    return sorted(set(max(0, min(n_layers - 1, layer_idx)) for layer_idx in candidates))
 
 
 def build_single_layer_patch_conditions(layer_candidates: list[int]) -> list[dict[str, Any]]:
@@ -1792,6 +1862,7 @@ def _stat_bucket_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "n_invalid": 0,
         "n_deceptive": 0,
         "n_truncated": 0,
+        "n_json_stopped": 0,
         "sum_new_tokens": 0.0,
     }
 
@@ -1811,6 +1882,8 @@ def _update_pair_condition_stats(stats: dict[tuple[str, str], dict[str, Any]], r
         bucket["n_invalid"] += 1
     if row.get("likely_truncated") is True:
         bucket["n_truncated"] += 1
+    if row.get("early_stopped_on_valid_json") is True:
+        bucket["n_json_stopped"] += 1
     try:
         bucket["sum_new_tokens"] += float(row.get("n_new_tokens", 0.0) or 0.0)
     except Exception:
@@ -1837,6 +1910,7 @@ def _pair_condition_summary_rows(stats: dict[tuple[str, str], dict[str, Any]]) -
                 "ci_high": ci_high,
                 "mean_new_tokens": float(bucket["sum_new_tokens"] / n_samples) if n_samples > 0 else float("nan"),
                 "truncation_rate": float(bucket["n_truncated"] / n_samples) if n_samples > 0 else float("nan"),
+                "json_stop_rate": float(bucket["n_json_stopped"] / n_samples) if n_samples > 0 else float("nan"),
             }
         )
         rows.append(row)
@@ -1869,6 +1943,7 @@ def _pooled_condition_summary_rows(stats: dict[tuple[str, str], dict[str, Any]])
                 "n_invalid": 0,
                 "n_deceptive": 0,
                 "n_truncated": 0,
+                "n_json_stopped": 0,
                 "sum_new_tokens": 0.0,
             }
             pair_rates_by_key[key] = []
@@ -1879,6 +1954,7 @@ def _pooled_condition_summary_rows(stats: dict[tuple[str, str], dict[str, Any]])
         out["n_invalid"] += int(bucket["n_invalid"])
         out["n_deceptive"] += int(bucket["n_deceptive"])
         out["n_truncated"] += int(bucket["n_truncated"])
+        out["n_json_stopped"] += int(bucket["n_json_stopped"])
         out["sum_new_tokens"] += float(bucket["sum_new_tokens"])
         if int(bucket["n_valid"]) > 0:
             pair_rates_by_key[key].append(float(bucket["n_deceptive"]) / float(bucket["n_valid"]))
@@ -1905,6 +1981,7 @@ def _pooled_condition_summary_rows(stats: dict[tuple[str, str], dict[str, Any]])
                 "ci_high": ci_high,
                 "mean_new_tokens": float(bucket["sum_new_tokens"] / n_samples) if n_samples > 0 else float("nan"),
                 "truncation_rate": float(bucket["n_truncated"] / n_samples) if n_samples > 0 else float("nan"),
+                "json_stop_rate": float(bucket["n_json_stopped"] / n_samples) if n_samples > 0 else float("nan"),
             }
         )
         rows.append(row)
@@ -1986,8 +2063,12 @@ def run_matched_pair_patch_experiment(
     base_seed: int = 17,
     cuda_device_name: str = "cuda:0",
     layer_candidates: list[int] | None = None,
+    layer_count: int | None = None,
     include_baselines: bool = True,
     patch_scope: str = "last_token",
+    early_stop_on_valid_json: bool = True,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
     resume: bool = True,
     disable_tqdm: bool = False,
 ) -> Path:
@@ -2041,7 +2122,10 @@ def run_matched_pair_patch_experiment(
     layers, layer_path = resolve_decoder_layers(model)
     n_layers = len(layers)
     if layer_candidates is None:
-        layer_candidates = build_default_layer_candidates(n_layers)
+        if layer_count is not None and int(layer_count) > 0:
+            layer_candidates = build_evenly_spaced_layer_candidates(n_layers, int(layer_count))
+        else:
+            layer_candidates = build_default_layer_candidates(n_layers)
     layer_candidates = sorted({int(layer_idx) for layer_idx in layer_candidates if 0 <= int(layer_idx) < int(n_layers)})
     patch_conditions = build_single_layer_patch_conditions(layer_candidates)
     all_conditions = (build_baseline_conditions() if include_baselines else []) + patch_conditions
@@ -2064,8 +2148,12 @@ def run_matched_pair_patch_experiment(
         "decoder_layer_path": layer_path,
         "n_layers": int(n_layers),
         "layer_candidates": [int(layer_idx) for layer_idx in layer_candidates],
+        "layer_count": None if layer_count is None else int(layer_count),
         "patch_scope": patch_scope,
         "patch_modes": ["residual"],
+        "early_stop_on_valid_json": bool(early_stop_on_valid_json),
+        "early_stop_check_interval": int(early_stop_check_interval),
+        "early_stop_min_new_tokens": int(early_stop_min_new_tokens),
         "include_baselines": bool(include_baselines),
         "conditions": [
             {
@@ -2212,6 +2300,9 @@ def run_matched_pair_patch_experiment(
                         top_p=float(top_p),
                         seed=seed,
                         patch_scope=patch_scope,
+                        early_stop_on_valid_json=bool(early_stop_on_valid_json),
+                        early_stop_check_interval=int(early_stop_check_interval),
+                        early_stop_min_new_tokens=int(early_stop_min_new_tokens),
                     )
                     row.pop("target_text", None)
                     row.pop("target_prefix_boundary_text", None)
@@ -2791,6 +2882,23 @@ def main(argv: list[str] | None = None) -> None:
         help="Comma-separated layer list. Defaults to 0,2,5,... for the loaded model.",
     )
     parser.add_argument(
+        "--layer-count",
+        type=int,
+        default=int(os.environ.get("ACT_PATCH_LAYER_COUNT", "0")),
+        help="Use this many evenly-spaced layers unless --layer-candidates is set.",
+    )
+    parser.add_argument("--no-early-stop-on-valid-json", action="store_true", default=False)
+    parser.add_argument(
+        "--early-stop-check-interval",
+        type=int,
+        default=int(os.environ.get("ACT_PATCH_EARLY_STOP_CHECK_INTERVAL", "16")),
+    )
+    parser.add_argument(
+        "--early-stop-min-new-tokens",
+        type=int,
+        default=int(os.environ.get("ACT_PATCH_EARLY_STOP_MIN_NEW_TOKENS", "32")),
+    )
+    parser.add_argument(
         "--output-root",
         type=str,
         default=str(ROOT_DIR / "Results" / "activation_patching"),
@@ -2815,6 +2923,10 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--max-new-tokens must be positive.")
     if int(args.rate_sample_count) <= 0:
         raise ValueError("--rate-sample-count must be positive.")
+    if int(args.early_stop_check_interval) <= 0:
+        raise ValueError("--early-stop-check-interval must be positive.")
+    if int(args.early_stop_min_new_tokens) < 0:
+        raise ValueError("--early-stop-min-new-tokens must be non-negative.")
 
     if args.plot_only_run_dir.strip():
         run_dir = Path(args.plot_only_run_dir).expanduser().resolve()
@@ -2846,9 +2958,16 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     layer_candidates = parse_layer_candidates(args.layer_candidates)
+    if layer_candidates is not None:
+        layer_tag = f"layers_{'_'.join(str(layer_idx) for layer_idx in layer_candidates)}"
+    elif int(args.layer_count) > 0:
+        layer_tag = f"layers{int(args.layer_count)}even"
+    else:
+        layer_tag = "layers_every3"
+    stop_tag = "jsonstop" if not bool(args.no_early_stop_on_valid_json) else "nojsonstop"
     run_tag = args.run_tag.strip() or (
         f"{DEFAULT_ENVIRONMENT}_{slugify(DEFAULT_MODEL_TAIL)}_matched{int(args.pair_count)}_"
-        f"last_token_residual_seed{int(args.base_seed)}"
+        f"last_token_residual_{layer_tag}_n{int(args.rate_sample_count)}_{stop_tag}_seed{int(args.base_seed)}"
     )
     output_root = Path(args.output_root).expanduser().resolve() / run_tag
     run_matched_pair_patch_experiment(
@@ -2863,8 +2982,12 @@ def main(argv: list[str] | None = None) -> None:
         base_seed=int(args.base_seed),
         cuda_device_name=str(args.cuda_device),
         layer_candidates=layer_candidates,
+        layer_count=int(args.layer_count) if layer_candidates is None and int(args.layer_count) > 0 else None,
         include_baselines=not bool(args.no_baselines),
         patch_scope="last_token",
+        early_stop_on_valid_json=not bool(args.no_early_stop_on_valid_json),
+        early_stop_check_interval=int(args.early_stop_check_interval),
+        early_stop_min_new_tokens=int(args.early_stop_min_new_tokens),
         resume=not bool(args.no_resume),
         disable_tqdm=bool(args.disable_tqdm),
     )
