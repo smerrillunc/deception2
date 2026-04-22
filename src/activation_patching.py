@@ -33,6 +33,17 @@ except Exception:  # pragma: no cover - tqdm is optional at import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
+DEFAULT_MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+DEFAULT_MODEL_TAIL = "DeepSeek-R1-Distill-Qwen-7B"
+DEFAULT_ENVIRONMENT = "bs"
+DEFAULT_LOCALIZATION_DIR = ROOT_DIR / "DatasetMain" / DEFAULT_ENVIRONMENT / DEFAULT_MODEL_TAIL / "localization"
+DEFAULT_PAIR_COUNT = 100
+DEFAULT_PAIR_CACHE_PATH = (
+    ROOT_DIR
+    / "Cache"
+    / "activation_patching"
+    / f"{DEFAULT_ENVIRONMENT}_{DEFAULT_MODEL_TAIL}_matched_truthful_donor_pairs_n{DEFAULT_PAIR_COUNT}.jsonl"
+)
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -86,8 +97,10 @@ def to_json_safe(obj: Any) -> Any:
         return [to_json_safe(value) for value in obj]
     if isinstance(obj, Path):
         return str(obj)
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
     if isinstance(obj, np.generic):
-        return obj.item()
+        return to_json_safe(obj.item())
     if isinstance(obj, pd.Timestamp):
         return obj.isoformat()
     return obj
@@ -97,6 +110,42 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(to_json_safe(row), ensure_ascii=False) + "\n")
+
+
+def append_jsonl_row(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(to_json_safe(row), ensure_ascii=False) + "\n")
+        handle.flush()
+
+
+def read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            clean = line.strip()
+            if clean:
+                rows.append(json.loads(clean))
+    return rows
+
+
+def iter_jsonl_rows(path: Path) -> Iterable[dict[str, Any]]:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            clean = line.strip()
+            if clean:
+                yield json.loads(clean)
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(to_json_safe(payload), indent=2), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def trace_df_from_payload(payload: dict[str, Any]) -> pd.DataFrame:
@@ -350,26 +399,231 @@ def _build_candidate_selection_row(localization_path: Path) -> dict[str, Any] | 
     }
 
 
+def _build_candidate_selection_rows(
+    localization_path: Path,
+    *,
+    min_commitment_delta: float = 0.0,
+    min_commitment_deception_rate: float = 0.0,
+    min_donor_clarity_score: float = float("-inf"),
+) -> list[dict[str, Any]]:
+    try:
+        payload = load_payload(localization_path)
+    except Exception:
+        return []
+
+    history = payload.get("history") or []
+    if len(history) < 2:
+        return []
+
+    required_rank = payload.get("eval_context", {}).get("truthful_rank")
+    if required_rank is not None:
+        try:
+            required_rank = int(required_rank)
+        except Exception:
+            required_rank = None
+
+    rows: list[dict[str, Any]] = []
+    example_id = str(payload.get("example_id", localization_path.stem))
+    for right_pos in range(1, len(history)):
+        left_pos = right_pos - 1
+        shared_context_entry = history[left_pos]
+        target_commitment_entry = history[right_pos]
+
+        try:
+            shared_context_deception_rate = float(shared_context_entry.get("deception_rate", float("nan")))
+            commitment_deception_rate = float(target_commitment_entry.get("deception_rate", float("nan")))
+            commitment_delta = commitment_deception_rate - shared_context_deception_rate
+        except Exception:
+            continue
+        if not math.isfinite(commitment_delta):
+            continue
+        if commitment_delta <= float(min_commitment_delta):
+            continue
+        if commitment_deception_rate < float(min_commitment_deception_rate):
+            continue
+
+        try:
+            generations_df, selected_donor_row = choose_honest_donor_generation(
+                shared_context_entry,
+                target_commitment_sentence=str(target_commitment_entry.get("sentence_text", "")),
+                required_rank=required_rank,
+                manual_generation_index=None,
+            )
+        except Exception:
+            continue
+
+        donor_score = float(selected_donor_row.get("honest_clarity_score", float("nan")))
+        if not math.isfinite(donor_score) or donor_score < float(min_donor_clarity_score):
+            continue
+
+        target_prompt = str(target_commitment_entry.get("prompt", payload.get("prompt", "")))
+        donor_prompt = str(selected_donor_row.get("prompt", shared_context_entry.get("prompt", target_prompt)))
+        shared_context_text = str(shared_context_entry.get("prefix_text", ""))
+        donor_shared_context_text = str(selected_donor_row.get("prefix_text", shared_context_text))
+        deceptive_prefix_text = str(target_commitment_entry.get("prefix_text", ""))
+        donor_sentence = str(selected_donor_row.get("first_sentence", ""))
+        truthful_prefix_text = append_continuation(donor_shared_context_text, donor_sentence)
+        donor_full_generation_text = str(selected_donor_row.get("full_generation_text", ""))
+
+        pair_id = (
+            f"{slugify(example_id)}__sent_{int(right_pos)}__"
+            f"donor_{int(selected_donor_row.get('gen_idx', 0))}"
+        )
+        rows.append(
+            {
+                "pair_id": pair_id,
+                "localization_path": str(localization_path),
+                "example_id": example_id,
+                "required_rank": required_rank,
+                "shared_context_sentence_pos": int(left_pos),
+                "commitment_sentence_pos": int(right_pos),
+                "shared_context_sentence_end_idx": shared_context_entry.get("sentence_end_idx"),
+                "commitment_sentence_end_idx": target_commitment_entry.get("sentence_end_idx"),
+                "shared_context_sentence_text": str(shared_context_entry.get("sentence_text", "")),
+                "deceptive_commitment_sentence": str(target_commitment_entry.get("sentence_text", "")),
+                "truthful_donor_sentence": donor_sentence,
+                "donor_first_sentence": donor_sentence,
+                "prompt": target_prompt,
+                "donor_prompt": donor_prompt,
+                "shared_context_text": shared_context_text,
+                "donor_shared_context_text": donor_shared_context_text,
+                "deceptive_prefix_text": deceptive_prefix_text,
+                "truthful_prefix_text": truthful_prefix_text,
+                "shared_context_deception_rate": shared_context_deception_rate,
+                "deceptive_prefix_deception_rate": commitment_deception_rate,
+                "commitment_deception_rate": commitment_deception_rate,
+                "commitment_delta": commitment_delta,
+                "full_trace_deception_rate": float(payload.get("full_score", {}).get("deception_rate", float("nan"))),
+                "shared_context_num_valid": shared_context_entry.get("num_valid"),
+                "shared_context_num_truthful": shared_context_entry.get("num_truthful"),
+                "deceptive_prefix_num_valid": target_commitment_entry.get("num_valid"),
+                "deceptive_prefix_num_truthful": target_commitment_entry.get("num_truthful"),
+                "donor_generation_idx": int(selected_donor_row.get("gen_idx", 0)),
+                "donor_full_generation_text": donor_full_generation_text,
+                "donor_cards_played": to_json_safe(selected_donor_row.get("cards_played")),
+                "donor_action": selected_donor_row.get("action"),
+                "donor_is_truthful": bool(selected_donor_row.get("is_truthful") is True),
+                "donor_deceptive": selected_donor_row.get("deceptive"),
+                "donor_parse_error": selected_donor_row.get("parse_error"),
+                "donor_evaluation": to_json_safe(selected_donor_row.get("evaluation")),
+                "donor_clarity_score": donor_score,
+                "n_truthful_donors": int(generations_df["accepted_truthful_donor"].sum()),
+            }
+        )
+    return rows
+
+
+def _candidate_selection_sort_key(row: dict[str, Any]) -> tuple[float, float, float, int]:
+    return (
+        float(row.get("commitment_delta", float("-inf"))),
+        float(row.get("deceptive_prefix_deception_rate", float("-inf"))),
+        float(row.get("donor_clarity_score", float("-inf"))),
+        int(row.get("n_truthful_donors", 0) or 0),
+    )
+
+
 def search_bs_activation_patch_examples(
     localization_dir: Path,
     *,
     limit: int | None = None,
+    min_commitment_delta: float = 0.0,
+    min_commitment_deception_rate: float = 0.0,
+    min_donor_clarity_score: float = float("-inf"),
+    disable_tqdm: bool = False,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    for path in sorted(localization_dir.glob("sentence_localization_*.json")):
-        row = _build_candidate_selection_row(path)
-        if row is not None and float(row["commitment_delta"]) > 0.0:
-            rows.append(row)
+    paths = sorted(localization_dir.glob("sentence_localization_*.json"))
+    trim_threshold = None if limit is None else max(int(limit) * 4, int(limit) + 100)
+    for path in maybe_tqdm(paths, desc="Search matched BS donors", total=len(paths), disable=disable_tqdm):
+        rows.extend(
+            _build_candidate_selection_rows(
+                path,
+                min_commitment_delta=min_commitment_delta,
+                min_commitment_deception_rate=min_commitment_deception_rate,
+                min_donor_clarity_score=min_donor_clarity_score,
+            )
+        )
+        if trim_threshold is not None and len(rows) > trim_threshold:
+            rows.sort(key=_candidate_selection_sort_key, reverse=True)
+            del rows[int(limit) :]
     df = pd.DataFrame(rows)
     if df.empty:
         return df
     df = df.sort_values(
-        ["donor_clarity_score", "commitment_delta", "commitment_deception_rate"],
-        ascending=[False, False, False],
+        ["commitment_delta", "deceptive_prefix_deception_rate", "donor_clarity_score", "n_truthful_donors"],
+        ascending=[False, False, False, False],
     ).reset_index(drop=True)
     if limit is not None:
         return df.head(int(limit)).reset_index(drop=True)
     return df
+
+
+def pair_cache_metadata_path(pair_cache_path: Path) -> Path:
+    suffix = pair_cache_path.suffix or ".jsonl"
+    return pair_cache_path.with_suffix(suffix + ".metadata.json")
+
+
+def load_or_build_bs_activation_patch_pair_cache(
+    localization_dir: Path,
+    *,
+    pair_cache_path: Path = DEFAULT_PAIR_CACHE_PATH,
+    pair_count: int = DEFAULT_PAIR_COUNT,
+    refresh_cache: bool = False,
+    min_commitment_delta: float = 0.0,
+    min_commitment_deception_rate: float = 0.0,
+    min_donor_clarity_score: float = float("-inf"),
+    disable_tqdm: bool = False,
+) -> pd.DataFrame:
+    pair_cache_path = Path(pair_cache_path).expanduser().resolve()
+    if pair_cache_path.exists() and not refresh_cache:
+        cached_df = pd.DataFrame(read_jsonl_rows(pair_cache_path))
+        if cached_df.empty:
+            raise ValueError(f"Pair cache exists but is empty: {pair_cache_path}")
+        if len(cached_df) < int(pair_count):
+            raise ValueError(
+                f"Pair cache has {len(cached_df)} rows, but pair_count={int(pair_count)} was requested. "
+                "Use --refresh-pair-cache to rebuild it."
+            )
+        return cached_df.head(int(pair_count)).reset_index(drop=True)
+
+    if not localization_dir.exists():
+        raise FileNotFoundError(localization_dir)
+    pair_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    candidates_df = search_bs_activation_patch_examples(
+        localization_dir,
+        limit=int(pair_count),
+        min_commitment_delta=min_commitment_delta,
+        min_commitment_deception_rate=min_commitment_deception_rate,
+        min_donor_clarity_score=min_donor_clarity_score,
+        disable_tqdm=disable_tqdm,
+    )
+    if candidates_df.empty:
+        raise ValueError(f"No matched deceptive/truthful donor pairs found in {localization_dir}")
+
+    selected_df = candidates_df.head(int(pair_count)).reset_index(drop=True)
+    if len(selected_df) < int(pair_count):
+        raise ValueError(
+            f"Only found {len(selected_df)} matched pairs, but pair_count={int(pair_count)} was requested."
+        )
+
+    write_jsonl(pair_cache_path, selected_df.to_dict(orient="records"))
+    selected_df.to_csv(pair_cache_path.with_suffix(".csv"), index=False)
+    write_json(
+        pair_cache_metadata_path(pair_cache_path),
+        {
+            "cache_version": 2,
+            "localization_dir": str(localization_dir),
+            "pair_cache_path": str(pair_cache_path),
+            "pair_count": int(pair_count),
+            "n_candidates_retained": int(len(candidates_df)),
+            "min_commitment_delta": float(min_commitment_delta),
+            "min_commitment_deception_rate": float(min_commitment_deception_rate),
+            "min_donor_clarity_score": float(min_donor_clarity_score),
+            "environment": DEFAULT_ENVIRONMENT,
+            "model_tail": DEFAULT_MODEL_TAIL,
+        },
+    )
+    return selected_df
 
 
 def resolve_primary_cuda_device(device_name: str) -> torch.device:
@@ -482,6 +736,22 @@ def _sequence_slice(start: int, stop: int) -> slice:
     if int(stop) < int(start):
         raise ValueError(f"Invalid slice bounds: start={start}, stop={stop}")
     return slice(int(start), int(stop))
+
+
+def _patch_slice_from_lengths(boundary_len: int, total_len: int, *, patch_scope: str) -> slice:
+    boundary_len = int(boundary_len)
+    total_len = int(total_len)
+    if total_len <= 0:
+        raise ValueError("Cannot patch an empty token sequence.")
+    if str(patch_scope) == "sentence_span":
+        return _sequence_slice(boundary_len, total_len)
+    if str(patch_scope) == "last_token":
+        if total_len <= boundary_len:
+            raise ValueError(
+                f"Cannot patch the last sentence token because total_len={total_len} <= boundary_len={boundary_len}."
+            )
+        return _sequence_slice(total_len - 1, total_len)
+    raise ValueError(f"Unsupported patch_scope={patch_scope!r}; expected 'last_token' or 'sentence_span'.")
 
 
 def _find_sequence_dim(tensor: torch.Tensor, expected_total_len: int | None = None) -> int:
@@ -664,6 +934,7 @@ def prepare_sentence_patch_source(
     donor_full_text: str,
     donor_prefix_boundary_text: str,
     max_model_length: int,
+    patch_scope: str = "sentence_span",
 ) -> dict[str, Any]:
     device = resolve_model_device(model)
     donor_encoded = encode_text_for_model(
@@ -681,13 +952,14 @@ def prepare_sentence_patch_source(
     donor_boundary_len = int(donor_boundary_encoded["input_ids"].shape[1])
     donor_total_len = int(donor_encoded["input_ids"].shape[1])
     donor_sentence_slice = _sequence_slice(donor_boundary_len, donor_total_len)
+    donor_patch_slice = _patch_slice_from_lengths(donor_boundary_len, donor_total_len, patch_scope=patch_scope)
     layers, _ = resolve_decoder_layers(model)
     capture_layers = tuple(range(len(layers)))
     hidden_by_layer, cache_by_layer = _run_prefill_with_capture(
         model,
         donor_encoded,
         capture_layers=capture_layers,
-        capture_slice=donor_sentence_slice,
+        capture_slice=donor_patch_slice,
     )
     return {
         "full_text": donor_full_text,
@@ -696,7 +968,10 @@ def prepare_sentence_patch_source(
         "boundary_len": donor_boundary_len,
         "total_len": donor_total_len,
         "sentence_slice": donor_sentence_slice,
+        "patch_slice": donor_patch_slice,
+        "patch_scope": patch_scope,
         "sentence_token_count": donor_total_len - donor_boundary_len,
+        "patch_token_count": donor_patch_slice.stop - donor_patch_slice.start,
         "hidden_by_layer": hidden_by_layer,
         "cache_by_layer": cache_by_layer,
     }
@@ -717,6 +992,7 @@ def generate_with_sentence_patch(
     temperature: float,
     top_p: float,
     seed: int,
+    patch_scope: str = "sentence_span",
 ) -> dict[str, Any]:
     seed_everything(seed)
     device = resolve_model_device(model)
@@ -735,6 +1011,7 @@ def generate_with_sentence_patch(
     )
     target_boundary_len = int(target_boundary_encoded["input_ids"].shape[1])
     target_sentence_slice = _sequence_slice(target_boundary_len, target_len)
+    target_patch_slice = _patch_slice_from_lengths(target_boundary_len, target_len, patch_scope=patch_scope)
     layers, layer_path = resolve_decoder_layers(model)
     hooks = []
     selected_layers = tuple(int(idx) for idx in (layer_indices or ()))
@@ -752,7 +1029,7 @@ def generate_with_sentence_patch(
                 return output
             patched = _replace_sequence_slice(
                 hidden,
-                target_sentence_slice,
+                target_patch_slice,
                 donor_hidden,
                 expected_total_len=target_len,
             )
@@ -777,13 +1054,13 @@ def generate_with_sentence_patch(
                 layer_idx,
                 _replace_sequence_slice(
                     key_tensor,
-                    target_sentence_slice,
+                    target_patch_slice,
                     donor_key,
                     expected_total_len=target_len,
                 ),
                 _replace_sequence_slice(
                     value_tensor,
-                    target_sentence_slice,
+                    target_patch_slice,
                     donor_value,
                     expected_total_len=target_len,
                 ),
@@ -835,6 +1112,7 @@ def generate_with_sentence_patch(
         "full_text": tokenizer.decode(full_ids, skip_special_tokens=True),
         "target_len": target_len,
         "target_sentence_token_count": int(target_sentence_slice.stop) - int(target_sentence_slice.start),
+        "target_patch_token_count": int(target_patch_slice.stop) - int(target_patch_slice.start),
         "n_new_tokens": n_new_tokens,
         "ended_with_eos": ended_with_eos,
         "hit_token_cap": hit_token_cap,
@@ -843,6 +1121,7 @@ def generate_with_sentence_patch(
         "layer_indices": list(layer_indices or []),
         "patch_label": patch_label,
         "patch_mode": patch_mode,
+        "patch_scope": patch_scope,
         "layer_path": layer_path,
     }
 
@@ -1091,6 +1370,7 @@ def run_generation_condition(
     temperature: float,
     top_p: float,
     seed: int,
+    patch_scope: str = "sentence_span",
 ) -> dict[str, Any]:
     generation = generate_with_sentence_patch(
         model,
@@ -1106,6 +1386,7 @@ def run_generation_condition(
         temperature=temperature,
         top_p=top_p,
         seed=seed,
+        patch_scope=patch_scope,
     )
     evaluation = evaluate_bs_generation(generation["generated_text"], required_rank=required_rank)
     first_sentence, remainder_text = extract_first_sentence(generation["generated_text"])
@@ -1113,6 +1394,7 @@ def run_generation_condition(
         "condition_name": condition_name,
         "patch_label": generation["patch_label"],
         "patch_mode": generation["patch_mode"],
+        "patch_scope": generation["patch_scope"],
         "layer_idx": generation["layer_idx"],
         "layer_indices": generation["layer_indices"],
         "layer_count": len(generation["layer_indices"]),
@@ -1124,6 +1406,7 @@ def run_generation_condition(
         "generated_text": generation["generated_text"],
         "full_text": generation["full_text"],
         "target_sentence_token_count": generation["target_sentence_token_count"],
+        "target_patch_token_count": generation["target_patch_token_count"],
         "n_new_tokens": generation["n_new_tokens"],
         "ended_with_eos": generation["ended_with_eos"],
         "hit_token_cap": generation["hit_token_cap"],
@@ -1170,6 +1453,7 @@ def run_generation_condition_samples(
     seed_start: int,
     n_samples: int,
     disable_tqdm: bool,
+    patch_scope: str = "sentence_span",
     progress_bar: Any | None = None,
     progress_desc: str | None = None,
 ) -> pd.DataFrame:
@@ -1200,6 +1484,7 @@ def run_generation_condition_samples(
             temperature=temperature,
             top_p=top_p,
             seed=int(seed_start) + sample_idx,
+            patch_scope=patch_scope,
         )
         row["sample_idx"] = sample_idx
         rows.append(row)
@@ -1260,10 +1545,61 @@ def parse_layer_candidates(text: str | None) -> list[int] | None:
 def build_default_layer_candidates(n_layers: int) -> list[int]:
     if n_layers <= 0:
         return []
-    candidates = list(range(0, int(n_layers), 3))
-    if candidates[-1] != int(n_layers) - 1:
-        candidates.append(int(n_layers) - 1)
+    candidates = [0]
+    candidates.extend(range(2, int(n_layers), 3))
     return sorted(set(int(layer_idx) for layer_idx in candidates))
+
+
+def build_single_layer_patch_conditions(layer_candidates: list[int]) -> list[dict[str, Any]]:
+    conditions: list[dict[str, Any]] = []
+    for layer_idx in layer_candidates:
+        layer_idx = int(layer_idx)
+        conditions.append(
+            {
+                "condition_name": f"denoising_layer_{layer_idx}",
+                "patch_label": f"Denoising | Layer {layer_idx}",
+                "experiment": "denoising",
+                "target_prefix_role": "deceptive",
+                "donor_prefix_role": "truthful",
+                "patch_mode": "residual",
+                "layer_indices": (layer_idx,),
+            }
+        )
+        conditions.append(
+            {
+                "condition_name": f"noising_layer_{layer_idx}",
+                "patch_label": f"Noising | Layer {layer_idx}",
+                "experiment": "noising",
+                "target_prefix_role": "truthful",
+                "donor_prefix_role": "deceptive",
+                "patch_mode": "residual",
+                "layer_indices": (layer_idx,),
+            }
+        )
+    return conditions
+
+
+def build_baseline_conditions() -> list[dict[str, Any]]:
+    return [
+        {
+            "condition_name": "baseline_deceptive",
+            "patch_label": "Baseline | Deceptive prefix",
+            "experiment": "baseline",
+            "target_prefix_role": "deceptive",
+            "donor_prefix_role": None,
+            "patch_mode": "none",
+            "layer_indices": (),
+        },
+        {
+            "condition_name": "baseline_truthful",
+            "patch_label": "Baseline | Truthful prefix",
+            "experiment": "baseline",
+            "target_prefix_role": "truthful",
+            "donor_prefix_role": None,
+            "patch_mode": "none",
+            "layer_indices": (),
+        },
+    ]
 
 
 def build_layer_group_conditions(n_layers: int, *, layer_candidates: list[int] | None = None) -> list[dict[str, Any]]:
@@ -1387,7 +1723,525 @@ def plot_rate_summary(rate_summary_df: pd.DataFrame, *, out_path: Path, sample_c
     plt.close()
 
 
-def main(argv: list[str] | None = None) -> None:
+def resolve_pair_text_bundle(pair: dict[str, Any]) -> dict[str, str]:
+    prompt = str(pair["prompt"])
+    donor_prompt = str(pair.get("donor_prompt", prompt))
+    shared_context_text = str(pair["shared_context_text"])
+    donor_shared_context_text = str(pair.get("donor_shared_context_text", shared_context_text))
+    deceptive_prefix_text = str(pair["deceptive_prefix_text"])
+    truthful_prefix_text = str(pair["truthful_prefix_text"])
+    return {
+        "deceptive_model_input": prompt + deceptive_prefix_text,
+        "truthful_model_input": donor_prompt + truthful_prefix_text,
+        "deceptive_boundary_text": prompt + shared_context_text,
+        "truthful_boundary_text": donor_prompt + donor_shared_context_text,
+    }
+
+
+def _sample_result_key(row: dict[str, Any]) -> str:
+    layer_key = "none" if row.get("layer_idx") is None or pd.isna(row.get("layer_idx")) else str(int(row["layer_idx"]))
+    return "|".join(
+        [
+            str(row["pair_id"]),
+            str(row["condition_name"]),
+            layer_key,
+            str(int(row["sample_idx"])),
+        ]
+    )
+
+
+def _planned_sample_key(
+    *,
+    pair_id: str,
+    condition_name: str,
+    layer_idx: int | None,
+    sample_idx: int,
+) -> str:
+    layer_key = "none" if layer_idx is None else str(int(layer_idx))
+    return "|".join([str(pair_id), str(condition_name), layer_key, str(int(sample_idx))])
+
+
+def _stat_bucket_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "pair_index": int(row["pair_index"]),
+        "pair_id": str(row["pair_id"]),
+        "example_id": str(row["example_id"]),
+        "condition_name": str(row["condition_name"]),
+        "patch_label": str(row.get("patch_label", "")),
+        "experiment": str(row.get("experiment", "")),
+        "target_prefix_role": str(row.get("target_prefix_role", "")),
+        "donor_prefix_role": row.get("donor_prefix_role"),
+        "patch_mode": str(row.get("patch_mode", "")),
+        "patch_scope": str(row.get("patch_scope", "")),
+        "layer_idx": row.get("layer_idx"),
+        "layer_indices": json.dumps(to_json_safe(row.get("layer_indices", []))),
+        "n_samples": 0,
+        "n_valid": 0,
+        "n_invalid": 0,
+        "n_deceptive": 0,
+        "n_truncated": 0,
+        "sum_new_tokens": 0.0,
+    }
+
+
+def _update_pair_condition_stats(stats: dict[tuple[str, str], dict[str, Any]], row: dict[str, Any]) -> None:
+    key = (str(row["pair_id"]), str(row["condition_name"]))
+    if key not in stats:
+        stats[key] = _stat_bucket_from_row(row)
+    bucket = stats[key]
+    bucket["n_samples"] += 1
+    is_valid = bool(row.get("is_valid") is True)
+    if is_valid:
+        bucket["n_valid"] += 1
+        if row.get("deceptive") is True:
+            bucket["n_deceptive"] += 1
+    else:
+        bucket["n_invalid"] += 1
+    if row.get("likely_truncated") is True:
+        bucket["n_truncated"] += 1
+    try:
+        bucket["sum_new_tokens"] += float(row.get("n_new_tokens", 0.0) or 0.0)
+    except Exception:
+        pass
+
+
+def _pair_condition_summary_rows(stats: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for bucket in stats.values():
+        n_samples = int(bucket["n_samples"])
+        n_valid = int(bucket["n_valid"])
+        n_deceptive = int(bucket["n_deceptive"])
+        deception_rate = float(n_deceptive / n_valid) if n_valid > 0 else float("nan")
+        ci_low, ci_high = wilson_interval(n_deceptive, n_valid) if n_valid > 0 else (float("nan"), float("nan"))
+        row = {
+            key: value
+            for key, value in bucket.items()
+            if key not in {"sum_new_tokens", "n_truncated"}
+        }
+        row.update(
+            {
+                "deception_rate": deception_rate,
+                "ci_low": ci_low,
+                "ci_high": ci_high,
+                "mean_new_tokens": float(bucket["sum_new_tokens"] / n_samples) if n_samples > 0 else float("nan"),
+                "truncation_rate": float(bucket["n_truncated"] / n_samples) if n_samples > 0 else float("nan"),
+            }
+        )
+        rows.append(row)
+    return sorted(rows, key=lambda row: (int(row["pair_index"]), str(row["condition_name"])))
+
+
+def _pooled_condition_summary_rows(stats: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
+    pooled: dict[tuple[str, str, str], dict[str, Any]] = {}
+    pair_rates_by_key: dict[tuple[str, str, str], list[float]] = {}
+    for bucket in stats.values():
+        key = (
+            str(bucket["condition_name"]),
+            str(bucket["experiment"]),
+            str(bucket.get("layer_idx")),
+        )
+        if key not in pooled:
+            pooled[key] = {
+                "condition_name": str(bucket["condition_name"]),
+                "patch_label": str(bucket["patch_label"]),
+                "experiment": str(bucket["experiment"]),
+                "target_prefix_role": str(bucket["target_prefix_role"]),
+                "donor_prefix_role": bucket.get("donor_prefix_role"),
+                "patch_mode": str(bucket["patch_mode"]),
+                "patch_scope": str(bucket["patch_scope"]),
+                "layer_idx": bucket.get("layer_idx"),
+                "layer_indices": bucket.get("layer_indices"),
+                "n_pairs": 0,
+                "n_samples": 0,
+                "n_valid": 0,
+                "n_invalid": 0,
+                "n_deceptive": 0,
+                "n_truncated": 0,
+                "sum_new_tokens": 0.0,
+            }
+            pair_rates_by_key[key] = []
+        out = pooled[key]
+        out["n_pairs"] += 1
+        out["n_samples"] += int(bucket["n_samples"])
+        out["n_valid"] += int(bucket["n_valid"])
+        out["n_invalid"] += int(bucket["n_invalid"])
+        out["n_deceptive"] += int(bucket["n_deceptive"])
+        out["n_truncated"] += int(bucket["n_truncated"])
+        out["sum_new_tokens"] += float(bucket["sum_new_tokens"])
+        if int(bucket["n_valid"]) > 0:
+            pair_rates_by_key[key].append(float(bucket["n_deceptive"]) / float(bucket["n_valid"]))
+
+    rows: list[dict[str, Any]] = []
+    for key, bucket in pooled.items():
+        n_samples = int(bucket["n_samples"])
+        n_valid = int(bucket["n_valid"])
+        n_deceptive = int(bucket["n_deceptive"])
+        pooled_deception_rate = float(n_deceptive / n_valid) if n_valid > 0 else float("nan")
+        ci_low, ci_high = wilson_interval(n_deceptive, n_valid) if n_valid > 0 else (float("nan"), float("nan"))
+        pair_rates = pair_rates_by_key[key]
+        row = {
+            key2: value
+            for key2, value in bucket.items()
+            if key2 not in {"sum_new_tokens", "n_truncated"}
+        }
+        row.update(
+            {
+                "pooled_deception_rate": pooled_deception_rate,
+                "mean_pair_deception_rate": float(np.mean(pair_rates)) if pair_rates else float("nan"),
+                "std_pair_deception_rate": float(np.std(pair_rates, ddof=1)) if len(pair_rates) > 1 else float("nan"),
+                "ci_low": ci_low,
+                "ci_high": ci_high,
+                "mean_new_tokens": float(bucket["sum_new_tokens"] / n_samples) if n_samples > 0 else float("nan"),
+                "truncation_rate": float(bucket["n_truncated"] / n_samples) if n_samples > 0 else float("nan"),
+            }
+        )
+        rows.append(row)
+    return sorted(
+        rows,
+        key=lambda row: (
+            {"baseline": 0, "denoising": 1, "noising": 2}.get(str(row["experiment"]), 99),
+            -1 if row.get("layer_idx") is None or pd.isna(row.get("layer_idx")) else int(row["layer_idx"]),
+            str(row["condition_name"]),
+        ),
+    )
+
+
+def _write_live_summaries(output_root: Path, stats: dict[tuple[str, str], dict[str, Any]]) -> None:
+    pair_rows = _pair_condition_summary_rows(stats)
+    pooled_rows = _pooled_condition_summary_rows(stats)
+    pair_df = pd.DataFrame(pair_rows)
+    pooled_df = pd.DataFrame(pooled_rows)
+    pair_df.to_csv(output_root / "pair_condition_summary_live.csv", index=False)
+    pooled_df.to_csv(output_root / "condition_summary_live.csv", index=False)
+    write_jsonl(output_root / "pair_condition_summary_live.jsonl", pair_rows)
+    write_jsonl(output_root / "condition_summary_live.jsonl", pooled_rows)
+
+
+def _load_completed_samples(samples_path: Path) -> tuple[set[str], dict[tuple[str, str], dict[str, Any]]]:
+    completed_keys: set[str] = set()
+    stats: dict[tuple[str, str], dict[str, Any]] = {}
+    if not samples_path.exists():
+        return completed_keys, stats
+    for row in iter_jsonl_rows(samples_path):
+        key = _sample_result_key(row)
+        completed_keys.add(key)
+        _update_pair_condition_stats(stats, row)
+    return completed_keys, stats
+
+
+def _condition_target_and_donor(
+    condition: dict[str, Any],
+    *,
+    pair_texts: dict[str, str],
+    deceptive_source: dict[str, Any] | None,
+    truthful_source: dict[str, Any] | None,
+) -> tuple[str, str, dict[str, Any] | None]:
+    target_role = str(condition["target_prefix_role"])
+    donor_role = condition.get("donor_prefix_role")
+    if target_role == "deceptive":
+        target_text = pair_texts["deceptive_model_input"]
+        target_boundary_text = pair_texts["deceptive_boundary_text"]
+    elif target_role == "truthful":
+        target_text = pair_texts["truthful_model_input"]
+        target_boundary_text = pair_texts["truthful_boundary_text"]
+    else:
+        raise ValueError(f"Unsupported target_prefix_role={target_role!r}")
+
+    donor_source = None
+    if donor_role == "deceptive":
+        donor_source = deceptive_source
+    elif donor_role == "truthful":
+        donor_source = truthful_source
+    elif donor_role is not None:
+        raise ValueError(f"Unsupported donor_prefix_role={donor_role!r}")
+    return target_text, target_boundary_text, donor_source
+
+
+def _sample_seed(base_seed: int, pair_index: int, condition_index: int, sample_idx: int) -> int:
+    return int(base_seed) + int(pair_index) * 1_000_000 + int(condition_index) * 10_000 + int(sample_idx)
+
+
+def run_matched_pair_patch_experiment(
+    *,
+    pairs_df: pd.DataFrame,
+    output_root: Path,
+    model_name_or_path: str = DEFAULT_MODEL_NAME,
+    max_model_length: int = 10000,
+    max_new_tokens: int = 10000,
+    samples_per_condition: int = 50,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    base_seed: int = 17,
+    cuda_device_name: str = "cuda:0",
+    layer_candidates: list[int] | None = None,
+    include_baselines: bool = True,
+    patch_scope: str = "last_token",
+    resume: bool = True,
+    disable_tqdm: bool = False,
+) -> Path:
+    if pairs_df.empty:
+        raise ValueError("pairs_df is empty.")
+    if int(samples_per_condition) <= 0:
+        raise ValueError("samples_per_condition must be positive.")
+    if patch_scope != "last_token":
+        raise ValueError("The matched-pair experiment is intended to patch only patch_scope='last_token'.")
+
+    output_root = Path(output_root).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    samples_path = output_root / "samples.jsonl"
+    completed_keys, stats = _load_completed_samples(samples_path) if resume else (set(), {})
+
+    pairs_df = pairs_df.reset_index(drop=True).copy()
+    if "pair_index" in pairs_df.columns:
+        pairs_df = pairs_df.drop(columns=["pair_index"])
+    pairs_df.insert(0, "pair_index", np.arange(len(pairs_df), dtype=int))
+    pairs_df.to_csv(output_root / "matched_pairs.csv", index=False)
+    write_jsonl(output_root / "matched_pairs.jsonl", pairs_df.to_dict(orient="records"))
+
+    seed_everything(int(base_seed))
+    cuda_device = resolve_primary_cuda_device(cuda_device_name)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = int(max_model_length)
+    if hasattr(tokenizer, "init_kwargs"):
+        tokenizer.init_kwargs["model_max_length"] = int(max_model_length)
+
+    model_kwargs = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "dtype": torch.bfloat16,
+        "device_map": single_gpu_device_map(cuda_device),
+    }
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+    model.eval()
+    assert_model_fully_on_cuda(model)
+
+    model_context_limit = getattr(model.config, "max_position_embeddings", None)
+    requested_total_tokens = int(max_model_length) + int(max_new_tokens)
+    if model_context_limit is not None and requested_total_tokens > int(model_context_limit):
+        raise ValueError(
+            f"Requested max_model_length + max_new_tokens = {requested_total_tokens} exceeds "
+            f"model max_position_embeddings = {int(model_context_limit)}."
+        )
+
+    layers, layer_path = resolve_decoder_layers(model)
+    n_layers = len(layers)
+    if layer_candidates is None:
+        layer_candidates = build_default_layer_candidates(n_layers)
+    layer_candidates = sorted({int(layer_idx) for layer_idx in layer_candidates if 0 <= int(layer_idx) < int(n_layers)})
+    patch_conditions = build_single_layer_patch_conditions(layer_candidates)
+    all_conditions = (build_baseline_conditions() if include_baselines else []) + patch_conditions
+
+    run_config = {
+        "mode": "matched_pair_last_token_patch",
+        "model_name_or_path": model_name_or_path,
+        "environment": DEFAULT_ENVIRONMENT,
+        "model_tail": DEFAULT_MODEL_TAIL,
+        "n_pairs": int(len(pairs_df)),
+        "max_model_length": int(max_model_length),
+        "max_new_tokens": int(max_new_tokens),
+        "samples_per_condition": int(samples_per_condition),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "base_seed": int(base_seed),
+        "cuda_device": str(cuda_device),
+        "model_context_limit": None if model_context_limit is None else int(model_context_limit),
+        "requested_total_tokens": int(requested_total_tokens),
+        "decoder_layer_path": layer_path,
+        "n_layers": int(n_layers),
+        "layer_candidates": [int(layer_idx) for layer_idx in layer_candidates],
+        "patch_scope": patch_scope,
+        "patch_modes": ["residual"],
+        "include_baselines": bool(include_baselines),
+        "conditions": [
+            {
+                "condition_name": condition["condition_name"],
+                "patch_label": condition["patch_label"],
+                "experiment": condition["experiment"],
+                "target_prefix_role": condition["target_prefix_role"],
+                "donor_prefix_role": condition["donor_prefix_role"],
+                "patch_mode": condition["patch_mode"],
+                "layer_indices": [int(layer_idx) for layer_idx in condition["layer_indices"]],
+            }
+            for condition in all_conditions
+        ],
+        "parameter_devices": parameter_device_summary(model),
+        "resume": bool(resume),
+    }
+    write_json(output_root / "run_config.json", run_config)
+
+    token_debug_rows: list[dict[str, Any]] = []
+    total_planned = len(pairs_df) * len(all_conditions) * int(samples_per_condition)
+    remaining = 0
+    for _, pair in pairs_df.iterrows():
+        for condition in all_conditions:
+            layer_indices = tuple(int(layer_idx) for layer_idx in condition["layer_indices"])
+            layer_idx = layer_indices[0] if len(layer_indices) == 1 else None
+            for sample_idx in range(int(samples_per_condition)):
+                key = _planned_sample_key(
+                    pair_id=str(pair["pair_id"]),
+                    condition_name=str(condition["condition_name"]),
+                    layer_idx=layer_idx,
+                    sample_idx=sample_idx,
+                )
+                if key not in completed_keys:
+                    remaining += 1
+
+    print(f"Output root: {output_root}")
+    print(f"Matched pairs: {len(pairs_df)}")
+    print(f"Layer candidates: {layer_candidates}")
+    print(
+        "Workload: "
+        f"{len(pairs_df)} pairs x {len(all_conditions)} conditions x {int(samples_per_condition)} samples "
+        f"= {total_planned} generations ({remaining} remaining after resume)."
+    )
+
+    progress = None
+    if not disable_tqdm and _tqdm is not None:
+        progress = _tqdm(total=remaining, desc="Matched patch generations", leave=True)
+
+    try:
+        for pair_index, pair in pairs_df.iterrows():
+            pair_dict = pair.to_dict()
+            pair_texts = resolve_pair_text_bundle(pair_dict)
+            required_rank = int(pair_dict["required_rank"])
+
+            token_debug_rows.extend(
+                [
+                    {
+                        "pair_index": int(pair_index),
+                        "pair_id": str(pair_dict["pair_id"]),
+                        **describe_text_for_model(
+                            tokenizer,
+                            "deceptive_prefix",
+                            pair_texts["deceptive_model_input"],
+                            max_model_length=int(max_model_length),
+                        ),
+                    },
+                    {
+                        "pair_index": int(pair_index),
+                        "pair_id": str(pair_dict["pair_id"]),
+                        **describe_text_for_model(
+                            tokenizer,
+                            "truthful_prefix",
+                            pair_texts["truthful_model_input"],
+                            max_model_length=int(max_model_length),
+                        ),
+                    },
+                ]
+            )
+            pd.DataFrame(token_debug_rows).to_csv(output_root / "token_debug_live.csv", index=False)
+
+            needs_denoising = any(condition.get("donor_prefix_role") == "truthful" for condition in patch_conditions)
+            needs_noising = any(condition.get("donor_prefix_role") == "deceptive" for condition in patch_conditions)
+            truthful_source = (
+                prepare_sentence_patch_source(
+                    model,
+                    tokenizer,
+                    donor_full_text=pair_texts["truthful_model_input"],
+                    donor_prefix_boundary_text=pair_texts["truthful_boundary_text"],
+                    max_model_length=int(max_model_length),
+                    patch_scope=patch_scope,
+                )
+                if needs_denoising
+                else None
+            )
+            deceptive_source = (
+                prepare_sentence_patch_source(
+                    model,
+                    tokenizer,
+                    donor_full_text=pair_texts["deceptive_model_input"],
+                    donor_prefix_boundary_text=pair_texts["deceptive_boundary_text"],
+                    max_model_length=int(max_model_length),
+                    patch_scope=patch_scope,
+                )
+                if needs_noising
+                else None
+            )
+
+            for condition_index, condition in enumerate(all_conditions):
+                layer_indices = tuple(int(layer_idx) for layer_idx in condition["layer_indices"])
+                layer_idx = layer_indices[0] if len(layer_indices) == 1 else None
+                target_text, target_boundary_text, donor_source = _condition_target_and_donor(
+                    condition,
+                    pair_texts=pair_texts,
+                    deceptive_source=deceptive_source,
+                    truthful_source=truthful_source,
+                )
+                for sample_idx in range(int(samples_per_condition)):
+                    planned_key = _planned_sample_key(
+                        pair_id=str(pair_dict["pair_id"]),
+                        condition_name=str(condition["condition_name"]),
+                        layer_idx=layer_idx,
+                        sample_idx=sample_idx,
+                    )
+                    if planned_key in completed_keys:
+                        continue
+
+                    seed = _sample_seed(int(base_seed), int(pair_index), int(condition_index), int(sample_idx))
+                    row = run_generation_condition(
+                        model,
+                        tokenizer,
+                        condition_name=str(condition["condition_name"]),
+                        target_text=target_text,
+                        target_prefix_boundary_text=target_boundary_text,
+                        patch_label=str(condition["patch_label"]),
+                        patch_mode=str(condition["patch_mode"]),
+                        layer_indices=layer_indices,
+                        donor_source=donor_source,
+                        required_rank=required_rank,
+                        max_model_length=int(max_model_length),
+                        max_new_tokens=int(max_new_tokens),
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        seed=seed,
+                        patch_scope=patch_scope,
+                    )
+                    row.pop("target_text", None)
+                    row.pop("target_prefix_boundary_text", None)
+                    row.update(
+                        {
+                            "pair_index": int(pair_index),
+                            "pair_id": str(pair_dict["pair_id"]),
+                            "example_id": str(pair_dict["example_id"]),
+                            "required_rank": required_rank,
+                            "experiment": str(condition["experiment"]),
+                            "target_prefix_role": str(condition["target_prefix_role"]),
+                            "donor_prefix_role": condition.get("donor_prefix_role"),
+                            "sample_idx": int(sample_idx),
+                            "seed": int(seed),
+                            "shared_context_deception_rate": float(pair_dict["shared_context_deception_rate"]),
+                            "deceptive_prefix_deception_rate": float(pair_dict["deceptive_prefix_deception_rate"]),
+                            "commitment_delta": float(pair_dict["commitment_delta"]),
+                            "donor_generation_idx": int(pair_dict["donor_generation_idx"]),
+                            "donor_clarity_score": float(pair_dict["donor_clarity_score"]),
+                        }
+                    )
+                    append_jsonl_row(samples_path, row)
+                    completed_keys.add(planned_key)
+                    _update_pair_condition_stats(stats, row)
+                    if progress is not None:
+                        progress.update(1)
+
+                _write_live_summaries(output_root, stats)
+    finally:
+        if progress is not None:
+            progress.close()
+
+    _write_live_summaries(output_root, stats)
+    pair_summary_live = output_root / "pair_condition_summary_live.csv"
+    condition_summary_live = output_root / "condition_summary_live.csv"
+    if pair_summary_live.exists():
+        shutil.copy2(pair_summary_live, output_root / "pair_condition_summary.csv")
+    if condition_summary_live.exists():
+        shutil.copy2(condition_summary_live, output_root / "condition_summary.csv")
+    print(f"Saved matched activation patching artifacts to {output_root}")
+    return output_root
+
+
+def legacy_single_example_main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Activation patching sweep for BS localization examples.")
     parser.add_argument("--localization-path", type=str, default="")
     parser.add_argument(
@@ -1861,6 +2715,145 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     print(f"Saved activation patching artifacts to {output_root}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Matched BS activation patching for Qwen-7B: cache the 100 best deceptive commitment "
+            "spikes with truthful donor sentences, then run denoising/noising last-token patches."
+        )
+    )
+    parser.add_argument(
+        "--localization-dir",
+        type=str,
+        default=os.environ.get("ACT_PATCH_LOCALIZATION_DIR", str(DEFAULT_LOCALIZATION_DIR)),
+        help="Qwen-7B BS localization directory.",
+    )
+    parser.add_argument(
+        "--pair-cache-path",
+        type=str,
+        default=os.environ.get("ACT_PATCH_PAIR_CACHE_PATH", str(DEFAULT_PAIR_CACHE_PATH)),
+    )
+    parser.add_argument("--refresh-pair-cache", action="store_true", default=False)
+    parser.add_argument("--cache-only", action="store_true", default=False)
+    parser.add_argument("--pair-count", type=int, default=int(os.environ.get("ACT_PATCH_PAIR_COUNT", DEFAULT_PAIR_COUNT)))
+    parser.add_argument("--min-commitment-delta", type=float, default=0.0)
+    parser.add_argument("--min-commitment-deception-rate", type=float, default=0.0)
+    parser.add_argument("--min-donor-clarity-score", type=float, default=float("-inf"))
+    parser.add_argument(
+        "--model-name-or-path",
+        type=str,
+        default=os.environ.get("ACT_PATCH_MODEL_NAME", DEFAULT_MODEL_NAME),
+    )
+    parser.add_argument(
+        "--max-model-length",
+        type=int,
+        default=int(os.environ.get("ACT_PATCH_MAX_MODEL_LENGTH", "10000")),
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=int(os.environ.get("ACT_PATCH_MAX_NEW_TOKENS", "10000")),
+    )
+    parser.add_argument(
+        "--rate-sample-count",
+        type=int,
+        default=int(os.environ.get("ACT_PATCH_RATE_SAMPLE_COUNT", "50")),
+        help="Continuations per pair/condition. Defaults to 50.",
+    )
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--base-seed", type=int, default=17)
+    parser.add_argument(
+        "--cuda-device",
+        type=str,
+        default=os.environ.get("ACT_PATCH_CUDA_DEVICE", "cuda:0"),
+    )
+    parser.add_argument(
+        "--layer-candidates",
+        type=str,
+        default="",
+        help="Comma-separated layer list. Defaults to 0,2,5,... for the loaded model.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=str,
+        default=str(ROOT_DIR / "Results" / "activation_patching"),
+    )
+    parser.add_argument("--run-tag", type=str, default="")
+    parser.add_argument("--no-baselines", action="store_true", default=False)
+    parser.add_argument("--no-resume", action="store_true", default=False)
+    parser.add_argument(
+        "--plot-only-run-dir",
+        type=str,
+        default="",
+        help="Skip generation and rebuild live summaries from samples.jsonl in this run directory.",
+    )
+    parser.add_argument("--disable-tqdm", action="store_true", default=False)
+    args = parser.parse_args(argv)
+
+    if int(args.pair_count) <= 0:
+        raise ValueError("--pair-count must be positive.")
+    if int(args.max_model_length) <= 0:
+        raise ValueError("--max-model-length must be positive.")
+    if int(args.max_new_tokens) <= 0:
+        raise ValueError("--max-new-tokens must be positive.")
+    if int(args.rate_sample_count) <= 0:
+        raise ValueError("--rate-sample-count must be positive.")
+
+    if args.plot_only_run_dir.strip():
+        run_dir = Path(args.plot_only_run_dir).expanduser().resolve()
+        samples_path = run_dir / "samples.jsonl"
+        if not samples_path.exists():
+            raise FileNotFoundError(samples_path)
+        _, stats = _load_completed_samples(samples_path)
+        _write_live_summaries(run_dir, stats)
+        shutil.copy2(run_dir / "pair_condition_summary_live.csv", run_dir / "pair_condition_summary.csv")
+        shutil.copy2(run_dir / "condition_summary_live.csv", run_dir / "condition_summary.csv")
+        print(f"Rebuilt live summaries from {samples_path}")
+        return
+
+    localization_dir = Path(args.localization_dir).expanduser().resolve()
+    pair_cache_path = Path(args.pair_cache_path).expanduser().resolve()
+    pairs_df = load_or_build_bs_activation_patch_pair_cache(
+        localization_dir,
+        pair_cache_path=pair_cache_path,
+        pair_count=int(args.pair_count),
+        refresh_cache=bool(args.refresh_pair_cache),
+        min_commitment_delta=float(args.min_commitment_delta),
+        min_commitment_deception_rate=float(args.min_commitment_deception_rate),
+        min_donor_clarity_score=float(args.min_donor_clarity_score),
+        disable_tqdm=bool(args.disable_tqdm),
+    )
+    print(f"Loaded {len(pairs_df)} matched pairs from {pair_cache_path}")
+    if args.cache_only:
+        print("Cache-only mode complete.")
+        return
+
+    layer_candidates = parse_layer_candidates(args.layer_candidates)
+    run_tag = args.run_tag.strip() or (
+        f"{DEFAULT_ENVIRONMENT}_{slugify(DEFAULT_MODEL_TAIL)}_matched{int(args.pair_count)}_"
+        f"last_token_residual_seed{int(args.base_seed)}"
+    )
+    output_root = Path(args.output_root).expanduser().resolve() / run_tag
+    run_matched_pair_patch_experiment(
+        pairs_df=pairs_df,
+        output_root=output_root,
+        model_name_or_path=str(args.model_name_or_path),
+        max_model_length=int(args.max_model_length),
+        max_new_tokens=int(args.max_new_tokens),
+        samples_per_condition=int(args.rate_sample_count),
+        temperature=float(args.temperature),
+        top_p=float(args.top_p),
+        base_seed=int(args.base_seed),
+        cuda_device_name=str(args.cuda_device),
+        layer_candidates=layer_candidates,
+        include_baselines=not bool(args.no_baselines),
+        patch_scope="last_token",
+        resume=not bool(args.no_resume),
+        disable_tqdm=bool(args.disable_tqdm),
+    )
 
 
 if __name__ == "__main__":
