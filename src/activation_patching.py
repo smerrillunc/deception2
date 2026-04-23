@@ -1183,6 +1183,211 @@ def generate_with_sentence_patch(
     }
 
 
+def _repeat_encoded_for_batch(encoded: dict[str, torch.Tensor], batch_size: int) -> dict[str, torch.Tensor]:
+    repeated: dict[str, torch.Tensor] = {}
+    for key, value in encoded.items():
+        repeats = (int(batch_size),) + (1,) * (value.ndim - 1)
+        repeated[key] = value.repeat(repeats)
+    return repeated
+
+
+def _make_finished_decode_token(tokenizer: Any, *, device: torch.device) -> int:
+    if tokenizer.eos_token_id is not None:
+        return int(tokenizer.eos_token_id)
+    if tokenizer.pad_token_id is not None:
+        return int(tokenizer.pad_token_id)
+    return 0
+
+
+def _repeat_past_key_values_for_batch(past_key_values: Any, batch_size: int) -> Any:
+    batch_size = int(batch_size)
+    if batch_size <= 1 or past_key_values is None:
+        return past_key_values
+    if hasattr(past_key_values, "batch_repeat_interleave"):
+        repeated = past_key_values.batch_repeat_interleave(batch_size)
+        return past_key_values if repeated is None else repeated
+    if isinstance(past_key_values, tuple):
+        return tuple(_repeat_past_key_values_for_batch(layer_cache, batch_size) for layer_cache in past_key_values)
+    if isinstance(past_key_values, list):
+        return [_repeat_past_key_values_for_batch(layer_cache, batch_size) for layer_cache in past_key_values]
+    if torch.is_tensor(past_key_values):
+        return past_key_values.repeat_interleave(batch_size, dim=0)
+    return past_key_values
+
+
+def generate_batch_with_sentence_patch(
+    model: Any,
+    tokenizer: Any,
+    *,
+    target_text: str,
+    target_prefix_boundary_text: str,
+    patch_label: str | None,
+    patch_mode: str,
+    layer_indices: tuple[int, ...] | None,
+    donor_source: dict[str, Any] | None,
+    max_model_length: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    seeds: list[int],
+    patch_scope: str = "sentence_span",
+    early_stop_on_valid_json: bool = False,
+    early_stop_required_rank: int | None = None,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
+) -> list[dict[str, Any]]:
+    if not seeds:
+        return []
+    if patch_mode in {"kv", "both"}:
+        raise NotImplementedError("Batched generation only supports residual or unpatched conditions.")
+
+    batch_size = len(seeds)
+    seed_everything(int(seeds[0]))
+    device = resolve_model_device(model)
+    encoded_single = encode_text_for_model(
+        tokenizer,
+        target_text,
+        device=device,
+        max_input_tokens=max_model_length,
+    )
+    target_len = int(encoded_single["input_ids"].shape[1])
+    target_boundary_encoded = encode_text_for_model(
+        tokenizer,
+        target_prefix_boundary_text,
+        device=device,
+        max_input_tokens=max_model_length,
+    )
+    target_boundary_len = int(target_boundary_encoded["input_ids"].shape[1])
+    target_sentence_slice = _sequence_slice(target_boundary_len, target_len)
+    target_patch_slice = _patch_slice_from_lengths(target_boundary_len, target_len, patch_scope=patch_scope)
+    layers, layer_path = resolve_decoder_layers(model)
+    hooks = []
+    selected_layers = tuple(int(idx) for idx in (layer_indices or ()))
+    if selected_layers and donor_source is None:
+        raise ValueError("donor_source is required when patching layers.")
+
+    for layer_idx in selected_layers if patch_mode == "residual" else ():
+        donor_hidden = donor_source["hidden_by_layer"][layer_idx]
+
+        def patch_hook(_module: Any, _inputs: Any, output: Any, donor_hidden: torch.Tensor = donor_hidden) -> Any:
+            hidden = hidden_from_output(output)
+            if int(hidden.shape[1]) != int(target_len):
+                return output
+            patched = _replace_sequence_slice(
+                hidden,
+                target_patch_slice,
+                donor_hidden,
+                expected_total_len=target_len,
+            )
+            return replace_hidden_in_output(output, patched)
+
+        hooks.append(layers[layer_idx].register_forward_hook(patch_hook))
+
+    try:
+        with torch.no_grad():
+            outputs = model(**encoded_single, use_cache=True, return_dict=True)
+    finally:
+        for handle in hooks:
+            handle.remove()
+
+    past_key_values = _repeat_past_key_values_for_batch(_ensure_decode_cache(outputs.past_key_values), batch_size)
+    generator_device = device if device.type != "cpu" else torch.device("cpu")
+    generators = [torch.Generator(device=generator_device).manual_seed(int(seed)) for seed in seeds]
+    finished_token_id = _make_finished_decode_token(tokenizer, device=device)
+
+    generated_token_ids_by_row: list[list[int]] = [[] for _ in range(batch_size)]
+    ended_with_eos_by_row = [False for _ in range(batch_size)]
+    json_stopped_by_row = [False for _ in range(batch_size)]
+
+    def sample_next_tokens(logits: torch.Tensor) -> torch.Tensor:
+        next_tokens: list[torch.Tensor] = []
+        for row_idx in range(batch_size):
+            if (
+                ended_with_eos_by_row[row_idx]
+                or json_stopped_by_row[row_idx]
+                or len(generated_token_ids_by_row[row_idx]) >= int(max_new_tokens)
+            ):
+                token = torch.tensor([[finished_token_id]], dtype=encoded_single["input_ids"].dtype, device=device)
+            else:
+                token = _sample_next_token(
+                    logits[row_idx : row_idx + 1],
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    generator=generators[row_idx],
+                ).to(device=device)
+                token_id = int(token.item())
+                generated_token_ids_by_row[row_idx].append(token_id)
+                ended_with_eos_by_row[row_idx] = (
+                    tokenizer.eos_token_id is not None and token_id == int(tokenizer.eos_token_id)
+                )
+                if early_stop_on_valid_json and not ended_with_eos_by_row[row_idx]:
+                    n_tokens = len(generated_token_ids_by_row[row_idx])
+                    interval = max(int(early_stop_check_interval), 1)
+                    if (
+                        early_stop_required_rank is not None
+                        and n_tokens >= int(early_stop_min_new_tokens)
+                        and (interval <= 1 or n_tokens % interval == 0)
+                    ):
+                        text = tokenizer.decode(generated_token_ids_by_row[row_idx], skip_special_tokens=True)
+                        try:
+                            evaluation = evaluate_bs_generation(text, required_rank=int(early_stop_required_rank))
+                            json_stopped_by_row[row_idx] = bool(evaluation.get("is_valid") is True)
+                        except Exception:
+                            json_stopped_by_row[row_idx] = False
+            next_tokens.append(token)
+        return torch.cat(next_tokens, dim=0)
+
+    next_input_ids = sample_next_tokens(outputs.logits[:, -1, :].expand(batch_size, -1))
+    while (
+        not all(
+            ended_with_eos_by_row[row_idx]
+            or json_stopped_by_row[row_idx]
+            or len(generated_token_ids_by_row[row_idx]) >= int(max_new_tokens)
+            for row_idx in range(batch_size)
+        )
+    ):
+        with torch.no_grad():
+            step_outputs = model(
+                input_ids=next_input_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+        past_key_values = step_outputs.past_key_values
+        next_input_ids = sample_next_tokens(step_outputs.logits[:, -1, :])
+
+    rows: list[dict[str, Any]] = []
+    input_ids_single = encoded_single["input_ids"][0]
+    for row_idx, ids in enumerate(generated_token_ids_by_row):
+        new_ids = torch.tensor(ids, dtype=input_ids_single.dtype, device=input_ids_single.device)
+        full_ids = torch.cat([input_ids_single, new_ids], dim=0)
+        generated_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+        n_new_tokens = len(ids)
+        hit_token_cap = n_new_tokens >= int(max_new_tokens)
+        likely_truncated = bool(hit_token_cap and not ended_with_eos_by_row[row_idx] and not json_stopped_by_row[row_idx])
+        rows.append(
+            {
+                "generated_text": generated_text,
+                "full_text": tokenizer.decode(full_ids, skip_special_tokens=True),
+                "target_len": target_len,
+                "target_sentence_token_count": int(target_sentence_slice.stop) - int(target_sentence_slice.start),
+                "target_patch_token_count": int(target_patch_slice.stop) - int(target_patch_slice.start),
+                "n_new_tokens": n_new_tokens,
+                "ended_with_eos": ended_with_eos_by_row[row_idx],
+                "early_stopped_on_valid_json": json_stopped_by_row[row_idx],
+                "hit_token_cap": hit_token_cap,
+                "likely_truncated": likely_truncated,
+                "layer_idx": layer_indices[0] if layer_indices and len(layer_indices) == 1 else None,
+                "layer_indices": list(layer_indices or []),
+                "patch_label": patch_label,
+                "patch_mode": patch_mode,
+                "patch_scope": patch_scope,
+                "layer_path": layer_path,
+            }
+        )
+    return rows
+
+
 def extract_last_json_object(text: str) -> dict[str, Any]:
     spans: list[tuple[int, int]] = []
     depth = 0
@@ -1483,6 +1688,90 @@ def run_generation_condition(
         "error": evaluation["error"],
         "parsed": evaluation["parsed"],
     }
+
+
+def run_generation_condition_batch_samples(
+    model: Any,
+    tokenizer: Any,
+    *,
+    condition_name: str,
+    target_text: str,
+    target_prefix_boundary_text: str,
+    patch_label: str | None,
+    patch_mode: str,
+    layer_indices: tuple[int, ...] | None,
+    donor_source: dict[str, Any] | None,
+    required_rank: int,
+    max_model_length: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    sample_indices: list[int],
+    seed_start: int,
+    patch_scope: str = "sentence_span",
+    early_stop_on_valid_json: bool = False,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
+) -> list[dict[str, Any]]:
+    seeds = [int(seed_start) + int(sample_idx) for sample_idx in sample_indices]
+    generations = generate_batch_with_sentence_patch(
+        model,
+        tokenizer,
+        target_text=target_text,
+        target_prefix_boundary_text=target_prefix_boundary_text,
+        patch_label=patch_label,
+        patch_mode=patch_mode,
+        layer_indices=layer_indices,
+        donor_source=donor_source,
+        max_model_length=max_model_length,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        seeds=seeds,
+        patch_scope=patch_scope,
+        early_stop_on_valid_json=early_stop_on_valid_json,
+        early_stop_required_rank=required_rank,
+        early_stop_check_interval=int(early_stop_check_interval),
+        early_stop_min_new_tokens=int(early_stop_min_new_tokens),
+    )
+
+    rows: list[dict[str, Any]] = []
+    for sample_idx, seed, generation in zip(sample_indices, seeds, generations):
+        evaluation = evaluate_bs_generation(generation["generated_text"], required_rank=required_rank)
+        first_sentence, remainder_text = extract_first_sentence(generation["generated_text"])
+        rows.append(
+            {
+                "condition_name": condition_name,
+                "patch_label": generation["patch_label"],
+                "patch_mode": generation["patch_mode"],
+                "patch_scope": generation["patch_scope"],
+                "layer_idx": generation["layer_idx"],
+                "layer_indices": generation["layer_indices"],
+                "layer_count": len(generation["layer_indices"]),
+                "seed": int(seed),
+                "sample_idx": int(sample_idx),
+                "target_text": target_text,
+                "target_prefix_boundary_text": target_prefix_boundary_text,
+                "first_generated_sentence": first_sentence,
+                "remainder_text": remainder_text,
+                "generated_text": generation["generated_text"],
+                "full_text": generation["full_text"],
+                "target_sentence_token_count": generation["target_sentence_token_count"],
+                "target_patch_token_count": generation["target_patch_token_count"],
+                "n_new_tokens": generation["n_new_tokens"],
+                "ended_with_eos": generation["ended_with_eos"],
+                "early_stopped_on_valid_json": generation["early_stopped_on_valid_json"],
+                "hit_token_cap": generation["hit_token_cap"],
+                "likely_truncated": generation["likely_truncated"],
+                "is_valid": evaluation["is_valid"],
+                "deceptive": evaluation["deceptive"],
+                "action": evaluation["action"],
+                "cards_played": evaluation["cards_played"],
+                "error": evaluation["error"],
+                "parsed": evaluation["parsed"],
+            }
+        )
+    return rows
 
 
 def wilson_interval(n_success: int, n_total: int, z: float = 1.96) -> tuple[float, float]:
@@ -2050,20 +2339,27 @@ def _sample_seed(base_seed: int, pair_index: int, condition_index: int, sample_i
     return int(base_seed) + int(pair_index) * 1_000_000 + int(condition_index) * 10_000 + int(sample_idx)
 
 
+def iter_chunks(values: list[int], chunk_size: int) -> Iterable[list[int]]:
+    chunk_size = max(int(chunk_size), 1)
+    for start in range(0, len(values), chunk_size):
+        yield values[start : start + chunk_size]
+
+
 def run_matched_pair_patch_experiment(
     *,
     pairs_df: pd.DataFrame,
     output_root: Path,
     model_name_or_path: str = DEFAULT_MODEL_NAME,
     max_model_length: int = 10000,
-    max_new_tokens: int = 10000,
-    samples_per_condition: int = 50,
+    max_new_tokens: int = 2048,
+    samples_per_condition: int = 25,
+    batch_size: int = 8,
     temperature: float = 0.8,
     top_p: float = 0.95,
     base_seed: int = 17,
     cuda_device_name: str = "cuda:0",
     layer_candidates: list[int] | None = None,
-    layer_count: int | None = None,
+    layer_count: int | None = 5,
     include_baselines: bool = True,
     patch_scope: str = "last_token",
     early_stop_on_valid_json: bool = True,
@@ -2076,6 +2372,8 @@ def run_matched_pair_patch_experiment(
         raise ValueError("pairs_df is empty.")
     if int(samples_per_condition) <= 0:
         raise ValueError("samples_per_condition must be positive.")
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive.")
     if patch_scope != "last_token":
         raise ValueError("The matched-pair experiment is intended to patch only patch_scope='last_token'.")
 
@@ -2139,6 +2437,7 @@ def run_matched_pair_patch_experiment(
         "max_model_length": int(max_model_length),
         "max_new_tokens": int(max_new_tokens),
         "samples_per_condition": int(samples_per_condition),
+        "batch_size": int(batch_size),
         "temperature": float(temperature),
         "top_p": float(top_p),
         "base_seed": int(base_seed),
@@ -2272,6 +2571,7 @@ def run_matched_pair_patch_experiment(
                     deceptive_source=deceptive_source,
                     truthful_source=truthful_source,
                 )
+                pending_sample_indices: list[int] = []
                 for sample_idx in range(int(samples_per_condition)):
                     planned_key = _planned_sample_key(
                         pair_id=str(pair_dict["pair_id"]),
@@ -2279,11 +2579,16 @@ def run_matched_pair_patch_experiment(
                         layer_idx=layer_idx,
                         sample_idx=sample_idx,
                     )
-                    if planned_key in completed_keys:
-                        continue
+                    if planned_key not in completed_keys:
+                        pending_sample_indices.append(int(sample_idx))
 
-                    seed = _sample_seed(int(base_seed), int(pair_index), int(condition_index), int(sample_idx))
-                    row = run_generation_condition(
+                seed_start = _sample_seed(int(base_seed), int(pair_index), int(condition_index), 0)
+                for sample_chunk in iter_chunks(pending_sample_indices, int(batch_size)):
+                    if progress is not None:
+                        progress.set_postfix_str(
+                            f"pair={int(pair_index)} condition={condition['condition_name']} batch={len(sample_chunk)}"
+                        )
+                    batch_rows = run_generation_condition_batch_samples(
                         model,
                         tokenizer,
                         condition_name=str(condition["condition_name"]),
@@ -2298,37 +2603,45 @@ def run_matched_pair_patch_experiment(
                         max_new_tokens=int(max_new_tokens),
                         temperature=float(temperature),
                         top_p=float(top_p),
-                        seed=seed,
+                        sample_indices=sample_chunk,
+                        seed_start=seed_start,
                         patch_scope=patch_scope,
                         early_stop_on_valid_json=bool(early_stop_on_valid_json),
                         early_stop_check_interval=int(early_stop_check_interval),
                         early_stop_min_new_tokens=int(early_stop_min_new_tokens),
                     )
-                    row.pop("target_text", None)
-                    row.pop("target_prefix_boundary_text", None)
-                    row.update(
-                        {
-                            "pair_index": int(pair_index),
-                            "pair_id": str(pair_dict["pair_id"]),
-                            "example_id": str(pair_dict["example_id"]),
-                            "required_rank": required_rank,
-                            "experiment": str(condition["experiment"]),
-                            "target_prefix_role": str(condition["target_prefix_role"]),
-                            "donor_prefix_role": condition.get("donor_prefix_role"),
-                            "sample_idx": int(sample_idx),
-                            "seed": int(seed),
-                            "shared_context_deception_rate": float(pair_dict["shared_context_deception_rate"]),
-                            "deceptive_prefix_deception_rate": float(pair_dict["deceptive_prefix_deception_rate"]),
-                            "commitment_delta": float(pair_dict["commitment_delta"]),
-                            "donor_generation_idx": int(pair_dict["donor_generation_idx"]),
-                            "donor_clarity_score": float(pair_dict["donor_clarity_score"]),
-                        }
-                    )
-                    append_jsonl_row(samples_path, row)
-                    completed_keys.add(planned_key)
-                    _update_pair_condition_stats(stats, row)
+                    for row in batch_rows:
+                        sample_idx = int(row["sample_idx"])
+                        planned_key = _planned_sample_key(
+                            pair_id=str(pair_dict["pair_id"]),
+                            condition_name=str(condition["condition_name"]),
+                            layer_idx=layer_idx,
+                            sample_idx=sample_idx,
+                        )
+                        row.pop("target_text", None)
+                        row.pop("target_prefix_boundary_text", None)
+                        row.update(
+                            {
+                                "pair_index": int(pair_index),
+                                "pair_id": str(pair_dict["pair_id"]),
+                                "example_id": str(pair_dict["example_id"]),
+                                "required_rank": required_rank,
+                                "experiment": str(condition["experiment"]),
+                                "target_prefix_role": str(condition["target_prefix_role"]),
+                                "donor_prefix_role": condition.get("donor_prefix_role"),
+                                "shared_context_deception_rate": float(pair_dict["shared_context_deception_rate"]),
+                                "deceptive_prefix_deception_rate": float(pair_dict["deceptive_prefix_deception_rate"]),
+                                "commitment_delta": float(pair_dict["commitment_delta"]),
+                                "donor_generation_idx": int(pair_dict["donor_generation_idx"]),
+                                "donor_clarity_score": float(pair_dict["donor_clarity_score"]),
+                            }
+                        )
+                        append_jsonl_row(samples_path, row)
+                        completed_keys.add(planned_key)
+                        _update_pair_condition_stats(stats, row)
                     if progress is not None:
-                        progress.update(1)
+                        progress.update(len(batch_rows))
+                    _write_live_summaries(output_root, stats)
 
                 _write_live_summaries(output_root, stats)
     finally:
@@ -2363,7 +2676,7 @@ def legacy_single_example_main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=int(os.environ.get("ACT_PATCH_MAX_NEW_TOKENS", "10000")),
+        default=int(os.environ.get("ACT_PATCH_MAX_NEW_TOKENS", "2048")),
     )
     parser.add_argument(
         "--rate-sample-count",
@@ -2859,13 +3172,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=int(os.environ.get("ACT_PATCH_MAX_NEW_TOKENS", "10000")),
+        default=int(os.environ.get("ACT_PATCH_MAX_NEW_TOKENS", "2048")),
     )
     parser.add_argument(
         "--rate-sample-count",
         type=int,
-        default=int(os.environ.get("ACT_PATCH_RATE_SAMPLE_COUNT", "50")),
-        help="Continuations per pair/condition. Defaults to 50.",
+        default=int(os.environ.get("ACT_PATCH_RATE_SAMPLE_COUNT", "25")),
+        help="Continuations per pair/condition. Defaults to 25.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(os.environ.get("ACT_PATCH_BATCH_SIZE", "8")),
+        help="Number of continuations to decode together for one pair/condition.",
     )
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -2879,12 +3198,12 @@ def main(argv: list[str] | None = None) -> None:
         "--layer-candidates",
         type=str,
         default="",
-        help="Comma-separated layer list. Defaults to 0,2,5,... for the loaded model.",
+        help="Comma-separated layer list. Overrides --layer-count.",
     )
     parser.add_argument(
         "--layer-count",
         type=int,
-        default=int(os.environ.get("ACT_PATCH_LAYER_COUNT", "0")),
+        default=int(os.environ.get("ACT_PATCH_LAYER_COUNT", "5")),
         help="Use this many evenly-spaced layers unless --layer-candidates is set.",
     )
     parser.add_argument("--no-early-stop-on-valid-json", action="store_true", default=False)
@@ -2923,6 +3242,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--max-new-tokens must be positive.")
     if int(args.rate_sample_count) <= 0:
         raise ValueError("--rate-sample-count must be positive.")
+    if int(args.batch_size) <= 0:
+        raise ValueError("--batch-size must be positive.")
     if int(args.early_stop_check_interval) <= 0:
         raise ValueError("--early-stop-check-interval must be positive.")
     if int(args.early_stop_min_new_tokens) < 0:
@@ -2967,7 +3288,8 @@ def main(argv: list[str] | None = None) -> None:
     stop_tag = "jsonstop" if not bool(args.no_early_stop_on_valid_json) else "nojsonstop"
     run_tag = args.run_tag.strip() or (
         f"{DEFAULT_ENVIRONMENT}_{slugify(DEFAULT_MODEL_TAIL)}_matched{int(args.pair_count)}_"
-        f"last_token_residual_{layer_tag}_n{int(args.rate_sample_count)}_{stop_tag}_seed{int(args.base_seed)}"
+        f"last_token_residual_{layer_tag}_n{int(args.rate_sample_count)}_"
+        f"maxnew{int(args.max_new_tokens)}_batch{int(args.batch_size)}_{stop_tag}_seed{int(args.base_seed)}"
     )
     output_root = Path(args.output_root).expanduser().resolve() / run_tag
     run_matched_pair_patch_experiment(
@@ -2977,6 +3299,7 @@ def main(argv: list[str] | None = None) -> None:
         max_model_length=int(args.max_model_length),
         max_new_tokens=int(args.max_new_tokens),
         samples_per_condition=int(args.rate_sample_count),
+        batch_size=int(args.batch_size),
         temperature=float(args.temperature),
         top_p=float(args.top_p),
         base_seed=int(args.base_seed),
