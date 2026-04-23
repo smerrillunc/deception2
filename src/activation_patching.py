@@ -821,17 +821,44 @@ def _replace_sequence_slice(
     return out
 
 
+def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, name)
+    except (AttributeError, TypeError):
+        return default
+
+
 def _get_layer_cache_pair(past_key_values: Any, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-    key_cache = getattr(past_key_values, "key_cache", None)
-    value_cache = getattr(past_key_values, "value_cache", None)
+    layer_idx = int(layer_idx)
+
+    layers = _safe_getattr(past_key_values, "layers", None)
+    if layers is not None:
+        layer = layers[layer_idx]
+        layer_keys = _safe_getattr(layer, "keys", None)
+        layer_values = _safe_getattr(layer, "values", None)
+        if torch.is_tensor(layer_keys) and torch.is_tensor(layer_values):
+            return layer_keys, layer_values
+        if isinstance(layer, (list, tuple)) and len(layer) >= 2:
+            return layer[0], layer[1]
+
+    key_cache = _safe_getattr(past_key_values, "key_cache", None)
+    value_cache = _safe_getattr(past_key_values, "value_cache", None)
     if key_cache is not None and value_cache is not None:
-        return key_cache[int(layer_idx)], value_cache[int(layer_idx)]
-    if hasattr(past_key_values, "to_legacy_cache"):
-        legacy_cache = past_key_values.to_legacy_cache()
-        layer_cache = legacy_cache[int(layer_idx)]
+        return key_cache[layer_idx], value_cache[layer_idx]
+
+    to_legacy_cache = _safe_getattr(past_key_values, "to_legacy_cache", None)
+    if callable(to_legacy_cache):
+        legacy_cache = to_legacy_cache()
+        layer_cache = legacy_cache[layer_idx]
         if isinstance(layer_cache, (list, tuple)) and len(layer_cache) >= 2:
             return layer_cache[0], layer_cache[1]
-    layer_cache = past_key_values[int(layer_idx)]
+
+    try:
+        layer_cache = past_key_values[layer_idx]
+    except TypeError as exc:
+        raise TypeError(
+            f"Unsupported cache structure for layer {layer_idx}: {type(past_key_values)}"
+        ) from exc
     if isinstance(layer_cache, (list, tuple)) and len(layer_cache) >= 2:
         return layer_cache[0], layer_cache[1]
     raise TypeError(f"Unsupported cache structure for layer {layer_idx}: {type(layer_cache)}")
@@ -843,16 +870,33 @@ def _set_layer_cache_pair(
     key_tensor: torch.Tensor,
     value_tensor: torch.Tensor,
 ) -> Any:
-    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
-        past_key_values.key_cache[int(layer_idx)] = key_tensor
-        past_key_values.value_cache[int(layer_idx)] = value_tensor
+    layer_idx = int(layer_idx)
+
+    layers = _safe_getattr(past_key_values, "layers", None)
+    if layers is not None:
+        layer = layers[layer_idx]
+        if hasattr(layer, "keys") and hasattr(layer, "values"):
+            layer.keys = key_tensor
+            layer.values = value_tensor
+            return past_key_values
+        if isinstance(layer, list):
+            layer[0] = key_tensor
+            layer[1] = value_tensor
+            return past_key_values
+        if isinstance(layer, tuple) and len(layer) >= 2:
+            layers[layer_idx] = (key_tensor, value_tensor, *layer[2:])
+            return past_key_values
+
+    if _safe_getattr(past_key_values, "key_cache", None) is not None and _safe_getattr(past_key_values, "value_cache", None) is not None:
+        past_key_values.key_cache[layer_idx] = key_tensor
+        past_key_values.value_cache[layer_idx] = value_tensor
         return past_key_values
 
     outer = list(past_key_values)
-    inner = list(outer[int(layer_idx)])
+    inner = list(outer[layer_idx])
     inner[0] = key_tensor
     inner[1] = value_tensor
-    outer[int(layer_idx)] = tuple(inner) if isinstance(outer[int(layer_idx)], tuple) else inner
+    outer[layer_idx] = tuple(inner) if isinstance(outer[layer_idx], tuple) else inner
     return tuple(outer) if isinstance(past_key_values, tuple) else outer
 
 
@@ -1238,8 +1282,6 @@ def generate_batch_with_sentence_patch(
 ) -> list[dict[str, Any]]:
     if not seeds:
         return []
-    if patch_mode in {"kv", "both"}:
-        raise NotImplementedError("Batched generation only supports residual or unpatched conditions.")
 
     batch_size = len(seeds)
     seed_everything(int(seeds[0]))
@@ -1265,8 +1307,10 @@ def generate_batch_with_sentence_patch(
     selected_layers = tuple(int(idx) for idx in (layer_indices or ()))
     if selected_layers and donor_source is None:
         raise ValueError("donor_source is required when patching layers.")
+    apply_residual_patch = patch_mode in {"residual", "both"}
+    apply_kv_patch = patch_mode in {"kv", "both"}
 
-    for layer_idx in selected_layers if patch_mode == "residual" else ():
+    for layer_idx in selected_layers if apply_residual_patch else ():
         donor_hidden = donor_source["hidden_by_layer"][layer_idx]
 
         def patch_hook(_module: Any, _inputs: Any, output: Any, donor_hidden: torch.Tensor = donor_hidden) -> Any:
@@ -1290,7 +1334,28 @@ def generate_batch_with_sentence_patch(
         for handle in hooks:
             handle.remove()
 
-    past_key_values = _repeat_past_key_values_for_batch(_ensure_decode_cache(outputs.past_key_values), batch_size)
+    past_key_values = outputs.past_key_values
+    if apply_kv_patch:
+        for layer_idx in selected_layers:
+            donor_key, donor_value = donor_source["cache_by_layer"][layer_idx]
+            key_tensor, value_tensor = _get_layer_cache_pair(past_key_values, layer_idx)
+            past_key_values = _set_layer_cache_pair(
+                past_key_values,
+                layer_idx,
+                _replace_sequence_slice(
+                    key_tensor,
+                    target_patch_slice,
+                    donor_key,
+                    expected_total_len=target_len,
+                ),
+                _replace_sequence_slice(
+                    value_tensor,
+                    target_patch_slice,
+                    donor_value,
+                    expected_total_len=target_len,
+                ),
+            )
+    past_key_values = _repeat_past_key_values_for_batch(_ensure_decode_cache(past_key_values), batch_size)
     generator_device = device if device.type != "cpu" else torch.device("cpu")
     generators = [torch.Generator(device=generator_device).manual_seed(int(seed)) for seed in seeds]
     finished_token_id = _make_finished_decode_token(tokenizer, device=device)
@@ -1947,6 +2012,49 @@ def build_single_layer_patch_conditions(layer_candidates: list[int]) -> list[dic
                 "layer_indices": (layer_idx,),
             }
         )
+    return conditions
+
+
+def build_single_layer_patch_conditions_with_modes(
+    layer_candidates: list[int],
+    *,
+    patch_modes: Iterable[str],
+) -> list[dict[str, Any]]:
+    mode_label_map = {
+        "residual": "Residual",
+        "kv": "K/V",
+        "both": "Residual + K/V",
+    }
+    conditions: list[dict[str, Any]] = []
+    for raw_patch_mode in patch_modes:
+        patch_mode = str(raw_patch_mode).strip().lower()
+        if patch_mode not in mode_label_map:
+            raise ValueError(f"Unsupported patch_mode={raw_patch_mode!r}")
+        mode_label = mode_label_map[patch_mode]
+        for layer_idx in layer_candidates:
+            layer_idx = int(layer_idx)
+            conditions.append(
+                {
+                    "condition_name": f"denoising_layer_{layer_idx}__{patch_mode}",
+                    "patch_label": f"{mode_label} | Denoising | Layer {layer_idx}",
+                    "experiment": "denoising",
+                    "target_prefix_role": "deceptive",
+                    "donor_prefix_role": "truthful",
+                    "patch_mode": patch_mode,
+                    "layer_indices": (layer_idx,),
+                }
+            )
+            conditions.append(
+                {
+                    "condition_name": f"noising_layer_{layer_idx}__{patch_mode}",
+                    "patch_label": f"{mode_label} | Noising | Layer {layer_idx}",
+                    "experiment": "noising",
+                    "target_prefix_role": "truthful",
+                    "donor_prefix_role": "deceptive",
+                    "patch_mode": patch_mode,
+                    "layer_indices": (layer_idx,),
+                }
+            )
     return conditions
 
 
