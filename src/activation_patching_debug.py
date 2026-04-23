@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import inspect
 import json
 import math
@@ -25,6 +26,27 @@ DEFAULT_DEBUG_MAX_NEW_TOKENS = 2048
 DEFAULT_DEBUG_LAYER_COUNT = 5
 DEFAULT_DEBUG_PATCH_MODES = ("residual", "kv", "both")
 DEFAULT_DEBUG_OUTPUT_ROOT = ap.ROOT_DIR / "Results" / "activation_patching_debug"
+DEFAULT_STEERING_SAMPLE_COUNT = 50
+DEFAULT_STEERING_BATCH_SIZE = 8
+DEFAULT_STEERING_MAX_NEW_TOKENS = 2048
+DEFAULT_STEERING_PATCH_MODES = ("both",)
+DEFAULT_STEERING_LAYER_TOPKS = (1,)
+DEFAULT_TRUTHFUL_STEERING_PAIR_COUNT = 150
+DEFAULT_TRUTHFUL_STEERING_EVAL_PAIR_COUNT = 50
+DEFAULT_TRUTHFUL_STEERING_GENERATION_EVAL_COUNT = 25
+DEFAULT_TRUTHFUL_STEERING_LAYER_COUNT = 8
+DEFAULT_TRUTHFUL_STEERING_ALPHA_VALUES = (0.25, 0.5, 1.0)
+DEFAULT_TRUTHFUL_STEERING_VECTOR_TYPES = ("learned", "random", "shuffled")
+DEFAULT_TRUTHFUL_STEERING_GENERATION_TOPK = 2
+DEFAULT_TRUTHFUL_STEERING_GREEDY_MAX_NEW_TOKENS = 128
+DEFAULT_POST_COMMITMENT_SUFFIX_SENTENCE_COUNT = 2
+DEFAULT_POST_COMMITMENT_PERSISTENT_TOKENS = (0, 16)
+DEFAULT_POST_COMMITMENT_PAIR_CACHE_PATH = (
+    ap.ROOT_DIR
+    / "Cache"
+    / "activation_patching"
+    / f"{ap.DEFAULT_ENVIRONMENT}_{ap.DEFAULT_MODEL_TAIL}_post_commitment_repair_pairs_n{DEFAULT_TRUTHFUL_STEERING_PAIR_COUNT}.jsonl"
+)
 DEFAULT_COMMITMENT_PAIR_COUNT = 50
 DEFAULT_COMMITMENT_IG_STEPS = 4
 DEFAULT_COMMITMENT_FAITHFULNESS = 0.85
@@ -35,7 +57,7 @@ DEFAULT_COMMITMENT_OBJECTIVE_TOKEN_COUNT = 3
 DEFAULT_COMMITMENT_OBJECTIVE_TOKEN_POSITION = "last"
 DEFAULT_COMMITMENT_EXCLUDE_FINAL_LAYERS = 2
 DEFAULT_COMMITMENT_PAIR_SEARCH_LIMIT = 400
-DEFAULT_EXPERIMENT_MODE = "commitment_eap_ig"
+DEFAULT_EXPERIMENT_MODE = "post_commitment_repair_steering"
 TAG_ONLY_RE = re.compile(r"^\s*</?[^>]+>\s*$")
 
 
@@ -55,6 +77,87 @@ def parse_patch_modes(text: str) -> list[str]:
     if not patch_modes:
         raise ValueError("At least one patch mode is required.")
     return patch_modes
+
+
+def parse_positive_int_list(text: str, *, name: str) -> list[int]:
+    values: list[int] = []
+    for raw_piece in str(text).split(","):
+        piece = raw_piece.strip()
+        if not piece:
+            continue
+        value = int(piece)
+        if value <= 0:
+            raise ValueError(f"{name} entries must be positive integers, got {value}.")
+        values.append(int(value))
+    if not values:
+        raise ValueError(f"{name} requires at least one positive integer.")
+    return sorted({int(value) for value in values})
+
+
+def parse_float_list(text: str, *, name: str) -> list[float]:
+    values: list[float] = []
+    for raw_piece in str(text).split(","):
+        piece = raw_piece.strip()
+        if not piece:
+            continue
+        value = float(piece)
+        if not math.isfinite(value):
+            raise ValueError(f"{name} entries must be finite, got {value}.")
+        values.append(float(value))
+    if not values:
+        raise ValueError(f"{name} requires at least one value.")
+    return sorted({float(value) for value in values})
+
+
+def parse_nonnegative_int_list(text: str, *, name: str) -> list[int]:
+    values: list[int] = []
+    for raw_piece in str(text).split(","):
+        piece = raw_piece.strip()
+        if not piece:
+            continue
+        value = int(piece)
+        if value < 0:
+            raise ValueError(f"{name} entries must be non-negative integers, got {value}.")
+        values.append(int(value))
+    if not values:
+        raise ValueError(f"{name} requires at least one non-negative integer.")
+    return sorted({int(value) for value in values})
+
+
+def parse_vector_types(text: str) -> list[str]:
+    allowed = {"learned", "random", "shuffled"}
+    values: list[str] = []
+    for raw_piece in str(text).split(","):
+        piece = raw_piece.strip().lower()
+        if not piece:
+            continue
+        if piece not in allowed:
+            raise ValueError(f"Unsupported vector type {raw_piece!r}. Choose from learned, random, shuffled.")
+        if piece not in values:
+            values.append(piece)
+    if not values:
+        raise ValueError("At least one steering vector type is required.")
+    return values
+
+
+def _alpha_tag(value: float) -> str:
+    text = f"{float(value):.6g}"
+    return text.replace("-", "m").replace(".", "p")
+
+
+def _normalize_vector(vector: torch.Tensor) -> torch.Tensor:
+    vector = vector.detach().float().cpu()
+    norm = torch.linalg.vector_norm(vector)
+    if not torch.isfinite(norm) or float(norm.item()) <= 1e-12:
+        raise ValueError("Cannot normalize a near-zero vector.")
+    return vector / norm
+
+
+def _make_random_unit_vector(*, dim: int, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    vector = torch.randn(int(dim), generator=generator, dtype=torch.float32)
+    return _normalize_vector(vector)
 
 
 def build_patch_conditions_with_modes(layer_candidates: list[int], *, patch_modes: Iterable[str]) -> list[dict[str, Any]]:
@@ -331,6 +434,116 @@ def _write_debug_delta_summaries(
     ).reset_index(drop=True)
     pooled_df.to_csv(pooled_delta_path, index=False)
     ap.write_jsonl(output_root / "condition_delta_live.jsonl", pooled_df.to_dict(orient="records"))
+
+
+def resolve_commitment_pair_text_bundle(pair: dict[str, Any]) -> dict[str, str]:
+    shared_prefix_text = str(pair["shared_prefix_text"])
+    deceptive_branch_text = str(pair["deceptive_branch_text"])
+    truthful_branch_text = str(pair["truthful_branch_text"])
+    return {
+        "deceptive_model_input": deceptive_branch_text,
+        "truthful_model_input": truthful_branch_text,
+        "deceptive_boundary_text": shared_prefix_text,
+        "truthful_boundary_text": shared_prefix_text,
+    }
+
+
+def load_commitment_pairs_from_run_dir(
+    run_dir: Path,
+    *,
+    pair_count: int | None = None,
+) -> pd.DataFrame:
+    run_dir = Path(run_dir).expanduser().resolve()
+    pairs_path = run_dir / "commitment_pairs.csv"
+    if not pairs_path.exists():
+        raise FileNotFoundError(pairs_path)
+    pairs_df = pd.read_csv(pairs_path)
+    if pairs_df.empty:
+        raise ValueError(f"Saved commitment pair file is empty: {pairs_path}")
+    if pair_count is not None and int(pair_count) > 0:
+        if len(pairs_df) < int(pair_count):
+            raise ValueError(
+                f"Saved pair file only has {len(pairs_df)} rows, but pair_count={int(pair_count)} was requested."
+            )
+        pairs_df = pairs_df.head(int(pair_count)).reset_index(drop=True)
+    return pairs_df
+
+
+def load_direction_layer_rankings_from_run_dir(
+    run_dir: Path,
+    *,
+    ranking_metric: str = "mean_attribution",
+) -> dict[str, list[int]]:
+    run_dir = Path(run_dir).expanduser().resolve()
+    ranking_path = run_dir / "site_ranking.csv"
+    if not ranking_path.exists():
+        raise FileNotFoundError(ranking_path)
+    ranking_df = pd.read_csv(ranking_path)
+    if ranking_df.empty:
+        raise ValueError(f"Site ranking file is empty: {ranking_path}")
+    if ranking_metric not in {"mean_attribution", "mean_abs_attribution"}:
+        raise ValueError(f"Unsupported ranking_metric={ranking_metric!r}")
+
+    direction_rankings: dict[str, list[int]] = {}
+    for direction, group in ranking_df.groupby("direction", sort=False):
+        layer_df = (
+            group.groupby("layer_idx", as_index=False)
+            .agg(score=(ranking_metric, "sum"))
+            .sort_values(["score", "layer_idx"], ascending=[False, True])
+            .reset_index(drop=True)
+        )
+        direction_rankings[str(direction)] = [int(layer_idx) for layer_idx in layer_df["layer_idx"].tolist()]
+    if not direction_rankings:
+        raise ValueError(f"No direction rankings found in {ranking_path}")
+    return direction_rankings
+
+
+def build_continuation_steering_conditions(
+    *,
+    direction_layer_rankings: dict[str, list[int]],
+    layer_topks: list[int],
+    patch_modes: Iterable[str],
+) -> list[dict[str, Any]]:
+    patch_modes = parse_patch_modes(",".join(str(mode) for mode in patch_modes))
+    conditions: list[dict[str, Any]] = []
+    direction_specs = [
+        ("denoising", "deceptive", "truthful", "deceptive_to_truthful"),
+        ("noising", "truthful", "deceptive", "truthful_to_deceptive"),
+    ]
+    mode_label_map = {
+        "residual": "Residual",
+        "kv": "K/V",
+        "both": "Residual + K/V",
+    }
+
+    for experiment, target_role, donor_role, ranking_direction in direction_specs:
+        ranked_layers = [int(layer_idx) for layer_idx in direction_layer_rankings.get(ranking_direction, [])]
+        if not ranked_layers:
+            raise ValueError(f"No ranked layers found for direction={ranking_direction!r}")
+        for topk in layer_topks:
+            selected_layers = tuple(ranked_layers[: int(topk)])
+            if len(selected_layers) < int(topk):
+                raise ValueError(
+                    f"Requested topk={int(topk)} layers for {ranking_direction}, "
+                    f"but only {len(selected_layers)} ranked layers are available."
+                )
+            layer_tag = "layer" if int(topk) == 1 else "layers"
+            for patch_mode in patch_modes:
+                mode_label = mode_label_map[str(patch_mode)]
+                conditions.append(
+                    {
+                        "condition_name": f"{experiment}_top{int(topk)}{layer_tag}__{patch_mode}",
+                        "patch_label": f"{mode_label} | {experiment.title()} | Top {int(topk)} {layer_tag}",
+                        "experiment": experiment,
+                        "target_prefix_role": target_role,
+                        "donor_prefix_role": donor_role,
+                        "patch_mode": str(patch_mode),
+                        "layer_indices": selected_layers,
+                        "ranking_direction": ranking_direction,
+                        "topk_layers": int(topk),
+                    }
+                )
+    return conditions
 
 
 def run_debug_patch_experiment(
@@ -1916,20 +2129,1680 @@ def run_commitment_eap_ig_experiment(
     return output_root
 
 
+def run_commitment_continuation_steering_experiment(
+    *,
+    pairs_df: pd.DataFrame,
+    output_root: Path,
+    direction_layer_rankings: dict[str, list[int]],
+    layer_topks: list[int],
+    steering_patch_modes: Iterable[str],
+    model_name_or_path: str = ap.DEFAULT_MODEL_NAME,
+    max_model_length: int = 10000,
+    max_new_tokens: int = DEFAULT_STEERING_MAX_NEW_TOKENS,
+    samples_per_condition: int = DEFAULT_STEERING_SAMPLE_COUNT,
+    batch_size: int = DEFAULT_STEERING_BATCH_SIZE,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    base_seed: int = 17,
+    cuda_device_name: str = "cuda:0",
+    early_stop_on_valid_json: bool = True,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
+    resume: bool = True,
+    disable_tqdm: bool = False,
+    steering_source_run_dir: Path | None = None,
+) -> Path:
+    if pairs_df.empty:
+        raise ValueError("pairs_df is empty.")
+    if int(samples_per_condition) <= 0:
+        raise ValueError("samples_per_condition must be positive.")
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive.")
+
+    output_root = Path(output_root).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    samples_path = output_root / "samples.jsonl"
+    completed_keys, stats = ap._load_completed_samples(samples_path) if resume else (set(), {})
+
+    pairs_df = pairs_df.reset_index(drop=True).copy()
+    if "pair_index" in pairs_df.columns:
+        pairs_df = pairs_df.drop(columns=["pair_index"])
+    pairs_df.insert(0, "pair_index", np.arange(len(pairs_df), dtype=int))
+    pairs_df.to_csv(output_root / "steering_pairs.csv", index=False)
+    ap.write_jsonl(output_root / "steering_pairs.jsonl", pairs_df.to_dict(orient="records"))
+
+    ap.seed_everything(int(base_seed))
+    cuda_device = ap.resolve_primary_cuda_device(cuda_device_name)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = int(max_model_length)
+    if hasattr(tokenizer, "init_kwargs"):
+        tokenizer.init_kwargs["model_max_length"] = int(max_model_length)
+
+    model_kwargs = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "device_map": ap.single_gpu_device_map(cuda_device),
+    }
+    model = load_model_with_dtype_compat(
+        model_name_or_path,
+        common_kwargs=model_kwargs,
+        dtype_value=torch.bfloat16,
+    )
+    model.eval()
+    ap.assert_model_fully_on_cuda(model)
+
+    model_context_limit = getattr(model.config, "max_position_embeddings", None)
+    requested_total_tokens = int(max_model_length) + int(max_new_tokens)
+    if model_context_limit is not None and requested_total_tokens > int(model_context_limit):
+        raise ValueError(
+            f"Requested max_model_length + max_new_tokens = {requested_total_tokens} exceeds "
+            f"model max_position_embeddings = {int(model_context_limit)}."
+        )
+
+    steering_conditions = build_continuation_steering_conditions(
+        direction_layer_rankings=direction_layer_rankings,
+        layer_topks=layer_topks,
+        patch_modes=steering_patch_modes,
+    )
+    all_conditions = ap.build_baseline_conditions() + steering_conditions
+    capture_cache = any(str(condition["patch_mode"]) in {"kv", "both"} for condition in steering_conditions)
+
+    run_config = {
+        "mode": "commitment_continuation_steering",
+        "hypothesis": (
+            "Patch only the final token of the commitment sentence, then sample the generated continuation "
+            "to test whether the suffix deception rate changes."
+        ),
+        "model_name_or_path": model_name_or_path,
+        "environment": ap.DEFAULT_ENVIRONMENT,
+        "model_tail": ap.DEFAULT_MODEL_TAIL,
+        "n_pairs": int(len(pairs_df)),
+        "max_model_length": int(max_model_length),
+        "max_new_tokens": int(max_new_tokens),
+        "samples_per_condition": int(samples_per_condition),
+        "batch_size": int(batch_size),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "base_seed": int(base_seed),
+        "cuda_device": str(cuda_device),
+        "model_context_limit": None if model_context_limit is None else int(model_context_limit),
+        "requested_total_tokens": int(requested_total_tokens),
+        "patch_scope": "last_token",
+        "capture_cache": bool(capture_cache),
+        "early_stop_on_valid_json": bool(early_stop_on_valid_json),
+        "early_stop_check_interval": int(early_stop_check_interval),
+        "early_stop_min_new_tokens": int(early_stop_min_new_tokens),
+        "steering_source_run_dir": None if steering_source_run_dir is None else str(Path(steering_source_run_dir).expanduser().resolve()),
+        "direction_layer_rankings": {key: [int(v) for v in values] for key, values in direction_layer_rankings.items()},
+        "layer_topks": [int(v) for v in layer_topks],
+        "patch_modes": [str(mode) for mode in parse_patch_modes(",".join(str(mode) for mode in steering_patch_modes))],
+        "conditions": [
+            {
+                "condition_name": condition["condition_name"],
+                "patch_label": condition["patch_label"],
+                "experiment": condition["experiment"],
+                "target_prefix_role": condition["target_prefix_role"],
+                "donor_prefix_role": condition["donor_prefix_role"],
+                "patch_mode": condition["patch_mode"],
+                "layer_indices": [int(layer_idx) for layer_idx in condition["layer_indices"]],
+                "ranking_direction": condition.get("ranking_direction"),
+                "topk_layers": condition.get("topk_layers"),
+            }
+            for condition in all_conditions
+        ],
+        "parameter_devices": ap.parameter_device_summary(model),
+        "resume": bool(resume),
+    }
+    ap.write_json(output_root / "run_config.json", run_config)
+
+    total_planned = len(pairs_df) * len(all_conditions) * int(samples_per_condition)
+    remaining = 0
+    for _, pair in pairs_df.iterrows():
+        for condition in all_conditions:
+            layer_indices = tuple(int(layer_idx) for layer_idx in condition["layer_indices"])
+            layer_idx = layer_indices[0] if len(layer_indices) == 1 else None
+            for sample_idx in range(int(samples_per_condition)):
+                key = ap._planned_sample_key(
+                    pair_id=str(pair["pair_id"]),
+                    condition_name=str(condition["condition_name"]),
+                    layer_idx=layer_idx,
+                    sample_idx=sample_idx,
+                )
+                if key not in completed_keys:
+                    remaining += 1
+
+    print(f"Output root: {output_root}")
+    print(f"Steering pairs: {len(pairs_df)}")
+    print(f"Layer topks: {layer_topks}")
+    print(f"Patch modes: {parse_patch_modes(','.join(str(mode) for mode in steering_patch_modes))}")
+    print(
+        "Workload: "
+        f"{len(pairs_df)} pairs x {len(all_conditions)} conditions x {int(samples_per_condition)} samples "
+        f"= {total_planned} generations ({remaining} remaining after resume)."
+    )
+
+    progress = None
+    if not disable_tqdm and ap._tqdm is not None:
+        progress = ap._tqdm(total=remaining, desc="Continuation steering generations", leave=True)
+
+    try:
+        for pair_index, pair in pairs_df.iterrows():
+            pair_dict = pair.to_dict()
+            pair_texts = resolve_commitment_pair_text_bundle(pair_dict)
+            required_rank = int(pair_dict["required_rank"])
+
+            truthful_source = ap.prepare_sentence_patch_source(
+                model,
+                tokenizer,
+                donor_full_text=pair_texts["truthful_model_input"],
+                donor_prefix_boundary_text=pair_texts["truthful_boundary_text"],
+                max_model_length=int(max_model_length),
+                patch_scope="last_token",
+                capture_cache=bool(capture_cache),
+            )
+            deceptive_source = ap.prepare_sentence_patch_source(
+                model,
+                tokenizer,
+                donor_full_text=pair_texts["deceptive_model_input"],
+                donor_prefix_boundary_text=pair_texts["deceptive_boundary_text"],
+                max_model_length=int(max_model_length),
+                patch_scope="last_token",
+                capture_cache=bool(capture_cache),
+            )
+
+            for condition_index, condition in enumerate(all_conditions):
+                layer_indices = tuple(int(layer_idx) for layer_idx in condition["layer_indices"])
+                layer_idx = layer_indices[0] if len(layer_indices) == 1 else None
+                target_text, target_boundary_text, donor_source = ap._condition_target_and_donor(
+                    condition,
+                    pair_texts=pair_texts,
+                    deceptive_source=deceptive_source,
+                    truthful_source=truthful_source,
+                )
+                pending_sample_indices: list[int] = []
+                for sample_idx in range(int(samples_per_condition)):
+                    planned_key = ap._planned_sample_key(
+                        pair_id=str(pair_dict["pair_id"]),
+                        condition_name=str(condition["condition_name"]),
+                        layer_idx=layer_idx,
+                        sample_idx=sample_idx,
+                    )
+                    if planned_key not in completed_keys:
+                        pending_sample_indices.append(int(sample_idx))
+
+                seed_start = ap._sample_seed(int(base_seed), int(pair_index), int(condition_index), 0)
+                for sample_chunk in ap.iter_chunks(pending_sample_indices, int(batch_size)):
+                    if progress is not None:
+                        progress.set_postfix_str(
+                            f"pair={int(pair_index)} condition={condition['condition_name']} batch={len(sample_chunk)}"
+                        )
+                    batch_rows = run_generation_condition_samples_compat(
+                        model,
+                        tokenizer,
+                        condition_name=str(condition["condition_name"]),
+                        target_text=target_text,
+                        target_prefix_boundary_text=target_boundary_text,
+                        patch_label=str(condition["patch_label"]),
+                        patch_mode=str(condition["patch_mode"]),
+                        layer_indices=layer_indices,
+                        donor_source=donor_source,
+                        required_rank=required_rank,
+                        max_model_length=int(max_model_length),
+                        max_new_tokens=int(max_new_tokens),
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        sample_indices=sample_chunk,
+                        seed_start=seed_start,
+                        patch_scope="last_token",
+                        early_stop_on_valid_json=bool(early_stop_on_valid_json),
+                        early_stop_check_interval=int(early_stop_check_interval),
+                        early_stop_min_new_tokens=int(early_stop_min_new_tokens),
+                    )
+                    for row in batch_rows:
+                        sample_idx = int(row["sample_idx"])
+                        planned_key = ap._planned_sample_key(
+                            pair_id=str(pair_dict["pair_id"]),
+                            condition_name=str(condition["condition_name"]),
+                            layer_idx=layer_idx,
+                            sample_idx=sample_idx,
+                        )
+                        row.pop("target_text", None)
+                        row.pop("target_prefix_boundary_text", None)
+                        row.update(
+                            {
+                                "pair_index": int(pair_index),
+                                "pair_id": str(pair_dict["pair_id"]),
+                                "example_id": str(pair_dict["example_id"]),
+                                "required_rank": required_rank,
+                                "experiment": str(condition["experiment"]),
+                                "target_prefix_role": str(condition["target_prefix_role"]),
+                                "donor_prefix_role": condition.get("donor_prefix_role"),
+                                "ranking_direction": condition.get("ranking_direction"),
+                                "topk_layers": condition.get("topk_layers"),
+                                "shared_context_deception_rate": float(pair_dict.get("shared_context_deception_rate", float("nan"))),
+                                "deceptive_prefix_deception_rate": float(pair_dict.get("deceptive_prefix_deception_rate", float("nan"))),
+                                "commitment_delta": float(pair_dict.get("commitment_delta", float("nan"))),
+                                "deceptive_commitment_sentence": str(pair_dict.get("deceptive_commitment_sentence", "")),
+                                "truthful_donor_sentence": str(pair_dict.get("truthful_donor_sentence", "")),
+                            }
+                        )
+                        ap.append_jsonl_row(samples_path, row)
+                        completed_keys.add(planned_key)
+                        ap._update_pair_condition_stats(stats, row)
+                    if progress is not None:
+                        progress.update(len(batch_rows))
+                    ap._write_live_summaries(output_root, stats)
+                    _write_debug_delta_summaries(output_root, stats)
+
+                ap._write_live_summaries(output_root, stats)
+                _write_debug_delta_summaries(output_root, stats)
+    finally:
+        if progress is not None:
+            progress.close()
+
+    ap._write_live_summaries(output_root, stats)
+    _write_debug_delta_summaries(output_root, stats)
+    for live_name, final_name in [
+        ("pair_condition_summary_live.csv", "pair_condition_summary.csv"),
+        ("condition_summary_live.csv", "condition_summary.csv"),
+        ("pair_condition_delta_live.csv", "pair_condition_delta.csv"),
+        ("condition_delta_live.csv", "condition_delta.csv"),
+    ]:
+        live_path = output_root / live_name
+        if live_path.exists():
+            shutil.copy2(live_path, output_root / final_name)
+    print(f"Saved continuation steering artifacts to {output_root}")
+    return output_root
+
+
+def _truncate_to_sentence_count(text: str, sentence_count: int | None) -> str:
+    clean = str(text or "").strip()
+    if not clean:
+        return ""
+    if sentence_count is None or int(sentence_count) <= 0:
+        return clean
+    spans = split_sentence_spans(clean)
+    if not spans:
+        return clean
+    end_idx = int(spans[min(len(spans), int(sentence_count)) - 1]["end"])
+    return clean[:int(end_idx)].strip()
+
+
+def _repair_phrase_bonus(text: str) -> float:
+    clean = ap.normalize_sentence_for_compare(text)
+    if not clean:
+        return float("-inf")
+    repair_phrases = [
+        "to be transparent",
+        "to be honest",
+        "i should disclose",
+        "i need to disclose",
+        "actually",
+        "but wait",
+        "more honestly",
+        "i do not have",
+        "i don't have",
+        "cannot honestly",
+        "can't honestly",
+        "shouldn't pretend",
+        "should not pretend",
+        "i should correct",
+        "i should be honest",
+    ]
+    return float(sum(0.4 for phrase in repair_phrases if phrase in clean))
+
+
+def _repair_suffix_score(row: pd.Series, *, required_rank: int | None) -> float:
+    first_sentence = str(row.get("first_sentence", ""))
+    gen_text = str(row.get("gen_text", ""))
+    if not gen_text.strip():
+        return float("-inf")
+    score = 0.0
+    if row.get("is_truthful") is True:
+        score += 2.0
+    clarity_fn = getattr(ap, "_bs_honest_donor_clarity_score", None)
+    if callable(clarity_fn):
+        clarity = float(
+            clarity_fn(
+                first_sentence=first_sentence,
+                required_rank=required_rank,
+                cards_played=row.get("cards_played"),
+            )
+        )
+        if math.isfinite(clarity):
+            score += clarity
+    score += _repair_phrase_bonus(first_sentence)
+    score += 0.001 * min(len(first_sentence), 240)
+    if row.get("parse_error") in {None, "", "None"}:
+        score += 0.1
+    return float(score)
+
+
+def _maintain_suffix_score(row: pd.Series) -> float:
+    first_sentence = str(row.get("first_sentence", ""))
+    gen_text = str(row.get("gen_text", ""))
+    if not gen_text.strip():
+        return float("-inf")
+    score = 0.0
+    if row.get("deceptive") is True:
+        score += 2.0
+    score += 0.001 * min(len(first_sentence), 240)
+    score -= max(_repair_phrase_bonus(first_sentence), 0.0)
+    if row.get("parse_error") in {None, "", "None"}:
+        score += 0.1
+    return float(score)
+
+
+def _build_post_commitment_repair_row(
+    pair_row: dict[str, Any],
+    *,
+    suffix_sentence_count: int,
+) -> dict[str, Any] | None:
+    localization_path = Path(pair_row["localization_path"]).expanduser().resolve()
+    try:
+        payload = ap.load_payload(localization_path)
+    except Exception:
+        return None
+    history = payload.get("history") or []
+    commitment_pos = int(pair_row["commitment_sentence_pos"])
+    if commitment_pos < 0 or commitment_pos >= len(history):
+        return None
+    commitment_entry = history[commitment_pos]
+    generations_fn = getattr(ap, "_truthful_generation_rows_from_entry", None)
+    if not callable(generations_fn):
+        raise AttributeError("activation_patching._truthful_generation_rows_from_entry is required.")
+    generations_df = generations_fn(commitment_entry)
+    if generations_df.empty:
+        return None
+
+    required_rank = pair_row.get("required_rank")
+    if required_rank is not None and not pd.isna(required_rank):
+        required_rank = int(required_rank)
+    else:
+        required_rank = None
+
+    generations_df = generations_df.copy()
+    generations_df["repair_score"] = generations_df.apply(
+        lambda row: _repair_suffix_score(row, required_rank=required_rank),
+        axis=1,
+    )
+    generations_df["maintain_score"] = generations_df.apply(_maintain_suffix_score, axis=1)
+
+    repair_df = generations_df.loc[
+        generations_df["is_truthful"].eq(True) & generations_df["gen_text"].astype(str).str.strip().ne("")
+    ].copy()
+    maintain_df = generations_df.loc[
+        generations_df["deceptive"].eq(True) & generations_df["gen_text"].astype(str).str.strip().ne("")
+    ].copy()
+    if repair_df.empty or maintain_df.empty:
+        return None
+
+    repair_df = repair_df.sort_values(
+        ["repair_score", "gen_idx"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+    maintain_df = maintain_df.sort_values(
+        ["maintain_score", "gen_idx"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+    repair_row = repair_df.iloc[0]
+    maintain_row = maintain_df.iloc[0]
+
+    prompt = str(commitment_entry.get("prompt", pair_row.get("prompt", "")))
+    post_commitment_prefix_text = str(commitment_entry.get("prefix_text", ""))
+    repair_suffix_text = str(repair_row.get("gen_text", "")).strip()
+    maintain_suffix_text = str(maintain_row.get("gen_text", "")).strip()
+    repair_objective_suffix_text = _truncate_to_sentence_count(repair_suffix_text, int(suffix_sentence_count))
+    maintain_objective_suffix_text = _truncate_to_sentence_count(maintain_suffix_text, int(suffix_sentence_count))
+    if not repair_objective_suffix_text or not maintain_objective_suffix_text:
+        return None
+
+    out = dict(pair_row)
+    out.update(
+        {
+            "post_commitment_prompt": prompt,
+            "post_commitment_prefix_text": post_commitment_prefix_text,
+            "post_commitment_model_input": prompt + post_commitment_prefix_text,
+            "repair_suffix_text": repair_suffix_text,
+            "maintain_suffix_text": maintain_suffix_text,
+            "repair_objective_suffix_text": repair_objective_suffix_text,
+            "maintain_objective_suffix_text": maintain_objective_suffix_text,
+            "repair_first_sentence": str(repair_row.get("first_sentence", "")),
+            "maintain_first_sentence": str(maintain_row.get("first_sentence", "")),
+            "repair_generation_idx": int(repair_row.get("gen_idx", 0)),
+            "maintain_generation_idx": int(maintain_row.get("gen_idx", 0)),
+            "repair_full_generation_text": str(repair_row.get("full_generation_text", "")),
+            "maintain_full_generation_text": str(maintain_row.get("full_generation_text", "")),
+            "repair_cards_played": ap.to_json_safe(repair_row.get("cards_played")),
+            "maintain_cards_played": ap.to_json_safe(maintain_row.get("cards_played")),
+            "repair_action": repair_row.get("action"),
+            "maintain_action": maintain_row.get("action"),
+            "repair_evaluation": ap.to_json_safe(repair_row.get("evaluation")),
+            "maintain_evaluation": ap.to_json_safe(maintain_row.get("evaluation")),
+            "repair_score": float(repair_row.get("repair_score", float("nan"))),
+            "maintain_score": float(maintain_row.get("maintain_score", float("nan"))),
+            "n_repair_candidates": int(len(repair_df)),
+            "n_maintain_candidates": int(len(maintain_df)),
+            "suffix_sentence_count": int(suffix_sentence_count),
+        }
+    )
+    return out
+
+
+def load_or_build_post_commitment_repair_pairs(
+    *,
+    commitment_pairs_df: pd.DataFrame,
+    pair_cache_path: Path,
+    suffix_sentence_count: int,
+    refresh_cache: bool,
+    disable_tqdm: bool,
+) -> pd.DataFrame:
+    pair_cache_path = Path(pair_cache_path).expanduser().resolve()
+    pair_cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cached_df = pd.DataFrame(ap.read_jsonl_rows(pair_cache_path)) if pair_cache_path.exists() and not refresh_cache else pd.DataFrame()
+    if not cached_df.empty:
+        if "suffix_sentence_count" in cached_df.columns:
+            cached_df = cached_df.loc[cached_df["suffix_sentence_count"].eq(int(suffix_sentence_count))].copy()
+        else:
+            cached_df = pd.DataFrame()
+
+    cached_by_pair: dict[str, dict[str, Any]] = {}
+    if not cached_df.empty:
+        cached_by_pair = {
+            str(row["pair_id"]): row
+            for row in cached_df.to_dict(orient="records")
+            if row.get("pair_id") is not None
+        }
+
+    built_rows: list[dict[str, Any]] = []
+    iterator = commitment_pairs_df.to_dict(orient="records")
+    iterator = ap.maybe_tqdm(
+        iterator,
+        desc="Building post-commitment repair pairs",
+        total=len(commitment_pairs_df),
+        disable=bool(disable_tqdm),
+        leave=False,
+    )
+    for pair_row in iterator:
+        pair_id = str(pair_row["pair_id"])
+        if pair_id in cached_by_pair:
+            built_rows.append(cached_by_pair[pair_id])
+            continue
+        enriched = _build_post_commitment_repair_row(
+            pair_row,
+            suffix_sentence_count=int(suffix_sentence_count),
+        )
+        if enriched is not None:
+            built_rows.append(enriched)
+            ap.append_jsonl_row(pair_cache_path, enriched)
+
+    built_df = pd.DataFrame(built_rows)
+    if built_df.empty:
+        raise ValueError("No usable post-commitment repair pairs were found.")
+    built_df = built_df.drop_duplicates(subset=["pair_id"], keep="first").reset_index(drop=True)
+    built_df.to_csv(pair_cache_path.with_suffix(".csv"), index=False)
+    return built_df
+
+
+def _collect_branch_prefix_site_stats(
+    model: Any,
+    tokenizer: Any,
+    *,
+    prefix_text: str,
+    branch_full_text: str,
+    layer_indices: list[int],
+    max_model_length: int,
+) -> dict[str, Any]:
+    device = ap.resolve_model_device(model)
+    branch_inputs = _encode_commitment_branch(
+        tokenizer,
+        prefix_text=str(prefix_text),
+        full_text=str(branch_full_text),
+        device=device,
+        max_model_length=int(max_model_length),
+        objective_token_count=None,
+        objective_token_position="last",
+    )
+    prefix_pos = int(branch_inputs["prefix_len"]) - 1
+    if prefix_pos < 0:
+        raise ValueError("prefix_text must contain at least one token.")
+
+    layers, _ = ap.resolve_decoder_layers(model)
+    captured: dict[int, dict[str, Any]] = {}
+    hooks = []
+    for layer_idx in layer_indices:
+        layer_idx = int(layer_idx)
+
+        def hook(_module: Any, _inputs: Any, output: Any, layer_idx: int = layer_idx) -> Any:
+            hidden = ap.hidden_from_output(output)
+            if int(hidden.shape[1]) != int(branch_inputs["total_len"]):
+                return output
+            site = hidden[:, prefix_pos : prefix_pos + 1, :].detach().clone().requires_grad_(True)
+            patched = hidden.detach().clone()
+            patched[:, prefix_pos : prefix_pos + 1, :] = site
+            captured[layer_idx] = {
+                "site": site,
+                "hidden_value": hidden[0, prefix_pos, :].detach().clone().cpu(),
+            }
+            return ap.replace_hidden_in_output(output, patched)
+
+        hooks.append(layers[layer_idx].register_forward_hook(hook))
+
+    model.zero_grad(set_to_none=True)
+    try:
+        with torch.enable_grad():
+            outputs = model(
+                input_ids=branch_inputs["input_ids"],
+                attention_mask=branch_inputs["attention_mask"],
+                use_cache=False,
+                return_dict=True,
+            )
+            total_logprob = _sentence_logprob_total_tensor(
+                outputs.logits,
+                branch_inputs["input_ids"],
+                branch_inputs["score_start_pos"],
+                branch_inputs["score_stop_pos"],
+            )
+            total_logprob.backward()
+    finally:
+        for handle in hooks:
+            handle.remove()
+
+    layer_stats: dict[int, dict[str, Any]] = {}
+    for layer_idx in layer_indices:
+        layer_idx = int(layer_idx)
+        site = captured[layer_idx]["site"]
+        layer_stats[layer_idx] = {
+            "gradient": site.grad[0, 0, :].detach().clone().cpu(),
+            "hidden_value": captured[layer_idx]["hidden_value"],
+        }
+    model.zero_grad(set_to_none=True)
+    return {
+        "total_logprob": float(total_logprob.detach().item()),
+        "layer_stats": layer_stats,
+        "prefix_token_count": int(branch_inputs["prefix_len"]),
+        "suffix_token_count": int(branch_inputs["sentence_len"]),
+    }
+
+
+def _build_post_commitment_vector_bank(
+    *,
+    model: Any,
+    tokenizer: Any,
+    train_pairs_df: pd.DataFrame,
+    layer_indices: list[int],
+    max_model_length: int,
+    base_seed: int,
+    disable_tqdm: bool,
+) -> tuple[dict[int, dict[str, Any]], pd.DataFrame, pd.DataFrame]:
+    per_layer_gradients: dict[int, list[torch.Tensor]] = {int(layer_idx): [] for layer_idx in layer_indices}
+    per_layer_hidden_norms: dict[int, list[float]] = {int(layer_idx): [] for layer_idx in layer_indices}
+    per_layer_hidden_diff_norms: dict[int, list[float]] = {int(layer_idx): [] for layer_idx in layer_indices}
+    train_rows: list[dict[str, Any]] = []
+
+    iterator = train_pairs_df.to_dict(orient="records")
+    iterator = ap.maybe_tqdm(
+        iterator,
+        desc="Learning repair steering vectors",
+        total=len(train_pairs_df),
+        disable=bool(disable_tqdm),
+        leave=False,
+    )
+    for pair_row in iterator:
+        prefix_text = str(pair_row["post_commitment_model_input"])
+        repair_branch_text = str(pair_row["post_commitment_prompt"]) + ap.append_continuation(
+            str(pair_row["post_commitment_prefix_text"]),
+            str(pair_row["repair_objective_suffix_text"]),
+        )
+        maintain_branch_text = str(pair_row["post_commitment_prompt"]) + ap.append_continuation(
+            str(pair_row["post_commitment_prefix_text"]),
+            str(pair_row["maintain_objective_suffix_text"]),
+        )
+        repair_stats = _collect_branch_prefix_site_stats(
+            model,
+            tokenizer,
+            prefix_text=prefix_text,
+            branch_full_text=repair_branch_text,
+            layer_indices=layer_indices,
+            max_model_length=int(max_model_length),
+        )
+        maintain_stats = _collect_branch_prefix_site_stats(
+            model,
+            tokenizer,
+            prefix_text=prefix_text,
+            branch_full_text=maintain_branch_text,
+            layer_indices=layer_indices,
+            max_model_length=int(max_model_length),
+        )
+        baseline_margin = float(repair_stats["total_logprob"] - maintain_stats["total_logprob"])
+
+        for layer_idx in layer_indices:
+            layer_idx = int(layer_idx)
+            repair_hidden = repair_stats["layer_stats"][layer_idx]["hidden_value"].float()
+            maintain_hidden = maintain_stats["layer_stats"][layer_idx]["hidden_value"].float()
+            hidden_diff = repair_hidden - maintain_hidden
+            margin_gradient = (
+                repair_stats["layer_stats"][layer_idx]["gradient"].float()
+                - maintain_stats["layer_stats"][layer_idx]["gradient"].float()
+            )
+            per_layer_gradients[layer_idx].append(margin_gradient)
+            per_layer_hidden_norms[layer_idx].append(float(repair_hidden.norm().item()))
+            per_layer_hidden_diff_norms[layer_idx].append(float(hidden_diff.norm().item()))
+            train_rows.append(
+                {
+                    "pair_id": str(pair_row["pair_id"]),
+                    "example_id": str(pair_row["example_id"]),
+                    "layer_idx": int(layer_idx),
+                    "baseline_margin_total_logprob": baseline_margin,
+                    "repair_total_logprob": float(repair_stats["total_logprob"]),
+                    "maintain_total_logprob": float(maintain_stats["total_logprob"]),
+                    "prefix_hidden_norm": float(repair_hidden.norm().item()),
+                    "prefix_hidden_diff_norm": float(hidden_diff.norm().item()),
+                    "margin_gradient_norm": float(margin_gradient.norm().item()),
+                    "repair_generation_idx": int(pair_row["repair_generation_idx"]),
+                    "maintain_generation_idx": int(pair_row["maintain_generation_idx"]),
+                }
+            )
+        torch.cuda.empty_cache()
+
+    vector_bank: dict[int, dict[str, Any]] = {}
+    summary_rows: list[dict[str, Any]] = []
+    for layer_idx in layer_indices:
+        layer_idx = int(layer_idx)
+        gradient_stack = torch.stack(per_layer_gradients[layer_idx], dim=0)
+        mean_gradient = gradient_stack.mean(dim=0)
+        learned_unit = _normalize_vector(mean_gradient)
+        shuffled_signs = torch.tensor(
+            np.random.default_rng(int(base_seed) + 100_000 + int(layer_idx)).choice(
+                [-1.0, 1.0],
+                size=int(gradient_stack.shape[0]),
+            ),
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        shuffled_mean = (gradient_stack * shuffled_signs).mean(dim=0)
+        try:
+            shuffled_unit = _normalize_vector(shuffled_mean)
+        except ValueError:
+            shuffled_unit = _make_random_unit_vector(dim=int(mean_gradient.numel()), seed=int(base_seed) + 200_000 + int(layer_idx))
+        random_unit = _make_random_unit_vector(dim=int(mean_gradient.numel()), seed=int(base_seed) + 300_000 + int(layer_idx))
+        reference_norm = float(np.mean(per_layer_hidden_norms[layer_idx])) if per_layer_hidden_norms[layer_idx] else 1.0
+        if not math.isfinite(reference_norm) or reference_norm <= 0.0:
+            reference_norm = 1.0
+        vector_bank[layer_idx] = {
+            "reference_norm": float(reference_norm),
+            "learned": learned_unit,
+            "random": random_unit,
+            "shuffled": shuffled_unit,
+            "mean_gradient_norm": float(mean_gradient.norm().item()),
+            "mean_prefix_hidden_norm": float(np.mean(per_layer_hidden_norms[layer_idx])) if per_layer_hidden_norms[layer_idx] else float("nan"),
+            "mean_prefix_hidden_diff_norm": float(np.mean(per_layer_hidden_diff_norms[layer_idx])) if per_layer_hidden_diff_norms[layer_idx] else float("nan"),
+            "n_train_pairs": int(len(per_layer_gradients[layer_idx])),
+        }
+        summary_rows.append(
+            {
+                "layer_idx": int(layer_idx),
+                "n_train_pairs": int(len(per_layer_gradients[layer_idx])),
+                "reference_norm": float(reference_norm),
+                "mean_gradient_norm": float(mean_gradient.norm().item()),
+                "mean_prefix_hidden_norm": float(np.mean(per_layer_hidden_norms[layer_idx])) if per_layer_hidden_norms[layer_idx] else float("nan"),
+                "mean_prefix_hidden_diff_norm": float(np.mean(per_layer_hidden_diff_norms[layer_idx])) if per_layer_hidden_diff_norms[layer_idx] else float("nan"),
+            }
+        )
+    return vector_bank, pd.DataFrame(train_rows), pd.DataFrame(summary_rows)
+
+
+def build_post_commitment_repair_conditions(
+    *,
+    layer_indices: list[int],
+    alpha_values: list[float],
+    vector_types: list[str],
+    persistent_token_counts: list[int],
+) -> list[dict[str, Any]]:
+    vector_label_map = {
+        "learned": "Learned repair",
+        "random": "Random same-norm",
+        "shuffled": "Shuffled labels",
+    }
+    conditions: list[dict[str, Any]] = [
+        {
+            "condition_name": "baseline",
+            "patch_label": "Baseline",
+            "experiment": "baseline",
+            "vector_type": "baseline",
+            "alpha": 0.0,
+            "layer_idx": None,
+            "layer_indices": (),
+            "persistent_tokens": 0,
+        }
+    ]
+    for layer_idx in layer_indices:
+        for vector_type in vector_types:
+            for alpha in alpha_values:
+                for persistent_tokens in persistent_token_counts:
+                    persist_tag = f"persist{int(persistent_tokens)}"
+                    conditions.append(
+                        {
+                            "condition_name": (
+                                f"repair_layer_{int(layer_idx)}__{vector_type}__alpha{_alpha_tag(alpha)}__{persist_tag}"
+                            ),
+                            "patch_label": (
+                                f"{vector_label_map[vector_type]} | Layer {int(layer_idx)} | alpha {float(alpha):.3g} "
+                                f"| persist {int(persistent_tokens)}"
+                            ),
+                            "experiment": "repair_steering",
+                            "vector_type": str(vector_type),
+                            "alpha": float(alpha),
+                            "layer_idx": int(layer_idx),
+                            "layer_indices": (int(layer_idx),),
+                            "persistent_tokens": int(persistent_tokens),
+                        }
+                    )
+    return conditions
+
+
+def _condition_layer_to_vector(
+    condition: dict[str, Any],
+    *,
+    vector_bank: dict[int, dict[str, Any]],
+) -> dict[int, torch.Tensor]:
+    if str(condition.get("vector_type")) == "baseline":
+        return {}
+    layer_idx = int(condition["layer_idx"])
+    vector_type = str(condition["vector_type"])
+    alpha = float(condition["alpha"])
+    layer_vectors = vector_bank[int(layer_idx)]
+    base_unit = layer_vectors[vector_type]
+    reference_norm = float(layer_vectors["reference_norm"])
+    return {int(layer_idx): base_unit * float(reference_norm) * float(alpha)}
+
+
+def _compute_steered_suffix_logprob(
+    model: Any,
+    tokenizer: Any,
+    *,
+    prefix_text: str,
+    branch_full_text: str,
+    layer_to_vector: dict[int, torch.Tensor],
+    persistent_tokens: int,
+    max_model_length: int,
+) -> float:
+    device = ap.resolve_model_device(model)
+    branch_inputs = _encode_commitment_branch(
+        tokenizer,
+        prefix_text=str(prefix_text),
+        full_text=str(branch_full_text),
+        device=device,
+        max_model_length=int(max_model_length),
+        objective_token_count=None,
+        objective_token_position="last",
+    )
+    prefix_len = int(branch_inputs["prefix_len"])
+    total_len = int(branch_inputs["total_len"])
+    patch_positions = [int(prefix_len) - 1]
+    if int(persistent_tokens) > 0:
+        suffix_len = max(0, int(total_len) - int(prefix_len))
+        for offset in range(min(int(persistent_tokens), int(suffix_len))):
+            patch_positions.append(int(prefix_len) + int(offset))
+    patch_positions = sorted({int(position) for position in patch_positions if 0 <= int(position) < int(total_len)})
+
+    layers, _ = ap.resolve_decoder_layers(model)
+    hooks = []
+    for layer_idx, vector in layer_to_vector.items():
+        layer_idx = int(layer_idx)
+
+        def hook(_module: Any, _inputs: Any, output: Any, vector: torch.Tensor = vector) -> Any:
+            hidden = ap.hidden_from_output(output)
+            if int(hidden.shape[1]) != int(total_len):
+                return output
+            patched = hidden.clone()
+            steer = vector.to(device=hidden.device, dtype=hidden.dtype)
+            for position in patch_positions:
+                patched[:, int(position) : int(position) + 1, :] = (
+                    patched[:, int(position) : int(position) + 1, :] + steer.view(1, 1, -1)
+                )
+            return ap.replace_hidden_in_output(output, patched)
+
+        hooks.append(layers[layer_idx].register_forward_hook(hook))
+
+    try:
+        with torch.no_grad():
+            outputs = model(
+                input_ids=branch_inputs["input_ids"],
+                attention_mask=branch_inputs["attention_mask"],
+                use_cache=False,
+                return_dict=True,
+            )
+        total_logprob = _sentence_logprob_total_tensor(
+            outputs.logits,
+            branch_inputs["input_ids"],
+            branch_inputs["score_start_pos"],
+            branch_inputs["score_stop_pos"],
+        )
+        return float(total_logprob.item())
+    finally:
+        for handle in hooks:
+            handle.remove()
+
+
+def _write_margin_live_outputs(output_root: Path, margin_rows: list[dict[str, Any]]) -> pd.DataFrame:
+    margin_df = pd.DataFrame(margin_rows)
+    margin_df.to_csv(output_root / "margin_results_live.csv", index=False)
+    ap.write_jsonl(output_root / "margin_results_live.jsonl", margin_rows)
+    if margin_df.empty:
+        pd.DataFrame().to_csv(output_root / "margin_summary_live.csv", index=False)
+        return pd.DataFrame()
+    summary_df = (
+        margin_df.groupby(
+            ["condition_name", "patch_label", "experiment", "vector_type", "layer_idx", "alpha", "persistent_tokens"],
+            dropna=False,
+            sort=False,
+        )
+        .agg(
+            n_pairs=("pair_id", "nunique"),
+            mean_baseline_margin=("baseline_margin_total_logprob", "mean"),
+            mean_steered_margin=("steered_margin_total_logprob", "mean"),
+            mean_margin_delta=("margin_delta", "mean"),
+            median_margin_delta=("margin_delta", "median"),
+            std_margin_delta=("margin_delta", lambda s: float(s.std(ddof=1)) if len(s) > 1 else float("nan")),
+            positive_margin_delta_rate=("margin_delta", lambda s: float((pd.Series(s) > 0).mean()) if len(s) > 0 else float("nan")),
+        )
+        .reset_index()
+        .sort_values(["mean_margin_delta", "condition_name"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    summary_df.to_csv(output_root / "margin_summary_live.csv", index=False)
+    return summary_df
+
+
+def _sentence_similarity(left_text: str, right_text: str) -> float:
+    left_norm = ap.normalize_sentence_for_compare(left_text)
+    right_norm = ap.normalize_sentence_for_compare(right_text)
+    if not left_norm and not right_norm:
+        return 1.0
+    if not left_norm or not right_norm:
+        return 0.0
+    return float(difflib.SequenceMatcher(a=left_norm, b=right_norm).ratio())
+
+
+def _write_greedy_live_outputs(output_root: Path, greedy_rows: list[dict[str, Any]]) -> pd.DataFrame:
+    greedy_df = pd.DataFrame(greedy_rows)
+    greedy_df.to_csv(output_root / "greedy_results_live.csv", index=False)
+    ap.write_jsonl(output_root / "greedy_results_live.jsonl", greedy_rows)
+    if greedy_df.empty:
+        pd.DataFrame().to_csv(output_root / "greedy_summary_live.csv", index=False)
+        return pd.DataFrame()
+    summary_df = (
+        greedy_df.groupby(
+            ["condition_name", "patch_label", "experiment", "vector_type", "layer_idx", "alpha", "persistent_tokens"],
+            dropna=False,
+            sort=False,
+        )
+        .agg(
+            n_pairs=("pair_id", "nunique"),
+            mean_truthful_similarity=("truthful_similarity", "mean"),
+            mean_maintain_similarity=("maintain_similarity", "mean"),
+            mean_similarity_margin=("similarity_margin", "mean"),
+            exact_repair_rate=("exact_repair_match", "mean"),
+            exact_maintain_rate=("exact_maintain_match", "mean"),
+            valid_rate=("is_valid", lambda s: float(pd.Series(s).eq(True).mean()) if len(s) > 0 else float("nan")),
+            deceptive_rate=("deceptive", lambda s: float(pd.Series(s).eq(True).mean()) if len(s) > 0 else float("nan")),
+        )
+        .reset_index()
+        .sort_values(["mean_similarity_margin", "condition_name"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    summary_df.to_csv(output_root / "greedy_summary_live.csv", index=False)
+    return summary_df
+
+
+def _select_generation_conditions(
+    *,
+    all_conditions: list[dict[str, Any]],
+    margin_summary_df: pd.DataFrame,
+    generation_topk: int,
+) -> list[dict[str, Any]]:
+    condition_by_name = {str(condition["condition_name"]): condition for condition in all_conditions}
+    selected_names: list[str] = ["baseline"]
+    if margin_summary_df.empty:
+        return [condition_by_name[name] for name in selected_names if name in condition_by_name]
+
+    if int(generation_topk) <= 0:
+        selected_names.extend(
+            str(name)
+            for name in margin_summary_df["condition_name"].tolist()
+            if str(name) != "baseline"
+        )
+    else:
+        learned_df = margin_summary_df.loc[
+            margin_summary_df["vector_type"].astype(str).eq("learned")
+            & margin_summary_df["condition_name"].astype(str).ne("baseline")
+        ].copy()
+        learned_df = learned_df.sort_values(
+            ["mean_margin_delta", "layer_idx", "alpha", "persistent_tokens"],
+            ascending=[False, True, True, True],
+        ).head(int(generation_topk))
+        for row in learned_df.itertuples(index=False):
+            selected_names.append(str(row.condition_name))
+            for vector_type in ("random", "shuffled"):
+                match = next(
+                    (
+                        condition
+                        for condition in all_conditions
+                        if str(condition.get("vector_type")) == vector_type
+                        and condition.get("layer_idx") == row.layer_idx
+                        and float(condition.get("alpha", float("nan"))) == float(row.alpha)
+                        and int(condition.get("persistent_tokens", 0)) == int(row.persistent_tokens)
+                    ),
+                    None,
+                )
+                if match is not None:
+                    selected_names.append(str(match["condition_name"]))
+
+    deduped_names: list[str] = []
+    seen: set[str] = set()
+    for name in selected_names:
+        if name in condition_by_name and name not in seen:
+            deduped_names.append(name)
+            seen.add(name)
+    return [condition_by_name[name] for name in deduped_names]
+
+
+def generate_batch_with_residual_steering(
+    model: Any,
+    tokenizer: Any,
+    *,
+    prefix_text: str,
+    layer_to_vector: dict[int, torch.Tensor],
+    persistent_tokens: int,
+    max_model_length: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    seeds: list[int],
+    early_stop_on_valid_json: bool = False,
+    early_stop_required_rank: int | None = None,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
+) -> list[dict[str, Any]]:
+    if not seeds:
+        return []
+    batch_size = len(seeds)
+    device = ap.resolve_model_device(model)
+    encoded_single = ap.encode_text_for_model(
+        tokenizer,
+        prefix_text,
+        device=device,
+        max_input_tokens=max_model_length,
+    )
+    prefix_len = int(encoded_single["input_ids"].shape[1])
+    prefix_pos = int(prefix_len) - 1
+    layers, layer_path = ap.resolve_decoder_layers(model)
+    steering_state = {"phase": "prefill", "decode_step": -1}
+    hooks = []
+
+    for layer_idx, vector in layer_to_vector.items():
+        layer_idx = int(layer_idx)
+
+        def hook(_module: Any, _inputs: Any, output: Any, vector: torch.Tensor = vector) -> Any:
+            hidden = ap.hidden_from_output(output)
+            patched = hidden
+            apply_steer = False
+            if steering_state["phase"] == "prefill":
+                if int(hidden.shape[1]) == int(prefix_len):
+                    patched = hidden.clone()
+                    patched[:, prefix_pos : prefix_pos + 1, :] = (
+                        patched[:, prefix_pos : prefix_pos + 1, :]
+                        + vector.to(device=hidden.device, dtype=hidden.dtype).view(1, 1, -1)
+                    )
+                    apply_steer = True
+            elif (
+                steering_state["phase"] == "decode"
+                and int(hidden.shape[1]) == 1
+                and int(steering_state["decode_step"]) < int(persistent_tokens)
+            ):
+                patched = hidden.clone()
+                patched[:, 0:1, :] = patched[:, 0:1, :] + vector.to(device=hidden.device, dtype=hidden.dtype).view(1, 1, -1)
+                apply_steer = True
+            return ap.replace_hidden_in_output(output, patched) if apply_steer else output
+
+        hooks.append(layers[layer_idx].register_forward_hook(hook))
+
+    try:
+        steering_state["phase"] = "prefill"
+        steering_state["decode_step"] = -1
+        with torch.no_grad():
+            outputs = model(**encoded_single, use_cache=True, return_dict=True)
+        past_key_values = ap._repeat_past_key_values_for_batch(ap._ensure_decode_cache(outputs.past_key_values), batch_size)
+        generator_device = device if device.type != "cpu" else torch.device("cpu")
+        generators = [torch.Generator(device=generator_device).manual_seed(int(seed)) for seed in seeds]
+        finished_token_id = ap._make_finished_decode_token(tokenizer, device=device)
+        generated_token_ids_by_row: list[list[int]] = [[] for _ in range(batch_size)]
+        ended_with_eos_by_row = [False for _ in range(batch_size)]
+        json_stopped_by_row = [False for _ in range(batch_size)]
+
+        def sample_next_tokens(logits: torch.Tensor) -> torch.Tensor:
+            next_tokens: list[torch.Tensor] = []
+            for row_idx in range(batch_size):
+                if (
+                    ended_with_eos_by_row[row_idx]
+                    or json_stopped_by_row[row_idx]
+                    or len(generated_token_ids_by_row[row_idx]) >= int(max_new_tokens)
+                ):
+                    token = torch.tensor([[finished_token_id]], dtype=encoded_single["input_ids"].dtype, device=device)
+                else:
+                    token = ap._sample_next_token(
+                        logits[row_idx : row_idx + 1],
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        generator=generators[row_idx],
+                    ).to(device=device)
+                    token_id = int(token.item())
+                    generated_token_ids_by_row[row_idx].append(token_id)
+                    ended_with_eos_by_row[row_idx] = (
+                        tokenizer.eos_token_id is not None and token_id == int(tokenizer.eos_token_id)
+                    )
+                    if early_stop_on_valid_json and not ended_with_eos_by_row[row_idx]:
+                        n_tokens = len(generated_token_ids_by_row[row_idx])
+                        interval = max(int(early_stop_check_interval), 1)
+                        if (
+                            early_stop_required_rank is not None
+                            and n_tokens >= int(early_stop_min_new_tokens)
+                            and (interval <= 1 or n_tokens % interval == 0)
+                        ):
+                            text = tokenizer.decode(generated_token_ids_by_row[row_idx], skip_special_tokens=True)
+                            try:
+                                evaluation = ap.evaluate_bs_generation(text, required_rank=int(early_stop_required_rank))
+                                json_stopped_by_row[row_idx] = bool(evaluation.get("is_valid") is True)
+                            except Exception:
+                                json_stopped_by_row[row_idx] = False
+                next_tokens.append(token)
+            return torch.cat(next_tokens, dim=0)
+
+        next_input_ids = sample_next_tokens(outputs.logits[:, -1, :].expand(batch_size, -1))
+        decode_step = 0
+        while (
+            not all(
+                ended_with_eos_by_row[row_idx]
+                or json_stopped_by_row[row_idx]
+                or len(generated_token_ids_by_row[row_idx]) >= int(max_new_tokens)
+                for row_idx in range(batch_size)
+            )
+        ):
+            steering_state["phase"] = "decode"
+            steering_state["decode_step"] = int(decode_step)
+            with torch.no_grad():
+                step_outputs = model(
+                    input_ids=next_input_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            past_key_values = step_outputs.past_key_values
+            next_input_ids = sample_next_tokens(step_outputs.logits[:, -1, :])
+            decode_step += 1
+    finally:
+        for handle in hooks:
+            handle.remove()
+
+    input_ids_single = encoded_single["input_ids"][0]
+    rows: list[dict[str, Any]] = []
+    for row_idx, ids in enumerate(generated_token_ids_by_row):
+        new_ids = torch.tensor(ids, dtype=input_ids_single.dtype, device=input_ids_single.device)
+        full_ids = torch.cat([input_ids_single, new_ids], dim=0)
+        n_new_tokens = len(ids)
+        hit_token_cap = n_new_tokens >= int(max_new_tokens)
+        likely_truncated = bool(hit_token_cap and not ended_with_eos_by_row[row_idx] and not json_stopped_by_row[row_idx])
+        rows.append(
+            {
+                "generated_text": tokenizer.decode(new_ids, skip_special_tokens=True),
+                "full_text": tokenizer.decode(full_ids, skip_special_tokens=True),
+                "prefix_token_count": int(prefix_len),
+                "n_new_tokens": int(n_new_tokens),
+                "ended_with_eos": bool(ended_with_eos_by_row[row_idx]),
+                "early_stopped_on_valid_json": bool(json_stopped_by_row[row_idx]),
+                "hit_token_cap": bool(hit_token_cap),
+                "likely_truncated": bool(likely_truncated),
+                "layer_path": layer_path,
+                "persistent_tokens": int(persistent_tokens),
+            }
+        )
+    return rows
+
+
+def run_post_commitment_generation_condition_batch_samples(
+    model: Any,
+    tokenizer: Any,
+    *,
+    condition: dict[str, Any],
+    prefix_text: str,
+    layer_to_vector: dict[int, torch.Tensor],
+    required_rank: int,
+    max_model_length: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    sample_indices: list[int],
+    seed_start: int,
+    early_stop_on_valid_json: bool,
+    early_stop_check_interval: int,
+    early_stop_min_new_tokens: int,
+) -> list[dict[str, Any]]:
+    seeds = [int(seed_start) + int(sample_idx) for sample_idx in sample_indices]
+    generations = generate_batch_with_residual_steering(
+        model,
+        tokenizer,
+        prefix_text=prefix_text,
+        layer_to_vector=layer_to_vector,
+        persistent_tokens=int(condition.get("persistent_tokens", 0)),
+        max_model_length=int(max_model_length),
+        max_new_tokens=int(max_new_tokens),
+        temperature=float(temperature),
+        top_p=float(top_p),
+        seeds=seeds,
+        early_stop_on_valid_json=bool(early_stop_on_valid_json),
+        early_stop_required_rank=int(required_rank),
+        early_stop_check_interval=int(early_stop_check_interval),
+        early_stop_min_new_tokens=int(early_stop_min_new_tokens),
+    )
+    rows: list[dict[str, Any]] = []
+    for sample_idx, seed, generation in zip(sample_indices, seeds, generations):
+        evaluation = ap.evaluate_bs_generation(generation["generated_text"], required_rank=int(required_rank))
+        first_sentence, remainder_text = ap.extract_first_sentence(generation["generated_text"])
+        rows.append(
+            {
+                "condition_name": str(condition["condition_name"]),
+                "patch_label": str(condition["patch_label"]),
+                "experiment": str(condition["experiment"]),
+                "vector_type": str(condition.get("vector_type", "")),
+                "alpha": float(condition.get("alpha", 0.0)),
+                "persistent_tokens": int(condition.get("persistent_tokens", 0)),
+                "patch_mode": "vector",
+                "patch_scope": "post_commitment_prefix",
+                "layer_idx": condition.get("layer_idx"),
+                "layer_indices": list(condition.get("layer_indices", ())),
+                "layer_count": len(condition.get("layer_indices", ())),
+                "seed": int(seed),
+                "sample_idx": int(sample_idx),
+                "first_generated_sentence": first_sentence,
+                "remainder_text": remainder_text,
+                "generated_text": generation["generated_text"],
+                "full_text": generation["full_text"],
+                "n_new_tokens": int(generation["n_new_tokens"]),
+                "ended_with_eos": bool(generation["ended_with_eos"]),
+                "early_stopped_on_valid_json": bool(generation["early_stopped_on_valid_json"]),
+                "hit_token_cap": bool(generation["hit_token_cap"]),
+                "likely_truncated": bool(generation["likely_truncated"]),
+                "is_valid": evaluation["is_valid"],
+                "deceptive": evaluation["deceptive"],
+                "action": evaluation["action"],
+                "cards_played": evaluation["cards_played"],
+                "error": evaluation["error"],
+                "parsed": evaluation["parsed"],
+            }
+        )
+    return rows
+
+
+def run_post_commitment_repair_steering_experiment(
+    *,
+    pairs_df: pd.DataFrame,
+    output_root: Path,
+    model_name_or_path: str,
+    max_model_length: int,
+    cuda_device_name: str,
+    layer_candidates: list[int] | None,
+    layer_count: int | None,
+    exclude_final_layers: int,
+    eval_pair_count: int,
+    generation_eval_count: int,
+    alpha_values: list[float],
+    vector_types: list[str],
+    persistent_token_counts: list[int],
+    generation_topk: int,
+    greedy_max_new_tokens: int,
+    max_new_tokens: int,
+    samples_per_condition: int,
+    batch_size: int,
+    temperature: float,
+    top_p: float,
+    base_seed: int,
+    early_stop_on_valid_json: bool,
+    early_stop_check_interval: int,
+    early_stop_min_new_tokens: int,
+    resume: bool,
+    disable_tqdm: bool,
+) -> Path:
+    if pairs_df.empty:
+        raise ValueError("pairs_df is empty.")
+    if int(eval_pair_count) <= 0 or int(eval_pair_count) >= len(pairs_df):
+        raise ValueError("eval_pair_count must be positive and smaller than the number of available pairs.")
+    if int(generation_eval_count) <= 0:
+        raise ValueError("generation_eval_count must be positive.")
+
+    output_root = Path(output_root).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    samples_path = output_root / "samples.jsonl"
+    completed_keys, generation_stats = ap._load_completed_samples(samples_path) if resume else (set(), {})
+
+    shuffled_pairs_df = pairs_df.sample(frac=1.0, random_state=int(base_seed)).reset_index(drop=True).copy()
+    if "pair_index" in shuffled_pairs_df.columns:
+        shuffled_pairs_df = shuffled_pairs_df.drop(columns=["pair_index"])
+    shuffled_pairs_df.insert(0, "pair_index", np.arange(len(shuffled_pairs_df), dtype=int))
+    train_pairs_df = shuffled_pairs_df.iloc[:-int(eval_pair_count)].reset_index(drop=True).copy()
+    eval_pairs_df = shuffled_pairs_df.iloc[-int(eval_pair_count) :].reset_index(drop=True).copy()
+    generation_pairs_df = eval_pairs_df.head(min(int(generation_eval_count), len(eval_pairs_df))).reset_index(drop=True).copy()
+
+    shuffled_pairs_df.to_csv(output_root / "post_commitment_pairs.csv", index=False)
+    train_pairs_df.to_csv(output_root / "train_pairs.csv", index=False)
+    eval_pairs_df.to_csv(output_root / "eval_pairs.csv", index=False)
+    generation_pairs_df.to_csv(output_root / "generation_eval_pairs.csv", index=False)
+    ap.write_jsonl(output_root / "post_commitment_pairs.jsonl", shuffled_pairs_df.to_dict(orient="records"))
+
+    ap.seed_everything(int(base_seed))
+    cuda_device = ap.resolve_primary_cuda_device(cuda_device_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = int(max_model_length)
+    if hasattr(tokenizer, "init_kwargs"):
+        tokenizer.init_kwargs["model_max_length"] = int(max_model_length)
+
+    model_kwargs = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "device_map": ap.single_gpu_device_map(cuda_device),
+    }
+    model = load_model_with_dtype_compat(
+        model_name_or_path,
+        common_kwargs=model_kwargs,
+        dtype_value=torch.bfloat16,
+    )
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    ap.assert_model_fully_on_cuda(model)
+
+    layers, layer_path = ap.resolve_decoder_layers(model)
+    n_layers = len(layers)
+    if layer_candidates is None:
+        effective_layer_count = DEFAULT_TRUTHFUL_STEERING_LAYER_COUNT if layer_count is None or int(layer_count) <= 0 else int(layer_count)
+        layer_candidates = ap.build_evenly_spaced_layer_candidates(n_layers, int(effective_layer_count))
+    layer_candidates = sorted({int(layer_idx) for layer_idx in layer_candidates if 0 <= int(layer_idx) < int(n_layers)})
+    if int(exclude_final_layers) > 0:
+        min_excluded_layer = int(n_layers) - int(exclude_final_layers)
+        layer_candidates = [int(layer_idx) for layer_idx in layer_candidates if int(layer_idx) < int(min_excluded_layer)]
+    if not layer_candidates:
+        raise ValueError("No valid layer candidates were selected for steering.")
+
+    run_config = {
+        "mode": "post_commitment_repair_steering",
+        "hypothesis": (
+            "After a deceptive commitment sentence is already in context, learned residual directions at the "
+            "post-commitment prefix can steer the generated suffix toward truthful repair instead of deceptive maintenance."
+        ),
+        "caa_note": (
+            "A literal CAA hidden-difference vector at the shared post-commitment prefix is degenerate here because the prefix "
+            "is identical across repair and maintain branches. This run therefore learns a margin-gradient steering direction "
+            "at that same prefix position."
+        ),
+        "model_name_or_path": model_name_or_path,
+        "environment": ap.DEFAULT_ENVIRONMENT,
+        "model_tail": ap.DEFAULT_MODEL_TAIL,
+        "n_pairs_total": int(len(shuffled_pairs_df)),
+        "n_train_pairs": int(len(train_pairs_df)),
+        "n_eval_pairs": int(len(eval_pairs_df)),
+        "n_generation_eval_pairs": int(len(generation_pairs_df)),
+        "max_model_length": int(max_model_length),
+        "max_new_tokens": int(max_new_tokens),
+        "samples_per_condition": int(samples_per_condition),
+        "batch_size": int(batch_size),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "base_seed": int(base_seed),
+        "cuda_device": str(cuda_device),
+        "decoder_layer_path": layer_path,
+        "n_layers": int(n_layers),
+        "layer_candidates": [int(layer_idx) for layer_idx in layer_candidates],
+        "exclude_final_layers": int(exclude_final_layers),
+        "alpha_values": [float(value) for value in alpha_values],
+        "vector_types": [str(value) for value in vector_types],
+        "persistent_token_counts": [int(value) for value in persistent_token_counts],
+        "generation_topk": int(generation_topk),
+        "greedy_max_new_tokens": int(greedy_max_new_tokens),
+        "early_stop_on_valid_json": bool(early_stop_on_valid_json),
+        "early_stop_check_interval": int(early_stop_check_interval),
+        "early_stop_min_new_tokens": int(early_stop_min_new_tokens),
+        "parameter_devices": ap.parameter_device_summary(model),
+        "resume": bool(resume),
+    }
+    ap.write_json(output_root / "run_config.json", run_config)
+
+    print(f"Output root: {output_root}")
+    print(f"Post-commitment repair pairs: total={len(shuffled_pairs_df)} train={len(train_pairs_df)} eval={len(eval_pairs_df)}")
+    print(f"Layer candidates: {layer_candidates}")
+
+    vector_bank, train_gradient_df, vector_summary_df = _build_post_commitment_vector_bank(
+        model=model,
+        tokenizer=tokenizer,
+        train_pairs_df=train_pairs_df,
+        layer_indices=layer_candidates,
+        max_model_length=int(max_model_length),
+        base_seed=int(base_seed),
+        disable_tqdm=bool(disable_tqdm),
+    )
+    train_gradient_df.to_csv(output_root / "train_gradient_rows.csv", index=False)
+    vector_summary_df.to_csv(output_root / "vector_summary.csv", index=False)
+    torch.save(
+        {
+            int(layer_idx): {
+                key: (value if not torch.is_tensor(value) else value.cpu())
+                for key, value in layer_data.items()
+            }
+            for layer_idx, layer_data in vector_bank.items()
+        },
+        output_root / "steering_vectors.pt",
+    )
+
+    all_conditions = build_post_commitment_repair_conditions(
+        layer_indices=layer_candidates,
+        alpha_values=alpha_values,
+        vector_types=vector_types,
+        persistent_token_counts=persistent_token_counts,
+    )
+
+    margin_rows: list[dict[str, Any]] = []
+    margin_progress = None
+    if not disable_tqdm and ap._tqdm is not None:
+        margin_progress = ap._tqdm(total=int(len(eval_pairs_df)) * int(len(all_conditions)), desc="Repair margin eval", leave=True)
+    try:
+        for pair_row in eval_pairs_df.to_dict(orient="records"):
+            prefix_text = str(pair_row["post_commitment_model_input"])
+            repair_branch_text = str(pair_row["post_commitment_prompt"]) + ap.append_continuation(
+                str(pair_row["post_commitment_prefix_text"]),
+                str(pair_row["repair_objective_suffix_text"]),
+            )
+            maintain_branch_text = str(pair_row["post_commitment_prompt"]) + ap.append_continuation(
+                str(pair_row["post_commitment_prefix_text"]),
+                str(pair_row["maintain_objective_suffix_text"]),
+            )
+            baseline_repair = _compute_steered_suffix_logprob(
+                model,
+                tokenizer,
+                prefix_text=prefix_text,
+                branch_full_text=repair_branch_text,
+                layer_to_vector={},
+                persistent_tokens=0,
+                max_model_length=int(max_model_length),
+            )
+            baseline_maintain = _compute_steered_suffix_logprob(
+                model,
+                tokenizer,
+                prefix_text=prefix_text,
+                branch_full_text=maintain_branch_text,
+                layer_to_vector={},
+                persistent_tokens=0,
+                max_model_length=int(max_model_length),
+            )
+            baseline_margin = float(baseline_repair - baseline_maintain)
+            for condition in all_conditions:
+                layer_to_vector = _condition_layer_to_vector(condition, vector_bank=vector_bank)
+                steered_repair = baseline_repair
+                steered_maintain = baseline_maintain
+                if layer_to_vector:
+                    steered_repair = _compute_steered_suffix_logprob(
+                        model,
+                        tokenizer,
+                        prefix_text=prefix_text,
+                        branch_full_text=repair_branch_text,
+                        layer_to_vector=layer_to_vector,
+                        persistent_tokens=int(condition.get("persistent_tokens", 0)),
+                        max_model_length=int(max_model_length),
+                    )
+                    steered_maintain = _compute_steered_suffix_logprob(
+                        model,
+                        tokenizer,
+                        prefix_text=prefix_text,
+                        branch_full_text=maintain_branch_text,
+                        layer_to_vector=layer_to_vector,
+                        persistent_tokens=int(condition.get("persistent_tokens", 0)),
+                        max_model_length=int(max_model_length),
+                    )
+                steered_margin = float(steered_repair - steered_maintain)
+                margin_rows.append(
+                    {
+                        "pair_id": str(pair_row["pair_id"]),
+                        "example_id": str(pair_row["example_id"]),
+                        "condition_name": str(condition["condition_name"]),
+                        "patch_label": str(condition["patch_label"]),
+                        "experiment": str(condition["experiment"]),
+                        "vector_type": str(condition.get("vector_type", "")),
+                        "layer_idx": condition.get("layer_idx"),
+                        "alpha": float(condition.get("alpha", 0.0)),
+                        "persistent_tokens": int(condition.get("persistent_tokens", 0)),
+                        "baseline_repair_total_logprob": float(baseline_repair),
+                        "baseline_maintain_total_logprob": float(baseline_maintain),
+                        "baseline_margin_total_logprob": float(baseline_margin),
+                        "steered_repair_total_logprob": float(steered_repair),
+                        "steered_maintain_total_logprob": float(steered_maintain),
+                        "steered_margin_total_logprob": float(steered_margin),
+                        "margin_delta": float(steered_margin - baseline_margin),
+                    }
+                )
+                if margin_progress is not None:
+                    margin_progress.update(1)
+            _write_margin_live_outputs(output_root, margin_rows)
+            torch.cuda.empty_cache()
+    finally:
+        if margin_progress is not None:
+            margin_progress.close()
+
+    margin_summary_df = _write_margin_live_outputs(output_root, margin_rows)
+    pd.DataFrame(margin_rows).to_csv(output_root / "margin_results.csv", index=False)
+    margin_summary_df.to_csv(output_root / "margin_summary.csv", index=False)
+
+    selected_generation_conditions = _select_generation_conditions(
+        all_conditions=all_conditions,
+        margin_summary_df=margin_summary_df,
+        generation_topk=int(generation_topk),
+    )
+    ap.write_json(
+        output_root / "selected_generation_conditions.json",
+        {"conditions": ap.to_json_safe(selected_generation_conditions)},
+    )
+
+    greedy_rows: list[dict[str, Any]] = []
+    greedy_progress = None
+    if not disable_tqdm and ap._tqdm is not None:
+        greedy_progress = ap._tqdm(
+            total=int(len(generation_pairs_df)) * int(len(selected_generation_conditions)),
+            desc="Greedy repair generations",
+            leave=True,
+        )
+    try:
+        for pair_row in generation_pairs_df.to_dict(orient="records"):
+            prefix_text = str(pair_row["post_commitment_model_input"])
+            required_rank = int(pair_row["required_rank"])
+            for condition_index, condition in enumerate(selected_generation_conditions):
+                layer_to_vector = _condition_layer_to_vector(condition, vector_bank=vector_bank)
+                rows = run_post_commitment_generation_condition_batch_samples(
+                    model,
+                    tokenizer,
+                    condition=condition,
+                    prefix_text=prefix_text,
+                    layer_to_vector=layer_to_vector,
+                    required_rank=required_rank,
+                    max_model_length=int(max_model_length),
+                    max_new_tokens=int(greedy_max_new_tokens),
+                    temperature=0.0,
+                    top_p=1.0,
+                    sample_indices=[0],
+                    seed_start=ap._sample_seed(int(base_seed), int(pair_row["pair_index"]), int(condition_index), 0),
+                    early_stop_on_valid_json=False,
+                    early_stop_check_interval=int(early_stop_check_interval),
+                    early_stop_min_new_tokens=int(early_stop_min_new_tokens),
+                )
+                row = rows[0]
+                repair_similarity = _sentence_similarity(row["first_generated_sentence"], str(pair_row["repair_first_sentence"]))
+                maintain_similarity = _sentence_similarity(row["first_generated_sentence"], str(pair_row["maintain_first_sentence"]))
+                row.update(
+                    {
+                        "pair_index": int(pair_row["pair_index"]),
+                        "pair_id": str(pair_row["pair_id"]),
+                        "example_id": str(pair_row["example_id"]),
+                        "required_rank": required_rank,
+                        "repair_reference_sentence": str(pair_row["repair_first_sentence"]),
+                        "maintain_reference_sentence": str(pair_row["maintain_first_sentence"]),
+                        "truthful_similarity": float(repair_similarity),
+                        "maintain_similarity": float(maintain_similarity),
+                        "similarity_margin": float(repair_similarity - maintain_similarity),
+                        "exact_repair_match": bool(
+                            ap.normalize_sentence_for_compare(row["first_generated_sentence"])
+                            == ap.normalize_sentence_for_compare(str(pair_row["repair_first_sentence"]))
+                        ),
+                        "exact_maintain_match": bool(
+                            ap.normalize_sentence_for_compare(row["first_generated_sentence"])
+                            == ap.normalize_sentence_for_compare(str(pair_row["maintain_first_sentence"]))
+                        ),
+                    }
+                )
+                greedy_rows.append(row)
+                if greedy_progress is not None:
+                    greedy_progress.update(1)
+            _write_greedy_live_outputs(output_root, greedy_rows)
+    finally:
+        if greedy_progress is not None:
+            greedy_progress.close()
+
+    greedy_summary_df = _write_greedy_live_outputs(output_root, greedy_rows)
+    pd.DataFrame(greedy_rows).to_csv(output_root / "greedy_results.csv", index=False)
+    greedy_summary_df.to_csv(output_root / "greedy_summary.csv", index=False)
+
+    total_planned = int(len(generation_pairs_df)) * int(len(selected_generation_conditions)) * int(samples_per_condition)
+    remaining = 0
+    for pair_row in generation_pairs_df.to_dict(orient="records"):
+        for condition in selected_generation_conditions:
+            layer_idx = condition.get("layer_idx")
+            for sample_idx in range(int(samples_per_condition)):
+                planned_key = ap._planned_sample_key(
+                    pair_id=str(pair_row["pair_id"]),
+                    condition_name=str(condition["condition_name"]),
+                    layer_idx=None if layer_idx is None else int(layer_idx),
+                    sample_idx=int(sample_idx),
+                )
+                if planned_key not in completed_keys:
+                    remaining += 1
+    print(
+        "Sampled suffix workload: "
+        f"{len(generation_pairs_df)} pairs x {len(selected_generation_conditions)} conditions x {int(samples_per_condition)} samples "
+        f"= {total_planned} generations ({remaining} remaining after resume)."
+    )
+
+    progress = None
+    if not disable_tqdm and ap._tqdm is not None:
+        progress = ap._tqdm(total=remaining, desc="Sampled repair generations", leave=True)
+    try:
+        for pair_row in generation_pairs_df.to_dict(orient="records"):
+            prefix_text = str(pair_row["post_commitment_model_input"])
+            required_rank = int(pair_row["required_rank"])
+            for condition_index, condition in enumerate(selected_generation_conditions):
+                layer_idx = condition.get("layer_idx")
+                pending_sample_indices: list[int] = []
+                for sample_idx in range(int(samples_per_condition)):
+                    planned_key = ap._planned_sample_key(
+                        pair_id=str(pair_row["pair_id"]),
+                        condition_name=str(condition["condition_name"]),
+                        layer_idx=None if layer_idx is None else int(layer_idx),
+                        sample_idx=int(sample_idx),
+                    )
+                    if planned_key not in completed_keys:
+                        pending_sample_indices.append(int(sample_idx))
+                if not pending_sample_indices:
+                    continue
+
+                layer_to_vector = _condition_layer_to_vector(condition, vector_bank=vector_bank)
+                seed_start = ap._sample_seed(int(base_seed), int(pair_row["pair_index"]), int(condition_index), 0)
+                for sample_chunk in ap.iter_chunks(pending_sample_indices, int(batch_size)):
+                    batch_rows = run_post_commitment_generation_condition_batch_samples(
+                        model,
+                        tokenizer,
+                        condition=condition,
+                        prefix_text=prefix_text,
+                        layer_to_vector=layer_to_vector,
+                        required_rank=required_rank,
+                        max_model_length=int(max_model_length),
+                        max_new_tokens=int(max_new_tokens),
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        sample_indices=sample_chunk,
+                        seed_start=seed_start,
+                        early_stop_on_valid_json=bool(early_stop_on_valid_json),
+                        early_stop_check_interval=int(early_stop_check_interval),
+                        early_stop_min_new_tokens=int(early_stop_min_new_tokens),
+                    )
+                    for row in batch_rows:
+                        planned_key = ap._planned_sample_key(
+                            pair_id=str(pair_row["pair_id"]),
+                            condition_name=str(condition["condition_name"]),
+                            layer_idx=None if layer_idx is None else int(layer_idx),
+                            sample_idx=int(row["sample_idx"]),
+                        )
+                        row.update(
+                            {
+                                "pair_index": int(pair_row["pair_index"]),
+                                "pair_id": str(pair_row["pair_id"]),
+                                "example_id": str(pair_row["example_id"]),
+                                "required_rank": required_rank,
+                                "commitment_delta": float(pair_row["commitment_delta"]),
+                                "deceptive_commitment_sentence": str(pair_row["deceptive_commitment_sentence"]),
+                                "repair_reference_sentence": str(pair_row["repair_first_sentence"]),
+                                "maintain_reference_sentence": str(pair_row["maintain_first_sentence"]),
+                            }
+                        )
+                        ap.append_jsonl_row(samples_path, row)
+                        completed_keys.add(planned_key)
+                        ap._update_pair_condition_stats(generation_stats, row)
+                    if progress is not None:
+                        progress.update(len(batch_rows))
+                    ap._write_live_summaries(output_root, generation_stats)
+    finally:
+        if progress is not None:
+            progress.close()
+
+    ap._write_live_summaries(output_root, generation_stats)
+    for live_name, final_name in [
+        ("pair_condition_summary_live.csv", "pair_condition_summary.csv"),
+        ("condition_summary_live.csv", "condition_summary.csv"),
+        ("margin_results_live.csv", "margin_results.csv"),
+        ("margin_summary_live.csv", "margin_summary.csv"),
+        ("greedy_results_live.csv", "greedy_results.csv"),
+        ("greedy_summary_live.csv", "greedy_summary.csv"),
+    ]:
+        live_path = output_root / live_name
+        if live_path.exists():
+            shutil.copy2(live_path, output_root / final_name)
+
+    print(f"Saved post-commitment repair steering artifacts to {output_root}")
+    return output_root
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Activation patching debug utilities for BS/Qwen7B. "
-            "Default mode runs a commitment-decision EAP-IG discovery pass over matched "
-            "deceptive/truthful commitment sentences from the same shared prefix."
+            "Default mode runs post-commitment repair steering: learn a truthful-repair direction "
+            "after a deceptive commitment sentence, then test whether the suffix becomes less deceptive."
         )
     )
     parser.add_argument(
         "--experiment-mode",
         type=str,
         default=DEFAULT_EXPERIMENT_MODE,
-        choices=["commitment_eap_ig", "patch_debug"],
-        help="Choose the commitment EAP-IG experiment or the older generation patch debug sweep.",
+        choices=["post_commitment_repair_steering", "commitment_eap_ig", "continuation_steering", "patch_debug"],
+        help="Choose post-commitment repair steering, commitment EAP-IG, continuation steering, or the older generation patch debug sweep.",
     )
     parser.add_argument(
         "--localization-dir",
@@ -1938,8 +3811,83 @@ def main(argv: list[str] | None = None) -> None:
         help="Qwen-7B BS localization directory.",
     )
     parser.add_argument("--pair-cache-path", type=str, default=str(ap.DEFAULT_PAIR_CACHE_PATH))
+    parser.add_argument(
+        "--repair-pair-cache-path",
+        type=str,
+        default=str(DEFAULT_POST_COMMITMENT_PAIR_CACHE_PATH),
+        help="Post-commitment repair steering mode. Cache path for enriched repair/maintain suffix pairs.",
+    )
     parser.add_argument("--refresh-pair-cache", action="store_true", default=False)
     parser.add_argument("--cache-only", action="store_true", default=False)
+    parser.add_argument(
+        "--steering-source-run-dir",
+        type=str,
+        default="",
+        help="Continuation steering mode. Discovery run directory that provides the exact pairs and layer rankings.",
+    )
+    parser.add_argument(
+        "--steering-layer-topks",
+        type=str,
+        default=",".join(str(v) for v in DEFAULT_STEERING_LAYER_TOPKS),
+        help="Continuation steering mode. Comma-separated top-K layer counts taken from the discovery run rankings.",
+    )
+    parser.add_argument(
+        "--steering-patch-modes",
+        type=str,
+        default=",".join(DEFAULT_STEERING_PATCH_MODES),
+        help="Continuation steering mode. Comma-separated subset of residual,kv,both.",
+    )
+    parser.add_argument("--steering-sample-count", type=int, default=DEFAULT_STEERING_SAMPLE_COUNT)
+    parser.add_argument("--steering-batch-size", type=int, default=DEFAULT_STEERING_BATCH_SIZE)
+    parser.add_argument("--steering-max-new-tokens", type=int, default=DEFAULT_STEERING_MAX_NEW_TOKENS)
+    parser.add_argument(
+        "--eval-pair-count",
+        type=int,
+        default=DEFAULT_TRUTHFUL_STEERING_EVAL_PAIR_COUNT,
+        help="Post-commitment repair steering mode. Held-out eval pair count; the remaining pairs are used to learn vectors.",
+    )
+    parser.add_argument(
+        "--generation-eval-count",
+        type=int,
+        default=DEFAULT_TRUTHFUL_STEERING_GENERATION_EVAL_COUNT,
+        help="Post-commitment repair steering mode. Number of eval pairs used for greedy/sample generation metrics.",
+    )
+    parser.add_argument(
+        "--steering-alphas",
+        type=str,
+        default=",".join(str(value) for value in DEFAULT_TRUTHFUL_STEERING_ALPHA_VALUES),
+        help="Post-commitment repair steering mode. Comma-separated steering strength multipliers, relative to the mean prefix norm at each layer.",
+    )
+    parser.add_argument(
+        "--steering-vector-types",
+        type=str,
+        default=",".join(DEFAULT_TRUTHFUL_STEERING_VECTOR_TYPES),
+        help="Post-commitment repair steering mode. Comma-separated subset of learned,random,shuffled.",
+    )
+    parser.add_argument(
+        "--persistent-token-counts",
+        type=str,
+        default=",".join(str(value) for value in DEFAULT_POST_COMMITMENT_PERSISTENT_TOKENS),
+        help="Post-commitment repair steering mode. Comma-separated non-negative counts of generated tokens to keep steering after the deceptive prefix.",
+    )
+    parser.add_argument(
+        "--generation-topk",
+        type=int,
+        default=DEFAULT_TRUTHFUL_STEERING_GENERATION_TOPK,
+        help="Post-commitment repair steering mode. Number of top learned conditions to carry forward into greedy/sample generation.",
+    )
+    parser.add_argument(
+        "--greedy-max-new-tokens",
+        type=int,
+        default=DEFAULT_TRUTHFUL_STEERING_GREEDY_MAX_NEW_TOKENS,
+        help="Post-commitment repair steering mode. Token cap for the greedy next-sentence generation screen.",
+    )
+    parser.add_argument(
+        "--suffix-sentence-count",
+        type=int,
+        default=DEFAULT_POST_COMMITMENT_SUFFIX_SENTENCE_COUNT,
+        help="Post-commitment repair steering mode. Number of repair/maintain suffix sentences to score in the teacher-forced margin objective.",
+    )
     parser.add_argument(
         "--pair-search-limit",
         type=int,
@@ -1950,7 +3898,7 @@ def main(argv: list[str] | None = None) -> None:
         "--pair-count",
         type=int,
         default=0,
-        help="Mode-dependent default: 50 for commitment EAP-IG, 12 for patch_debug.",
+        help="Mode-dependent default: 150 for post-commitment repair steering, 50 for commitment EAP-IG, 12 for patch_debug.",
     )
     parser.add_argument("--min-commitment-delta", type=float, default=0.0)
     parser.add_argument("--min-commitment-deception-rate", type=float, default=0.0)
@@ -1980,7 +3928,7 @@ def main(argv: list[str] | None = None) -> None:
         "--layer-count",
         type=int,
         default=-1,
-        help="Mode-dependent default: all layers for commitment EAP-IG, 5 evenly-spaced layers for patch_debug.",
+        help="Mode-dependent default: 8 evenly-spaced layers for post-commitment repair steering, all layers for commitment EAP-IG, 5 evenly-spaced layers for patch_debug.",
     )
     parser.add_argument("--ig-steps", type=int, default=DEFAULT_COMMITMENT_IG_STEPS)
     parser.add_argument("--token-bin-count", type=int, default=DEFAULT_COMMITMENT_TOKEN_BIN_COUNT)
@@ -2031,12 +3979,26 @@ def main(argv: list[str] | None = None) -> None:
     pair_count = (
         int(args.pair_count)
         if int(args.pair_count) > 0
-        else (DEFAULT_COMMITMENT_PAIR_COUNT if experiment_mode == "commitment_eap_ig" else DEFAULT_DEBUG_PAIR_COUNT)
+        else (
+            DEFAULT_TRUTHFUL_STEERING_PAIR_COUNT
+            if experiment_mode == "post_commitment_repair_steering"
+            else (DEFAULT_COMMITMENT_PAIR_COUNT if experiment_mode == "commitment_eap_ig" else DEFAULT_DEBUG_PAIR_COUNT)
+        )
     )
     if int(pair_count) <= 0:
         raise ValueError("--pair-count must be positive.")
     if int(args.max_model_length) <= 0:
         raise ValueError("--max-model-length must be positive.")
+    if experiment_mode == "post_commitment_repair_steering" and int(args.eval_pair_count) <= 0:
+        raise ValueError("--eval-pair-count must be positive.")
+    if experiment_mode == "post_commitment_repair_steering" and int(args.generation_eval_count) <= 0:
+        raise ValueError("--generation-eval-count must be positive.")
+    if experiment_mode == "post_commitment_repair_steering" and int(args.generation_topk) < 0:
+        raise ValueError("--generation-topk must be non-negative.")
+    if experiment_mode == "post_commitment_repair_steering" and int(args.greedy_max_new_tokens) <= 0:
+        raise ValueError("--greedy-max-new-tokens must be positive.")
+    if experiment_mode == "post_commitment_repair_steering" and int(args.suffix_sentence_count) <= 0:
+        raise ValueError("--suffix-sentence-count must be positive.")
     if experiment_mode == "patch_debug" and int(args.max_new_tokens) <= 0:
         raise ValueError("--max-new-tokens must be positive.")
     if experiment_mode == "patch_debug" and int(args.rate_sample_count) <= 0:
@@ -2057,6 +4019,12 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--random-edge-samples must be positive.")
     if experiment_mode == "commitment_eap_ig" and int(args.pair_search_limit) < 0:
         raise ValueError("--pair-search-limit must be non-negative.")
+    if experiment_mode == "continuation_steering" and int(args.steering_sample_count) <= 0:
+        raise ValueError("--steering-sample-count must be positive.")
+    if experiment_mode == "continuation_steering" and int(args.steering_batch_size) <= 0:
+        raise ValueError("--steering-batch-size must be positive.")
+    if experiment_mode == "continuation_steering" and int(args.steering_max_new_tokens) <= 0:
+        raise ValueError("--steering-max-new-tokens must be positive.")
 
     if experiment_mode == "patch_debug" and args.plot_only_run_dir.strip():
         run_dir = Path(args.plot_only_run_dir).expanduser().resolve()
@@ -2080,7 +4048,41 @@ def main(argv: list[str] | None = None) -> None:
 
     localization_dir = Path(args.localization_dir).expanduser().resolve()
     pair_cache_path = Path(args.pair_cache_path).expanduser().resolve()
-    if experiment_mode == "commitment_eap_ig":
+    repair_pair_cache_path = Path(args.repair_pair_cache_path).expanduser().resolve()
+    steering_source_run_dir = Path(args.steering_source_run_dir).expanduser().resolve() if args.steering_source_run_dir.strip() else None
+    if experiment_mode == "continuation_steering" and steering_source_run_dir is not None:
+        source_pair_count = int(pair_count) if int(args.pair_count) > 0 else None
+        pairs_df = load_commitment_pairs_from_run_dir(
+            steering_source_run_dir,
+            pair_count=source_pair_count,
+        )
+        print(f"Loaded {len(pairs_df)} steering pairs from {steering_source_run_dir}")
+    elif experiment_mode == "post_commitment_repair_steering":
+        commitment_pairs_df = load_commitment_pairs(
+            localization_dir=localization_dir,
+            pair_cache_path=pair_cache_path,
+            pair_count=int(pair_count),
+            pair_search_limit=None if int(args.pair_search_limit) <= 0 else int(args.pair_search_limit),
+            refresh_cache=bool(args.refresh_pair_cache),
+            min_commitment_delta=float(args.min_commitment_delta),
+            min_commitment_deception_rate=float(args.min_commitment_deception_rate),
+            min_donor_clarity_score=float(args.min_donor_clarity_score),
+            disable_tqdm=bool(args.disable_tqdm),
+        )
+        pairs_df = load_or_build_post_commitment_repair_pairs(
+            commitment_pairs_df=commitment_pairs_df,
+            pair_cache_path=repair_pair_cache_path,
+            suffix_sentence_count=int(args.suffix_sentence_count),
+            refresh_cache=bool(args.refresh_pair_cache),
+            disable_tqdm=bool(args.disable_tqdm),
+        )
+        if len(pairs_df) < int(pair_count):
+            print(
+                f"Warning: only {len(pairs_df)} post-commitment repair pairs were usable after suffix filtering "
+                f"(requested {int(pair_count)} commitment spikes)."
+            )
+        print(f"Loaded {len(pairs_df)} post-commitment repair pairs from {repair_pair_cache_path}")
+    elif experiment_mode == "commitment_eap_ig":
         pairs_df = load_commitment_pairs(
             localization_dir=localization_dir,
             pair_cache_path=pair_cache_path,
@@ -2114,12 +4116,103 @@ def main(argv: list[str] | None = None) -> None:
     if layer_candidates is None:
         if experiment_mode == "patch_debug":
             layer_count = DEFAULT_DEBUG_LAYER_COUNT if int(args.layer_count) < 0 else int(args.layer_count)
+        elif experiment_mode == "post_commitment_repair_steering":
+            layer_count = DEFAULT_TRUTHFUL_STEERING_LAYER_COUNT if int(args.layer_count) < 0 else int(args.layer_count)
         else:
             layer_count = None if int(args.layer_count) <= 0 else int(args.layer_count)
     if layer_candidates is not None:
         layer_tag = f"layers_{'_'.join(str(layer_idx) for layer_idx in layer_candidates)}"
     else:
         layer_tag = "layers_all" if layer_count is None or int(layer_count) <= 0 else f"layers{int(layer_count)}even"
+
+    if experiment_mode == "post_commitment_repair_steering":
+        alpha_values = parse_float_list(args.steering_alphas, name="--steering-alphas")
+        vector_types = parse_vector_types(args.steering_vector_types)
+        persistent_token_counts = parse_nonnegative_int_list(
+            args.persistent_token_counts,
+            name="--persistent-token-counts",
+        )
+        alpha_tag = "alphas_" + "_".join(_alpha_tag(value) for value in alpha_values)
+        vector_tag = "vectors_" + "_".join(vector_types)
+        persist_tag = "persist_" + "_".join(str(value) for value in persistent_token_counts)
+        stop_tag = "jsonstop" if not bool(args.no_early_stop_on_valid_json) else "nojsonstop"
+        run_tag = args.run_tag.strip() or (
+            f"{ap.DEFAULT_ENVIRONMENT}_{ap.slugify(ap.DEFAULT_MODEL_TAIL)}_postcommit_repair_steering_"
+            f"pairs{int(len(pairs_df))}_{layer_tag}_{alpha_tag}_{vector_tag}_{persist_tag}_"
+            f"eval{int(args.eval_pair_count)}_geneval{int(args.generation_eval_count)}_"
+            f"gentop{int(args.generation_topk)}_maxnew{int(args.steering_max_new_tokens)}_"
+            f"n{int(args.steering_sample_count)}_batch{int(args.steering_batch_size)}_{stop_tag}_seed{int(args.base_seed)}"
+        )
+        output_root = Path(args.output_root).expanduser().resolve() / run_tag
+        run_post_commitment_repair_steering_experiment(
+            pairs_df=pairs_df,
+            output_root=output_root,
+            model_name_or_path=str(args.model_name_or_path),
+            max_model_length=int(args.max_model_length),
+            cuda_device_name=str(args.cuda_device),
+            layer_candidates=layer_candidates,
+            layer_count=layer_count,
+            exclude_final_layers=int(args.exclude_final_layers),
+            eval_pair_count=int(args.eval_pair_count),
+            generation_eval_count=int(args.generation_eval_count),
+            alpha_values=alpha_values,
+            vector_types=vector_types,
+            persistent_token_counts=persistent_token_counts,
+            generation_topk=int(args.generation_topk),
+            greedy_max_new_tokens=int(args.greedy_max_new_tokens),
+            max_new_tokens=int(args.steering_max_new_tokens),
+            samples_per_condition=int(args.steering_sample_count),
+            batch_size=int(args.steering_batch_size),
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            base_seed=int(args.base_seed),
+            early_stop_on_valid_json=not bool(args.no_early_stop_on_valid_json),
+            early_stop_check_interval=int(args.early_stop_check_interval),
+            early_stop_min_new_tokens=int(args.early_stop_min_new_tokens),
+            resume=not bool(args.no_resume),
+            disable_tqdm=bool(args.disable_tqdm),
+        )
+        return
+
+    if experiment_mode == "continuation_steering":
+        if steering_source_run_dir is None:
+            raise ValueError("--steering-source-run-dir is required for continuation_steering mode.")
+        direction_layer_rankings = load_direction_layer_rankings_from_run_dir(steering_source_run_dir)
+        layer_topks = parse_positive_int_list(args.steering_layer_topks, name="--steering-layer-topks")
+        steering_patch_modes = parse_patch_modes(args.steering_patch_modes)
+        topk_tag = "topk_" + "_".join(str(v) for v in layer_topks)
+        mode_tag = "modes_" + "_".join(steering_patch_modes)
+        stop_tag = "jsonstop" if not bool(args.no_early_stop_on_valid_json) else "nojsonstop"
+        run_tag = args.run_tag.strip() or (
+            f"{ap.DEFAULT_ENVIRONMENT}_{ap.slugify(ap.DEFAULT_MODEL_TAIL)}_continuation_steering_"
+            f"pairs{int(len(pairs_df))}_{topk_tag}_{mode_tag}_"
+            f"maxnew{int(args.steering_max_new_tokens)}_n{int(args.steering_sample_count)}_"
+            f"batch{int(args.steering_batch_size)}_{stop_tag}_seed{int(args.base_seed)}"
+        )
+        output_root = Path(args.output_root).expanduser().resolve() / run_tag
+        run_commitment_continuation_steering_experiment(
+            pairs_df=pairs_df,
+            output_root=output_root,
+            direction_layer_rankings=direction_layer_rankings,
+            layer_topks=layer_topks,
+            steering_patch_modes=steering_patch_modes,
+            model_name_or_path=str(args.model_name_or_path),
+            max_model_length=int(args.max_model_length),
+            max_new_tokens=int(args.steering_max_new_tokens),
+            samples_per_condition=int(args.steering_sample_count),
+            batch_size=int(args.steering_batch_size),
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            base_seed=int(args.base_seed),
+            cuda_device_name=str(args.cuda_device),
+            early_stop_on_valid_json=not bool(args.no_early_stop_on_valid_json),
+            early_stop_check_interval=int(args.early_stop_check_interval),
+            early_stop_min_new_tokens=int(args.early_stop_min_new_tokens),
+            resume=not bool(args.no_resume),
+            disable_tqdm=bool(args.disable_tqdm),
+            steering_source_run_dir=steering_source_run_dir,
+        )
+        return
 
     if experiment_mode == "commitment_eap_ig":
         objective_token_count = None if int(args.objective_token_count) <= 0 else int(args.objective_token_count)
