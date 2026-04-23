@@ -31,6 +31,9 @@ DEFAULT_COMMITMENT_FAITHFULNESS = 0.85
 DEFAULT_COMMITMENT_RANDOM_EDGE_SAMPLES = 20
 DEFAULT_COMMITMENT_TOKEN_BIN_COUNT = 8
 DEFAULT_COMMITMENT_CURVE_SIZES = (1, 2, 4, 8, 16, 32, 64)
+DEFAULT_COMMITMENT_OBJECTIVE_TOKEN_COUNT = 3
+DEFAULT_COMMITMENT_EXCLUDE_FINAL_LAYERS = 2
+DEFAULT_COMMITMENT_PAIR_SEARCH_LIMIT = 400
 DEFAULT_EXPERIMENT_MODE = "commitment_eap_ig"
 TAG_ONLY_RE = re.compile(r"^\s*</?[^>]+>\s*$")
 
@@ -668,6 +671,7 @@ def load_commitment_pairs(
     localization_dir: Path,
     pair_cache_path: Path,
     pair_count: int,
+    pair_search_limit: int | None,
     refresh_cache: bool,
     min_commitment_delta: float,
     min_commitment_deception_rate: float,
@@ -677,20 +681,33 @@ def load_commitment_pairs(
     pair_cache_path = Path(pair_cache_path).expanduser().resolve()
     localization_dir = Path(localization_dir).expanduser().resolve()
 
-    if pair_cache_path.exists() and not refresh_cache:
+    requested_cache_count = max(int(pair_count), DEFAULT_COMMITMENT_PAIR_COUNT)
+    search_limit = (
+        int(pair_search_limit)
+        if pair_search_limit is not None and int(pair_search_limit) > 0
+        else max(int(requested_cache_count) * 4, DEFAULT_COMMITMENT_PAIR_SEARCH_LIMIT)
+    )
+
+    need_rebuild = bool(refresh_cache) or not pair_cache_path.exists()
+    source_df = pd.DataFrame()
+    if not need_rebuild:
         source_df = pd.DataFrame(ap.read_jsonl_rows(pair_cache_path))
-    else:
-        requested_cache_count = max(int(pair_count), DEFAULT_COMMITMENT_PAIR_COUNT)
-        source_df = ap.load_or_build_bs_activation_patch_pair_cache(
+        if source_df.empty or len(source_df) < int(pair_count) or len(source_df) < int(search_limit):
+            need_rebuild = True
+
+    if need_rebuild:
+        source_df = ap.search_bs_activation_patch_examples(
             localization_dir,
-            pair_cache_path=pair_cache_path,
-            pair_count=int(requested_cache_count),
-            refresh_cache=bool(refresh_cache),
+            limit=int(search_limit),
             min_commitment_delta=float(min_commitment_delta),
             min_commitment_deception_rate=float(min_commitment_deception_rate),
             min_donor_clarity_score=float(min_donor_clarity_score),
             disable_tqdm=bool(disable_tqdm),
         )
+        if source_df.empty:
+            raise ValueError(f"No matched commitment pairs found in {localization_dir}")
+        ap.write_jsonl(pair_cache_path, source_df.to_dict(orient="records"))
+        source_df.to_csv(pair_cache_path.with_suffix(".csv"), index=False)
     if source_df.empty:
         raise ValueError(f"No matched pairs available in {pair_cache_path}")
 
@@ -731,7 +748,8 @@ def load_commitment_pairs(
     if len(usable_df) < int(pair_count):
         raise ValueError(
             f"Only {len(usable_df)} usable commitment pairs remained after filtering, "
-            f"but pair_count={int(pair_count)} was requested."
+            f"but pair_count={int(pair_count)} was requested. "
+            f"Try a larger --pair-search-limit (current effective limit: {int(search_limit)})."
         )
     usable_df = usable_df.head(int(pair_count)).reset_index(drop=True)
     usable_df.insert(0, "pair_index", np.arange(len(usable_df), dtype=int))
@@ -745,6 +763,7 @@ def _encode_commitment_branch(
     full_text: str,
     device: torch.device,
     max_model_length: int,
+    objective_token_count: int | None,
 ) -> dict[str, Any]:
     prefix_inputs = ap.encode_text_for_model(tokenizer, prefix_text, max_input_tokens=max_model_length)
     full_inputs = ap.encode_text_for_model(tokenizer, full_text, max_input_tokens=max_model_length)
@@ -757,6 +776,11 @@ def _encode_commitment_branch(
         raise ValueError("Commitment branch must add at least one token after the shared prefix.")
     if prefix_len > total_len or not torch.equal(full_ids[:prefix_len], prefix_ids):
         raise ValueError("Full branch tokenization does not begin with the shared prefix tokenization.")
+    scored_token_count = int(sentence_len)
+    if objective_token_count is not None and int(objective_token_count) > 0:
+        scored_token_count = min(int(sentence_len), int(objective_token_count))
+    score_start_pos = int(prefix_len)
+    score_stop_pos = int(prefix_len) + int(scored_token_count)
     device_inputs = {key: value.to(device) for key, value in full_inputs.items()}
     return {
         "input_ids": device_inputs["input_ids"],
@@ -764,6 +788,9 @@ def _encode_commitment_branch(
         "prefix_len": int(prefix_len),
         "total_len": int(total_len),
         "sentence_len": int(sentence_len),
+        "score_start_pos": int(score_start_pos),
+        "score_stop_pos": int(score_stop_pos),
+        "scored_token_count": int(scored_token_count),
     }
 
 
@@ -791,8 +818,11 @@ def _capture_sentence_hidden_states(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    score_start_pos: int,
+    score_stop_pos: int,
     prefix_len: int,
     total_len: int,
+    scored_token_count: int,
     layer_indices: list[int],
 ) -> dict[str, Any]:
     with torch.inference_mode():
@@ -807,8 +837,8 @@ def _capture_sentence_hidden_states(
         _sentence_logprob_total_tensor(
             outputs.logits,
             input_ids,
-            prefix_len,
-            total_len,
+            score_start_pos,
+            score_stop_pos,
         ).item()
     )
     sentence_len = int(total_len) - int(prefix_len)
@@ -818,8 +848,10 @@ def _capture_sentence_hidden_states(
     }
     return {
         "sentence_total_logprob": sentence_total_logprob,
-        "sentence_avg_logprob": sentence_total_logprob / float(sentence_len),
+        "sentence_avg_logprob": sentence_total_logprob / float(int(scored_token_count)),
         "sentence_hidden_by_layer": hidden_by_layer,
+        "scored_token_count": int(scored_token_count),
+        "sentence_len": int(sentence_len),
     }
 
 
@@ -922,10 +954,10 @@ def _score_target_with_site_masks(
         total_logprob = _sentence_logprob_total_tensor(
             outputs.logits,
             branch_inputs["input_ids"],
-            branch_inputs["prefix_len"],
-            branch_inputs["total_len"],
+            branch_inputs["score_start_pos"],
+            branch_inputs["score_stop_pos"],
         )
-        avg_logprob = total_logprob / float(branch_inputs["sentence_len"])
+        avg_logprob = total_logprob / float(branch_inputs["scored_token_count"])
         return total_logprob, avg_logprob
     finally:
         for handle in handles:
@@ -1020,6 +1052,7 @@ def _prepare_commitment_pair_bundle(
     layer_indices: list[int],
     token_bin_count: int,
     max_model_length: int,
+    objective_token_count: int | None,
 ) -> dict[str, Any]:
     model_device = ap.resolve_model_device(model)
     prefix_text = str(pair_row["shared_prefix_text"])
@@ -1030,6 +1063,7 @@ def _prepare_commitment_pair_bundle(
         full_text=str(pair_row["deceptive_branch_text"]),
         device=model_device,
         max_model_length=int(max_model_length),
+        objective_token_count=objective_token_count,
     )
     truthful_inputs = _encode_commitment_branch(
         tokenizer,
@@ -1037,6 +1071,7 @@ def _prepare_commitment_pair_bundle(
         full_text=str(pair_row["truthful_branch_text"]),
         device=model_device,
         max_model_length=int(max_model_length),
+        objective_token_count=objective_token_count,
     )
     if int(deceptive_inputs["prefix_len"]) != int(truthful_inputs["prefix_len"]):
         raise ValueError("Shared prefix token length differs across deceptive/truthful branches.")
@@ -1045,16 +1080,22 @@ def _prepare_commitment_pair_bundle(
         model,
         input_ids=deceptive_inputs["input_ids"],
         attention_mask=deceptive_inputs["attention_mask"],
+        score_start_pos=int(deceptive_inputs["score_start_pos"]),
+        score_stop_pos=int(deceptive_inputs["score_stop_pos"]),
         prefix_len=int(deceptive_inputs["prefix_len"]),
         total_len=int(deceptive_inputs["total_len"]),
+        scored_token_count=int(deceptive_inputs["scored_token_count"]),
         layer_indices=layer_indices,
     )
     truthful_capture = _capture_sentence_hidden_states(
         model,
         input_ids=truthful_inputs["input_ids"],
         attention_mask=truthful_inputs["attention_mask"],
+        score_start_pos=int(truthful_inputs["score_start_pos"]),
+        score_stop_pos=int(truthful_inputs["score_stop_pos"]),
         prefix_len=int(truthful_inputs["prefix_len"]),
         total_len=int(truthful_inputs["total_len"]),
+        scored_token_count=int(truthful_inputs["scored_token_count"]),
         layer_indices=layer_indices,
     )
 
@@ -1090,6 +1131,7 @@ def _prepare_commitment_pair_bundle(
         "shared_prefix_text": prefix_text,
         "baseline_margin_total_logprob": baseline_margin_total,
         "baseline_margin_avg_logprob": baseline_margin_avg,
+        "objective_token_count": None if objective_token_count is None else int(objective_token_count),
         "deceptive_branch": {
             "branch_label": "deceptive",
             "sentence_text": str(pair_row["deceptive_commitment_sentence"]),
@@ -1116,6 +1158,8 @@ def _prepare_commitment_pair_bundle(
                 "baseline_target_avg_logprob": float(deceptive_capture["sentence_avg_logprob"]),
                 "baseline_other_total_logprob": float(truthful_capture["sentence_total_logprob"]),
                 "baseline_other_avg_logprob": float(truthful_capture["sentence_avg_logprob"]),
+                "target_scored_token_count": int(deceptive_capture["scored_token_count"]),
+                "other_scored_token_count": int(truthful_capture["scored_token_count"]),
                 "site_layout": deceptive_to_truthful_layout,
             },
             "truthful_to_deceptive": {
@@ -1129,6 +1173,8 @@ def _prepare_commitment_pair_bundle(
                 "baseline_target_avg_logprob": float(truthful_capture["sentence_avg_logprob"]),
                 "baseline_other_total_logprob": float(deceptive_capture["sentence_total_logprob"]),
                 "baseline_other_avg_logprob": float(deceptive_capture["sentence_avg_logprob"]),
+                "target_scored_token_count": int(truthful_capture["scored_token_count"]),
+                "other_scored_token_count": int(deceptive_capture["scored_token_count"]),
                 "site_layout": truthful_to_deceptive_layout,
             },
         },
@@ -1303,8 +1349,10 @@ def run_commitment_eap_ig_experiment(
     cuda_device_name: str,
     layer_candidates: list[int] | None,
     layer_count: int | None,
+    exclude_final_layers: int,
     ig_steps: int,
     token_bin_count: int,
+    objective_token_count: int | None,
     faithfulness_threshold: float,
     random_edge_samples: int,
     curve_sizes_text: str,
@@ -1320,6 +1368,8 @@ def run_commitment_eap_ig_experiment(
         raise ValueError("token_bin_count must be positive.")
     if int(random_edge_samples) <= 0:
         raise ValueError("random_edge_samples must be positive.")
+    if int(exclude_final_layers) < 0:
+        raise ValueError("exclude_final_layers must be non-negative.")
 
     output_root = Path(output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -1378,6 +1428,9 @@ def run_commitment_eap_ig_experiment(
         else:
             layer_candidates = ap.build_evenly_spaced_layer_candidates(n_layers, int(layer_count))
     layer_candidates = sorted({int(layer_idx) for layer_idx in layer_candidates if 0 <= int(layer_idx) < int(n_layers)})
+    if int(exclude_final_layers) > 0:
+        min_excluded_layer = int(n_layers) - int(exclude_final_layers)
+        layer_candidates = [int(layer_idx) for layer_idx in layer_candidates if int(layer_idx) < int(min_excluded_layer)]
     if not layer_candidates:
         raise ValueError("No valid layer candidates were selected.")
 
@@ -1391,6 +1444,7 @@ def run_commitment_eap_ig_experiment(
             "from the same shared prefix and rank layer/bin sites by integrated gradients."
         ),
         "objective": "logp(s_k^target | y_1:k-1)",
+        "objective_token_count": None if objective_token_count is None else int(objective_token_count),
         "margin_reference": "logp(s_k^D | y_1:k-1) - logp(s_k^H | y_1:k-1)",
         "model_name_or_path": model_name_or_path,
         "environment": ap.DEFAULT_ENVIRONMENT,
@@ -1407,6 +1461,8 @@ def run_commitment_eap_ig_experiment(
         "n_layers": int(n_layers),
         "layer_candidates": [int(layer_idx) for layer_idx in layer_candidates],
         "layer_count": None if layer_count is None else int(layer_count),
+        "exclude_final_layers": int(exclude_final_layers),
+        "excluded_layer_indices": [layer_idx for layer_idx in range(max(0, int(n_layers) - int(exclude_final_layers)), int(n_layers))],
         "parameter_devices": ap.parameter_device_summary(model),
         "resume": bool(resume),
     }
@@ -1449,6 +1505,7 @@ def run_commitment_eap_ig_experiment(
                 layer_indices=layer_candidates,
                 token_bin_count=int(token_bin_count),
                 max_model_length=int(max_model_length),
+                objective_token_count=objective_token_count,
             )
             for direction_name in pending_directions:
                 direction_bundle = pair_bundle["directions"][str(direction_name)]
@@ -1506,10 +1563,13 @@ def run_commitment_eap_ig_experiment(
                     "donor_role": str(direction_bundle["donor_role"]),
                     "baseline_margin_total_logprob": baseline_margin_total,
                     "baseline_margin_avg_logprob": float(pair_bundle["baseline_margin_avg_logprob"]),
+                    "objective_token_count": None if objective_token_count is None else int(objective_token_count),
                     "baseline_target_total_logprob": baseline_target_total,
                     "baseline_target_avg_logprob": baseline_target_avg,
                     "baseline_other_total_logprob": float(direction_bundle["baseline_other_total_logprob"]),
                     "baseline_other_avg_logprob": float(direction_bundle["baseline_other_avg_logprob"]),
+                    "target_scored_token_count": int(direction_bundle["target_scored_token_count"]),
+                    "other_scored_token_count": int(direction_bundle["other_scored_token_count"]),
                     "full_patch_target_total_logprob": full_patch_total_value,
                     "full_patch_target_avg_logprob": full_patch_avg_value,
                     "score_drop_full_patch": score_drop_full_patch,
@@ -1606,6 +1666,7 @@ def run_commitment_eap_ig_experiment(
                 layer_indices=layer_candidates,
                 token_bin_count=int(token_bin_count),
                 max_model_length=int(max_model_length),
+                objective_token_count=objective_token_count,
             )
             for direction_name, direction_bundle in pair_bundle["directions"].items():
                 ranked_sites = direction_site_map.get(str(direction_name), [])
@@ -1658,6 +1719,7 @@ def run_commitment_eap_ig_experiment(
                             "direction": str(direction_name),
                             "target_role": str(direction_bundle["target_role"]),
                             "donor_role": str(direction_bundle["donor_role"]),
+                            "objective_token_count": None if objective_token_count is None else int(objective_token_count),
                             "circuit_size": int(circuit_size),
                             "patched_target_total_logprob": patched_total_value,
                             "patched_target_avg_logprob": float(patched_avg.item()),
@@ -1718,6 +1780,7 @@ def run_commitment_eap_ig_experiment(
                 layer_indices=layer_candidates,
                 token_bin_count=int(token_bin_count),
                 max_model_length=int(max_model_length),
+                objective_token_count=objective_token_count,
             )
             for direction_name, direction_bundle in pair_bundle["directions"].items():
                 ranked_sites = direction_site_map.get(str(direction_name), [])
@@ -1852,6 +1915,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--refresh-pair-cache", action="store_true", default=False)
     parser.add_argument("--cache-only", action="store_true", default=False)
     parser.add_argument(
+        "--pair-search-limit",
+        type=int,
+        default=0,
+        help="Commitment mode only. When positive, mine up to this many candidate matched pairs before filtering/selecting.",
+    )
+    parser.add_argument(
         "--pair-count",
         type=int,
         default=0,
@@ -1889,6 +1958,18 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--ig-steps", type=int, default=DEFAULT_COMMITMENT_IG_STEPS)
     parser.add_argument("--token-bin-count", type=int, default=DEFAULT_COMMITMENT_TOKEN_BIN_COUNT)
+    parser.add_argument(
+        "--objective-token-count",
+        type=int,
+        default=DEFAULT_COMMITMENT_OBJECTIVE_TOKEN_COUNT,
+        help="Commitment mode only. Score only the first N commitment tokens; set <=0 to score the full sentence.",
+    )
+    parser.add_argument(
+        "--exclude-final-layers",
+        type=int,
+        default=DEFAULT_COMMITMENT_EXCLUDE_FINAL_LAYERS,
+        help="Commitment mode only. Exclude this many final decoder layers from discovery.",
+    )
     parser.add_argument("--faithfulness-threshold", type=float, default=DEFAULT_COMMITMENT_FAITHFULNESS)
     parser.add_argument("--random-edge-samples", type=int, default=DEFAULT_COMMITMENT_RANDOM_EDGE_SAMPLES)
     parser.add_argument(
@@ -1937,8 +2018,12 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--ig-steps must be positive.")
     if experiment_mode == "commitment_eap_ig" and int(args.token_bin_count) <= 0:
         raise ValueError("--token-bin-count must be positive.")
+    if experiment_mode == "commitment_eap_ig" and int(args.exclude_final_layers) < 0:
+        raise ValueError("--exclude-final-layers must be non-negative.")
     if experiment_mode == "commitment_eap_ig" and int(args.random_edge_samples) <= 0:
         raise ValueError("--random-edge-samples must be positive.")
+    if experiment_mode == "commitment_eap_ig" and int(args.pair_search_limit) < 0:
+        raise ValueError("--pair-search-limit must be non-negative.")
 
     if experiment_mode == "patch_debug" and args.plot_only_run_dir.strip():
         run_dir = Path(args.plot_only_run_dir).expanduser().resolve()
@@ -1967,6 +2052,7 @@ def main(argv: list[str] | None = None) -> None:
             localization_dir=localization_dir,
             pair_cache_path=pair_cache_path,
             pair_count=int(pair_count),
+            pair_search_limit=None if int(args.pair_search_limit) <= 0 else int(args.pair_search_limit),
             refresh_cache=bool(args.refresh_pair_cache),
             min_commitment_delta=float(args.min_commitment_delta),
             min_commitment_deception_rate=float(args.min_commitment_deception_rate),
@@ -2003,9 +2089,13 @@ def main(argv: list[str] | None = None) -> None:
         layer_tag = "layers_all" if layer_count is None or int(layer_count) <= 0 else f"layers{int(layer_count)}even"
 
     if experiment_mode == "commitment_eap_ig":
+        objective_token_count = None if int(args.objective_token_count) <= 0 else int(args.objective_token_count)
+        exclude_tag = f"exclast{int(args.exclude_final_layers)}"
+        objective_tag = "objfull" if objective_token_count is None else f"objtok{int(objective_token_count)}"
         run_tag = args.run_tag.strip() or (
             f"{ap.DEFAULT_ENVIRONMENT}_{ap.slugify(ap.DEFAULT_MODEL_TAIL)}_commitment_eapig_"
-            f"pairs{int(pair_count)}_{layer_tag}_bins{int(args.token_bin_count)}_ig{int(args.ig_steps)}_"
+            f"pairs{int(pair_count)}_{layer_tag}_{exclude_tag}_{objective_tag}_"
+            f"bins{int(args.token_bin_count)}_ig{int(args.ig_steps)}_"
             f"faith{int(round(float(args.faithfulness_threshold) * 100.0))}_seed{int(args.base_seed)}"
         )
         output_root = Path(args.output_root).expanduser().resolve() / run_tag
@@ -2017,8 +2107,10 @@ def main(argv: list[str] | None = None) -> None:
             cuda_device_name=str(args.cuda_device),
             layer_candidates=layer_candidates,
             layer_count=layer_count,
+            exclude_final_layers=int(args.exclude_final_layers),
             ig_steps=int(args.ig_steps),
             token_bin_count=int(args.token_bin_count),
+            objective_token_count=objective_token_count,
             faithfulness_threshold=float(args.faithfulness_threshold),
             random_edge_samples=int(args.random_edge_samples),
             curve_sizes_text=str(args.curve_sizes),
