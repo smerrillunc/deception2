@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import shutil
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,7 +17,7 @@ import activation_patching as ap
 DEFAULT_DEBUG_PAIR_COUNT = 12
 DEFAULT_DEBUG_SAMPLE_COUNT = 4
 DEFAULT_DEBUG_BATCH_SIZE = 4
-DEFAULT_DEBUG_MAX_NEW_TOKENS = 256
+DEFAULT_DEBUG_MAX_NEW_TOKENS = 2048
 DEFAULT_DEBUG_LAYER_COUNT = 5
 DEFAULT_DEBUG_PATCH_MODES = ("residual", "kv", "both")
 DEFAULT_DEBUG_OUTPUT_ROOT = ap.ROOT_DIR / "Results" / "activation_patching_debug"
@@ -38,6 +39,163 @@ def parse_patch_modes(text: str) -> list[str]:
     if not patch_modes:
         raise ValueError("At least one patch mode is required.")
     return patch_modes
+
+
+def build_patch_conditions_with_modes(layer_candidates: list[int], *, patch_modes: Iterable[str]) -> list[dict[str, Any]]:
+    if hasattr(ap, "build_single_layer_patch_conditions_with_modes"):
+        return ap.build_single_layer_patch_conditions_with_modes(layer_candidates, patch_modes=patch_modes)
+
+    mode_label_map = {
+        "residual": "Residual",
+        "kv": "K/V",
+        "both": "Residual + K/V",
+    }
+    conditions: list[dict[str, Any]] = []
+    for raw_patch_mode in patch_modes:
+        patch_mode = str(raw_patch_mode).strip().lower()
+        if patch_mode not in mode_label_map:
+            raise ValueError(f"Unsupported patch_mode={raw_patch_mode!r}")
+        mode_label = mode_label_map[patch_mode]
+        for layer_idx in layer_candidates:
+            layer_idx = int(layer_idx)
+            conditions.append(
+                {
+                    "condition_name": f"denoising_layer_{layer_idx}__{patch_mode}",
+                    "patch_label": f"{mode_label} | Denoising | Layer {layer_idx}",
+                    "experiment": "denoising",
+                    "target_prefix_role": "deceptive",
+                    "donor_prefix_role": "truthful",
+                    "patch_mode": patch_mode,
+                    "layer_indices": (layer_idx,),
+                }
+            )
+            conditions.append(
+                {
+                    "condition_name": f"noising_layer_{layer_idx}__{patch_mode}",
+                    "patch_label": f"{mode_label} | Noising | Layer {layer_idx}",
+                    "experiment": "noising",
+                    "target_prefix_role": "truthful",
+                    "donor_prefix_role": "deceptive",
+                    "patch_mode": patch_mode,
+                    "layer_indices": (layer_idx,),
+                }
+            )
+    return conditions
+
+
+def load_model_with_dtype_compat(
+    model_name_or_path: str,
+    *,
+    common_kwargs: dict[str, Any],
+    dtype_value: torch.dtype,
+) -> Any:
+    last_exc: Exception | None = None
+    for dtype_key in ("dtype", "torch_dtype"):
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                **common_kwargs,
+                **{dtype_key: dtype_value},
+            )
+        except TypeError as exc:
+            last_exc = exc
+            if "unexpected keyword argument" not in str(exc):
+                raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Unable to load model with either dtype or torch_dtype.")
+
+
+def _supports_batched_patch_mode(patch_mode: str) -> bool:
+    patch_mode = str(patch_mode).strip().lower()
+    if patch_mode in {"none", "residual"}:
+        return hasattr(ap, "run_generation_condition_batch_samples")
+    batch_fn = getattr(ap, "generate_batch_with_sentence_patch", None)
+    if batch_fn is None or not hasattr(ap, "run_generation_condition_batch_samples"):
+        return False
+    try:
+        source = inspect.getsource(batch_fn)
+    except (OSError, TypeError):
+        return hasattr(ap, "build_single_layer_patch_conditions_with_modes")
+    return "Batched generation only supports residual or unpatched conditions." not in source
+
+
+def run_generation_condition_samples_compat(
+    model: Any,
+    tokenizer: Any,
+    *,
+    condition_name: str,
+    target_text: str,
+    target_prefix_boundary_text: str,
+    patch_label: str | None,
+    patch_mode: str,
+    layer_indices: tuple[int, ...] | None,
+    donor_source: dict[str, Any] | None,
+    required_rank: int,
+    max_model_length: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    sample_indices: list[int],
+    seed_start: int,
+    patch_scope: str = "sentence_span",
+    early_stop_on_valid_json: bool = False,
+    early_stop_check_interval: int = 16,
+    early_stop_min_new_tokens: int = 32,
+) -> list[dict[str, Any]]:
+    if not sample_indices:
+        return []
+    if _supports_batched_patch_mode(patch_mode):
+        return ap.run_generation_condition_batch_samples(
+            model,
+            tokenizer,
+            condition_name=condition_name,
+            target_text=target_text,
+            target_prefix_boundary_text=target_prefix_boundary_text,
+            patch_label=patch_label,
+            patch_mode=patch_mode,
+            layer_indices=layer_indices,
+            donor_source=donor_source,
+            required_rank=required_rank,
+            max_model_length=max_model_length,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            sample_indices=sample_indices,
+            seed_start=seed_start,
+            patch_scope=patch_scope,
+            early_stop_on_valid_json=early_stop_on_valid_json,
+            early_stop_check_interval=early_stop_check_interval,
+            early_stop_min_new_tokens=early_stop_min_new_tokens,
+        )
+
+    rows: list[dict[str, Any]] = []
+    for sample_idx in sample_indices:
+        seed = int(seed_start) + int(sample_idx)
+        row = ap.run_generation_condition(
+            model,
+            tokenizer,
+            condition_name=condition_name,
+            target_text=target_text,
+            target_prefix_boundary_text=target_prefix_boundary_text,
+            patch_label=patch_label,
+            patch_mode=patch_mode,
+            layer_indices=layer_indices,
+            donor_source=donor_source,
+            required_rank=required_rank,
+            max_model_length=max_model_length,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            patch_scope=patch_scope,
+            early_stop_on_valid_json=early_stop_on_valid_json,
+            early_stop_check_interval=early_stop_check_interval,
+            early_stop_min_new_tokens=early_stop_min_new_tokens,
+        )
+        row["sample_idx"] = int(sample_idx)
+        rows.append(row)
+    return rows
 
 
 def _write_debug_delta_summaries(
@@ -214,10 +372,13 @@ def run_debug_patch_experiment(
     model_kwargs = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
-        "torch_dtype": torch.bfloat16,
         "device_map": ap.single_gpu_device_map(cuda_device),
     }
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+    model = load_model_with_dtype_compat(
+        model_name_or_path,
+        common_kwargs=model_kwargs,
+        dtype_value=torch.bfloat16,
+    )
     model.eval()
     ap.assert_model_fully_on_cuda(model)
 
@@ -238,7 +399,7 @@ def run_debug_patch_experiment(
             layer_candidates = ap.build_default_layer_candidates(n_layers)
     layer_candidates = sorted({int(layer_idx) for layer_idx in layer_candidates if 0 <= int(layer_idx) < int(n_layers)})
     patch_modes = parse_patch_modes(",".join(str(mode) for mode in patch_modes))
-    patch_conditions = ap.build_single_layer_patch_conditions_with_modes(layer_candidates, patch_modes=patch_modes)
+    patch_conditions = build_patch_conditions_with_modes(layer_candidates, patch_modes=patch_modes)
     all_conditions = (ap.build_baseline_conditions() if include_baselines else []) + patch_conditions
     capture_cache = any(str(condition["patch_mode"]) in {"kv", "both"} for condition in patch_conditions)
 
@@ -400,7 +561,7 @@ def run_debug_patch_experiment(
                         progress.set_postfix_str(
                             f"pair={int(pair_index)} condition={condition['condition_name']} batch={len(sample_chunk)}"
                         )
-                    batch_rows = ap.run_generation_condition_batch_samples(
+                    batch_rows = run_generation_condition_samples_compat(
                         model,
                         tokenizer,
                         condition_name=str(condition["condition_name"]),
