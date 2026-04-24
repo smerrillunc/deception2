@@ -41,6 +41,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -236,6 +237,20 @@ ENV_ORDER = list(ENV_SPECS.keys())
 
 FEATURE_FILENAME = "prefix_deception_features.parquet.tmp"
 ACTIVATION_FILENAME = "prefix_deception_activations.h5"
+STRUCTURAL_BASELINE_FILENAME = os.environ.get(
+    "OOD_MAIN3_COMPANION_STRUCTURAL_BASELINE_FILENAME",
+    getattr(extractor, "DEFAULT_OUTPUT_NAME", "commitment_text_structural_baselines.parquet"),
+)
+TFIDF_CACHE_DIRNAME = os.environ.get(
+    "OOD_MAIN3_COMPANION_TFIDF_CACHE_DIRNAME",
+    getattr(extractor, "DEFAULT_TFIDF_CACHE_DIRNAME", "commitment_text_baseline_tfidf_cache"),
+)
+TFIDF_TEXT_FIELDS = tuple(
+    env_str_tuple(
+        "OOD_MAIN3_COMPANION_TFIDF_TEXT_FIELDS",
+        tuple(getattr(extractor, "DEFAULT_TFIDF_TEXT_FIELDS", ("last_sentence_text", "prefix_text"))),
+    )
+)
 RANDOM_SEED = env_int("OOD_MAIN3_COMPANION_SEED", env_int("OOD_MAIN3_SEED", 42))
 VAL_SIZE = env_float("OOD_MAIN3_COMPANION_VAL_SIZE", env_float("OOD_MAIN3_VAL_SIZE", 0.20))
 DELTA_THRESHOLD = env_float("OOD_MAIN3_COMPANION_DELTA_THRESHOLD", env_float("OOD_MAIN3_DELTA_THRESHOLD", 0.30))
@@ -289,6 +304,57 @@ MODEL_SELECTION_OBJECTIVE = os.environ.get(
 FORCE_REBUILD_REDUCTIONS = os.environ.get("OOD_MAIN3_COMPANION_FORCE_REBUILD", "0") == "1"
 DISABLE_TQDM = os.environ.get("OOD_MAIN3_COMPANION_DISABLE_TQDM", "0") == "1"
 TOP_FEATURES_TO_SHOW = env_int("OOD_MAIN3_COMPANION_TOP_FEATURES_TO_SHOW", 20)
+FEATURE_SPACE_MODE = str(
+    os.environ.get(
+        "OOD_MAIN3_COMPANION_FEATURE_SPACE_MODE",
+        "all",
+    )
+).strip().lower()
+
+STRUCTURAL_BASELINE_EXCLUDED_COLUMNS = {
+    "dataset",
+    "model_name",
+    "model_bundle_name",
+    "example_id",
+    "trace_id",
+    "localization_path",
+    "prompt",
+    "example_label",
+    "example_label_source",
+    "commitment_direction",
+    "sentence_text",
+    "last_sentence_text",
+    "previous_sentence_text",
+    "prefix_text",
+    "full_prefix_text",
+    "deceptive_commitment_sentence_idx",
+    "truthful_commitment_sentence_idx",
+    "example_commitment_sentence_idx",
+    "num_truthful",
+    "num_valid",
+    "deception_rate",
+    "prev_deception_rate",
+    "next_deception_rate",
+    "delta_deception_rate",
+    "abs_delta_deception_rate",
+    "target_value",
+    "has_deceptive_commitment",
+    "has_truthful_commitment",
+    "has_example_commitment",
+    "is_deceptive_commitment_juncture",
+    "is_truthful_commitment_juncture",
+    "is_commitment_juncture",
+}
+STRUCTURAL_BASELINE_FEATURE_COLUMNS = tuple(
+    column_name
+    for column_name in extractor.OUTPUT_COLUMNS
+    if column_name not in STRUCTURAL_BASELINE_EXCLUDED_COLUMNS
+    and (
+        column_name in extractor.INT_COLUMNS
+        or column_name in extractor.FLOAT_COLUMNS
+        or column_name in extractor.BOOL_COLUMNS
+    )
+)
 
 SCENARIO_TITLES = OrderedDict(
     [
@@ -437,6 +503,8 @@ class FeatureSpaceSpec:
     attention_subset_key: str | None
     activation_variant: str | None
     activation_use_pca: bool
+    baseline_variant: str | None = None
+    baseline_text_field: str | None = None
 
 
 ATTENTION_SUBSETS = OrderedDict(
@@ -490,7 +558,7 @@ ATTENTION_SUBSETS = OrderedDict(
 )
 
 
-FEATURE_SPACES = OrderedDict(
+BASE_FEATURE_SPACES = OrderedDict(
     [
         (
             "attention_only",
@@ -592,7 +660,7 @@ FEATURE_SPACES = OrderedDict(
             "baseline_raw_final",
             FeatureSpaceSpec(
                 name="baseline_raw_final",
-                title="Baseline: raw final",
+                title="Baseline: raw final activation",
                 family_title="baseline",
                 uses_attention=False,
                 attention_subset_key=None,
@@ -639,6 +707,215 @@ FEATURE_SPACES = OrderedDict(
     ]
 )
 
+FAMILY_PANEL_ORDER = (
+    "attention_only",
+    "activation_only",
+    "attention_plus_activation",
+    "baseline",
+)
+
+FAMILY_DISPLAY_TITLES = {
+    "attention_only": "Attention only",
+    "activation_only": "Activation only",
+    "attention_plus_activation": "Attention + activation",
+    "baseline": "Baseline",
+}
+
+
+def build_dataset_file_map(model_dirname: str) -> OrderedDict[str, dict[str, Path]]:
+    file_map: OrderedDict[str, dict[str, Path]] = OrderedDict()
+    for env_name, env_dir in ENV_SPECS.items():
+        feature_path = DATASET_ROOT / env_dir / model_dirname / FEATURE_FILENAME
+        activation_path = DATASET_ROOT / env_dir / model_dirname / ACTIVATION_FILENAME
+        if not feature_path.exists():
+            raise FileNotFoundError(f"Missing feature parquet for {env_name}: {feature_path}")
+        if not activation_path.exists():
+            raise FileNotFoundError(f"Missing activation h5 for {env_name}: {activation_path}")
+        file_map[env_name] = {
+            "feature_path": feature_path,
+            "activation_path": activation_path,
+            "structural_baseline_path": DATASET_ROOT / env_dir / model_dirname / STRUCTURAL_BASELINE_FILENAME,
+            "tfidf_cache_dir": DATASET_ROOT / env_dir / model_dirname / TFIDF_CACHE_DIRNAME,
+        }
+    return file_map
+
+
+DATASET_FILE_MAP = build_dataset_file_map(MODEL_DIRNAME)
+
+
+def parse_tfidf_artifact_meta(meta_path: Path) -> dict[str, Any]:
+    return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+def locate_tfidf_artifact(cache_dir: Path, text_field: str) -> dict[str, Path] | None:
+    if not cache_dir.is_dir():
+        return None
+
+    candidate_rows: list[dict[str, Any]] = []
+    for meta_path in sorted(cache_dir.glob("*.json")):
+        try:
+            meta = parse_tfidf_artifact_meta(meta_path)
+        except Exception:
+            continue
+        if str(meta.get("feature_type", "")).strip().lower() != "tfidf":
+            continue
+        if str(meta.get("text_field", "")).strip() != str(text_field):
+            continue
+        matrix_path = meta_path.with_suffix(".npz")
+        vectorizer_path = meta_path.with_suffix(".joblib")
+        feature_names_path = meta_path.with_name(f"{meta_path.stem}__feature_names.npy")
+        if not matrix_path.exists() or not vectorizer_path.exists() or not feature_names_path.exists():
+            continue
+        vectorizer_params = meta.get("vectorizer_params", {})
+        candidate_rows.append(
+            {
+                "meta_path": meta_path,
+                "matrix_path": matrix_path,
+                "vectorizer_path": vectorizer_path,
+                "feature_names_path": feature_names_path,
+                "meta": meta,
+                "is_default_config": (
+                    int(vectorizer_params.get("max_features", -1)) == int(getattr(extractor, "DEFAULT_TFIDF_MAX_FEATURES", 20000))
+                    and tuple(vectorizer_params.get("ngram_range", [])) == (
+                        int(getattr(extractor, "DEFAULT_TFIDF_MIN_NGRAM", 1)),
+                        int(getattr(extractor, "DEFAULT_TFIDF_MAX_NGRAM", 2)),
+                    )
+                    and bool(vectorizer_params.get("lowercase", True))
+                    and bool(vectorizer_params.get("sublinear_tf", True))
+                    and vectorizer_params.get("stop_words", None) is None
+                ),
+                "mtime_ns": meta_path.stat().st_mtime_ns,
+            }
+        )
+
+    if not candidate_rows:
+        return None
+
+    candidate_rows.sort(
+        key=lambda row: (bool(row["is_default_config"]), int(row["mtime_ns"])),
+        reverse=True,
+    )
+    selected = candidate_rows[0]
+    return {
+        "meta_path": selected["meta_path"],
+        "matrix_path": selected["matrix_path"],
+        "vectorizer_path": selected["vectorizer_path"],
+        "feature_names_path": selected["feature_names_path"],
+    }
+
+
+def discover_optional_feature_spaces() -> tuple[OrderedDict[str, FeatureSpaceSpec], pd.DataFrame]:
+    availability_rows: list[dict[str, Any]] = []
+    active_feature_spaces: OrderedDict[str, FeatureSpaceSpec] = OrderedDict(BASE_FEATURE_SPACES)
+
+    structural_ready = all(env_paths["structural_baseline_path"].exists() for env_paths in DATASET_FILE_MAP.values())
+    availability_rows.append(
+        {
+            "feature_space": "baseline_structural",
+            "feature_space_title": "Baseline: sentence structure",
+            "artifact_kind": "structural_parquet",
+            "is_available": bool(structural_ready),
+            "detail": STRUCTURAL_BASELINE_FILENAME,
+        }
+    )
+    if structural_ready:
+        active_feature_spaces["baseline_structural"] = FeatureSpaceSpec(
+            name="baseline_structural",
+            title="Baseline: sentence structure",
+            family_title="baseline",
+            uses_attention=False,
+            attention_subset_key=None,
+            activation_variant=None,
+            activation_use_pca=False,
+            baseline_variant="structural",
+            baseline_text_field=None,
+        )
+
+    known_tfidf_titles = {
+        "last_sentence_text": "Baseline: TF-IDF last sentence",
+        "prefix_text": "Baseline: TF-IDF prefix",
+        "full_prefix_text": "Baseline: TF-IDF full prefix",
+    }
+    tfidf_space_specs: OrderedDict[str, dict[str, str]] = OrderedDict()
+    for text_field in TFIDF_TEXT_FIELDS:
+        feature_space_name = f"baseline_tfidf_{slugify(str(text_field))}"
+        tfidf_space_specs[feature_space_name] = {
+            "title": known_tfidf_titles.get(str(text_field), f"Baseline: TF-IDF {text_field}"),
+            "text_field": str(text_field),
+        }
+    for feature_space_name, spec in tfidf_space_specs.items():
+        text_field = str(spec["text_field"])
+        artifacts_present = structural_ready and all(
+            locate_tfidf_artifact(env_paths["tfidf_cache_dir"], text_field) is not None
+            for env_paths in DATASET_FILE_MAP.values()
+        )
+        availability_rows.append(
+            {
+                "feature_space": feature_space_name,
+                "feature_space_title": spec["title"],
+                "artifact_kind": "tfidf_cache",
+                "is_available": bool(artifacts_present),
+                "detail": text_field,
+            }
+        )
+        if not artifacts_present:
+            continue
+        active_feature_spaces[feature_space_name] = FeatureSpaceSpec(
+            name=feature_space_name,
+            title=str(spec["title"]),
+            family_title="baseline",
+            uses_attention=False,
+            attention_subset_key=None,
+            activation_variant=None,
+            activation_use_pca=False,
+            baseline_variant="tfidf",
+            baseline_text_field=text_field,
+        )
+
+    availability_df = pd.DataFrame(availability_rows)
+    return active_feature_spaces, availability_df
+
+
+def filter_feature_spaces_for_mode(
+    feature_spaces: OrderedDict[str, FeatureSpaceSpec],
+    *,
+    mode: str,
+) -> OrderedDict[str, FeatureSpaceSpec]:
+    normalized_mode = str(mode or "all").strip().lower()
+    if normalized_mode in {"all", ""}:
+        return feature_spaces
+    if normalized_mode == "only_tfidf":
+        filtered = OrderedDict(
+            (feature_space_name, feature_space)
+            for feature_space_name, feature_space in feature_spaces.items()
+            if feature_space.baseline_variant == "tfidf"
+        )
+        if not filtered:
+            raise ValueError(
+                "FEATURE_SPACE_MODE='only_tfidf' was requested, but no TF-IDF feature spaces were discovered. "
+                "Check that the TF-IDF cache exists for every environment."
+            )
+        return filtered
+    raise ValueError(
+        f"Unsupported FEATURE_SPACE_MODE={mode!r}. "
+        "Expected one of ['all', 'only_tfidf']."
+    )
+
+
+_discovered_feature_spaces, optional_feature_space_availability_df = discover_optional_feature_spaces()
+FEATURE_SPACES = filter_feature_spaces_for_mode(
+    _discovered_feature_spaces,
+    mode=FEATURE_SPACE_MODE,
+)
+optional_feature_space_availability_df["selected_by_mode"] = optional_feature_space_availability_df["feature_space"].astype(str).isin(
+    set(FEATURE_SPACES.keys())
+)
+optional_feature_space_availability_df.to_csv(
+    OUTPUT_ROOT / "optional_feature_space_availability.csv",
+    index=False,
+)
+display(optional_feature_space_availability_df)
+
 attention_subset_catalog_df = pd.DataFrame(
     [
         {
@@ -667,44 +944,29 @@ feature_space_catalog_df = pd.DataFrame(
             ),
             "activation_variant": feature_space.activation_variant or "",
             "activation_use_pca": feature_space.activation_use_pca,
+            "baseline_variant": feature_space.baseline_variant or "",
+            "baseline_text_field": feature_space.baseline_text_field or "",
         }
         for feature_space in FEATURE_SPACES.values()
     ]
 )
 feature_space_catalog_df.to_csv(OUTPUT_ROOT / "feature_space_catalog.csv", index=False)
-
-FAMILY_PANEL_ORDER = (
-    "attention_only",
-    "activation_only",
-    "attention_plus_activation",
-    "baseline",
+config_df = pd.concat(
+    [
+        config_df,
+        pd.DataFrame(
+            [
+                {"setting": "structural_baseline_filename", "value": STRUCTURAL_BASELINE_FILENAME},
+                {"setting": "tfidf_cache_dirname", "value": TFIDF_CACHE_DIRNAME},
+                {"setting": "tfidf_text_fields", "value": ", ".join(TFIDF_TEXT_FIELDS)},
+                {"setting": "feature_space_mode", "value": FEATURE_SPACE_MODE},
+                {"setting": "active_feature_spaces", "value": ", ".join(FEATURE_SPACES.keys())},
+            ]
+        ),
+    ],
+    ignore_index=True,
 )
-
-FAMILY_DISPLAY_TITLES = {
-    "attention_only": "Attention only",
-    "activation_only": "Activation only",
-    "attention_plus_activation": "Attention + activation",
-    "baseline": "Baseline",
-}
-
-
-def build_dataset_file_map(model_dirname: str) -> OrderedDict[str, dict[str, Path]]:
-    file_map: OrderedDict[str, dict[str, Path]] = OrderedDict()
-    for env_name, env_dir in ENV_SPECS.items():
-        feature_path = DATASET_ROOT / env_dir / model_dirname / FEATURE_FILENAME
-        activation_path = DATASET_ROOT / env_dir / model_dirname / ACTIVATION_FILENAME
-        if not feature_path.exists():
-            raise FileNotFoundError(f"Missing feature parquet for {env_name}: {feature_path}")
-        if not activation_path.exists():
-            raise FileNotFoundError(f"Missing activation h5 for {env_name}: {activation_path}")
-        file_map[env_name] = {
-            "feature_path": feature_path,
-            "activation_path": activation_path,
-        }
-    return file_map
-
-
-DATASET_FILE_MAP = build_dataset_file_map(MODEL_DIRNAME)
+config_df.to_csv(OUTPUT_ROOT / "config.csv", index=False)
 
 
 # %%
@@ -775,6 +1037,18 @@ def load_feature_metadata(feature_path: Path, env_name: str) -> pd.DataFrame:
     return annotate_prefix_metadata(df, env_name=env_name)
 
 
+def load_structural_baseline_metadata(structural_path: Path, env_name: str) -> pd.DataFrame:
+    df = pd.read_parquet(structural_path, columns=["example_id", "sentence_idx"]).copy()
+    df["env_name"] = env_name
+    df["example_id"] = df["example_id"].astype(str)
+    df["sentence_idx"] = pd.to_numeric(df["sentence_idx"], errors="coerce")
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["example_id", "sentence_idx"]).copy()
+    df["sentence_idx"] = df["sentence_idx"].astype(int)
+    df["row_idx"] = np.arange(len(df), dtype=np.int64)
+    return df.reset_index(drop=True)
+
+
 def load_activation_metadata(activation_path: Path, env_name: str) -> pd.DataFrame:
     with h5py.File(activation_path, "r") as f:
         example_ids = pd.Series(f["example_id"].asstr()[:], dtype="string")
@@ -838,6 +1112,7 @@ class ActivationEnvStore:
 
 feature_metadata_by_env: OrderedDict[str, pd.DataFrame] = OrderedDict()
 activation_metadata_by_env: OrderedDict[str, pd.DataFrame] = OrderedDict()
+structural_metadata_by_env: OrderedDict[str, pd.DataFrame] = OrderedDict()
 activation_stores: OrderedDict[str, ActivationEnvStore] = OrderedDict()
 split_summary_rows: list[dict[str, Any]] = []
 
@@ -862,6 +1137,13 @@ for env_name, env_paths in maybe_tqdm(
         activation_path=env_paths["activation_path"],
         metadata_df=activation_metadata_df,
     )
+
+    if env_paths["structural_baseline_path"].exists():
+        structural_metadata_df = load_structural_baseline_metadata(env_paths["structural_baseline_path"], env_name)
+        structural_metadata_df["split"] = structural_metadata_df["example_id"].map(split_map).astype("string")
+        if structural_metadata_df["split"].isna().any():
+            raise ValueError(f"{env_name} structural baseline metadata contains example IDs absent from the feature split map.")
+        structural_metadata_by_env[env_name] = structural_metadata_df
 
     split_summary_rows.append(split_summary_row(feature_metadata_df, env_name=env_name))
 
@@ -890,6 +1172,29 @@ for env_name, metadata_df in feature_metadata_by_env.items():
     for target_name in TARGET_SPECS:
         bundle[f"y_train__{target_name}"] = metadata_df.loc[train_mask, f"label__{target_name}"].to_numpy(dtype=np.int8, copy=False)
         bundle[f"y_val__{target_name}"] = metadata_df.loc[val_mask, f"label__{target_name}"].to_numpy(dtype=np.int8, copy=False)
+
+    structural_metadata_df = structural_metadata_by_env.get(env_name)
+    if structural_metadata_df is not None:
+        feature_keys_df = metadata_df.loc[:, ["example_id", "sentence_idx"]].copy()
+        feature_keys_df["feature_row_idx"] = metadata_df["row_idx"].to_numpy(dtype=np.int64, copy=False)
+        structural_keys_df = structural_metadata_df.loc[:, ["example_id", "sentence_idx"]].copy()
+        structural_keys_df["structural_row_idx"] = structural_metadata_df["row_idx"].to_numpy(dtype=np.int64, copy=False)
+        aligned_key_df = feature_keys_df.merge(
+            structural_keys_df,
+            on=["example_id", "sentence_idx"],
+            how="inner",
+            validate="one_to_one",
+        )
+        if len(aligned_key_df) != len(metadata_df) or len(aligned_key_df) != len(structural_metadata_df):
+            raise ValueError(
+                f"{env_name} structural baseline rows do not match feature parquet rows. "
+                f"feature_rows={len(metadata_df)}, structural_rows={len(structural_metadata_df)}, aligned_rows={len(aligned_key_df)}"
+            )
+        aligned_key_df = aligned_key_df.sort_values("feature_row_idx", kind="mergesort").reset_index(drop=True)
+        structural_row_idx = aligned_key_df["structural_row_idx"].to_numpy(dtype=np.int64, copy=False)
+        bundle["train_structural_row_idx"] = structural_row_idx[train_mask]
+        bundle["val_structural_row_idx"] = structural_row_idx[val_mask]
+
     split_cache_by_env[env_name] = bundle
 
 
@@ -1241,6 +1546,35 @@ def make_activation_lookup(
     )
 
 
+def make_generic_feature_lookup(
+    *,
+    space_name: str,
+    feature_names: list[str],
+    feature_root: str,
+    metric_name: str,
+    family_resolver: Any,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for feature_name in feature_names:
+        rows.append(
+            {
+                "feature": str(feature_name),
+                "feature_root": str(feature_root),
+                "transition_prefix": "",
+                "is_transition": False,
+                "metric_name": str(metric_name),
+                "metric_group": "",
+                "attention_feature_group": "",
+                "head_summary": "",
+                "band": "",
+                "band_stat": "",
+                "layer_count": pd.NA,
+                "family": str(family_resolver(str(feature_name))),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def make_activation_ranking_df(
     *,
     target_name: str,
@@ -1262,6 +1596,19 @@ def make_activation_ranking_df(
     out["global_rank"] = np.arange(int(start_rank), int(start_rank) + len(out), dtype=int)
     out["target_name"] = target_name
     return out
+
+
+def make_placeholder_ranking_df(
+    *,
+    target_name: str,
+    feature_lookup_df: pd.DataFrame,
+    start_rank: int = 1,
+) -> pd.DataFrame:
+    return make_activation_ranking_df(
+        target_name=target_name,
+        feature_lookup_df=feature_lookup_df,
+        start_rank=start_rank,
+    )
 
 
 def safe_auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -1373,8 +1720,23 @@ class FittedBinaryModel:
     validation_metrics: dict[str, Any]
 
 
-def build_estimator(*, candidate_params: dict[str, Any]) -> Pipeline:
+def build_estimator(*, candidate_params: dict[str, Any], input_is_sparse: bool = False) -> Pipeline:
     if MODEL_FAMILY == "logreg":
+        if input_is_sparse:
+            return Pipeline(
+                [
+                    (
+                        "model",
+                        LogisticRegression(
+                            C=float(candidate_params["C"]),
+                            class_weight="balanced",
+                            max_iter=4000,
+                            solver="liblinear",
+                            random_state=int(RANDOM_SEED),
+                        ),
+                    ),
+                ]
+            )
         return Pipeline(
             [
                 ("imputer", SimpleImputer(strategy="median")),
@@ -1395,6 +1757,12 @@ def build_estimator(*, candidate_params: dict[str, Any]) -> Pipeline:
     if MODEL_FAMILY == "xgboost":
         if XGBClassifier is None:
             raise ImportError("xgboost is unavailable, but MODEL_FAMILY='xgboost' was requested.")
+        if input_is_sparse:
+            return Pipeline(
+                [
+                    ("model", XGBClassifier(**candidate_params)),
+                ]
+            )
         return Pipeline(
             [
                 ("imputer", SimpleImputer(strategy="median")),
@@ -1406,16 +1774,20 @@ def build_estimator(*, candidate_params: dict[str, Any]) -> Pipeline:
 
 
 def fit_candidate_classifiers(
-    x_train: np.ndarray,
+    x_train: Any,
     y_train: np.ndarray,
-    x_val: np.ndarray,
+    x_val: Any,
     y_val: np.ndarray,
 ) -> tuple[list[FittedBinaryModel], pd.DataFrame]:
     candidate_rows: list[dict[str, Any]] = []
     fitted_models: list[FittedBinaryModel] = []
+    input_is_sparse = bool(sp.issparse(x_train) or sp.issparse(x_val))
 
     for candidate_spec in build_model_candidate_specs(y_train):
-        estimator = build_estimator(candidate_params=dict(candidate_spec["candidate_params"]))
+        estimator = build_estimator(
+            candidate_params=dict(candidate_spec["candidate_params"]),
+            input_is_sparse=input_is_sparse,
+        )
         estimator.fit(x_train, y_train)
         val_scores = estimator.predict_proba(x_val)[:, 1].astype(np.float32)
         decision_threshold = choose_decision_threshold(
@@ -1558,6 +1930,13 @@ class ActivationMatrixBundle:
     effective_pca_dim: int | None
 
 
+@dataclass
+class BaselineMatrixBundle:
+    matrices_by_env: dict[str, dict[str, Any]]
+    feature_names: list[str]
+    feature_lookup_df: pd.DataFrame
+
+
 def build_attention_matrix_cache(selected_features: list[str]) -> dict[str, dict[str, np.ndarray]]:
     env_cache: dict[str, dict[str, np.ndarray]] = {}
     for env_name in ENV_ORDER:
@@ -1576,6 +1955,175 @@ def build_attention_matrix_cache(selected_features: list[str]) -> dict[str, dict
         del pooled
         gc.collect()
     return env_cache
+
+
+def structural_feature_family(feature_name: str) -> str:
+    return str(classify_feature_family(str(feature_name)))
+
+
+def tfidf_feature_family(_feature_name: str) -> str:
+    return "tfidf"
+
+
+def align_matrix_to_feature_order(
+    matrix: sp.spmatrix,
+    env_feature_names: list[str],
+    target_feature_names: list[str],
+) -> sp.csr_matrix:
+    matrix = matrix.tocsr()
+    env_feature_to_idx = {str(feature_name): idx for idx, feature_name in enumerate(env_feature_names)}
+    source_columns: list[int] = []
+    target_columns: list[int] = []
+    for target_idx, feature_name in enumerate(target_feature_names):
+        source_idx = env_feature_to_idx.get(str(feature_name))
+        if source_idx is None:
+            continue
+        source_columns.append(int(source_idx))
+        target_columns.append(int(target_idx))
+
+    if not target_feature_names:
+        return sp.csr_matrix((matrix.shape[0], 0), dtype=np.float32)
+    if not source_columns:
+        return sp.csr_matrix((matrix.shape[0], len(target_feature_names)), dtype=np.float32)
+
+    subset = matrix[:, np.asarray(source_columns, dtype=np.int64)]
+    if len(source_columns) == len(target_feature_names) and all(
+        source_col == target_col for source_col, target_col in zip(range(len(target_feature_names)), target_columns, strict=True)
+    ):
+        return subset.tocsr().astype(np.float32)
+
+    subset_coo = subset.tocoo()
+    remapped_columns = np.asarray(target_columns, dtype=np.int64)[subset_coo.col]
+    return sp.csr_matrix(
+        (subset_coo.data.astype(np.float32, copy=False), (subset_coo.row, remapped_columns)),
+        shape=(matrix.shape[0], len(target_feature_names)),
+        dtype=np.float32,
+    )
+
+
+def choose_cross_env_tfidf_feature_names(feature_names_by_env: OrderedDict[str, list[str]]) -> tuple[list[str], str]:
+    if not feature_names_by_env:
+        return [], "empty"
+
+    ordered_env_names = list(feature_names_by_env.keys())
+    first_env = ordered_env_names[0]
+    common_names = set(feature_names_by_env[first_env])
+    for env_name in ordered_env_names[1:]:
+        common_names &= set(feature_names_by_env[env_name])
+
+    if common_names:
+        ordered_common = [
+            str(feature_name)
+            for feature_name in feature_names_by_env[first_env]
+            if str(feature_name) in common_names
+        ]
+        return ordered_common, "intersection"
+
+    seen: set[str] = set()
+    ordered_union: list[str] = []
+    for env_name in ordered_env_names:
+        for feature_name in feature_names_by_env[env_name]:
+            feature_name = str(feature_name)
+            if feature_name in seen:
+                continue
+            seen.add(feature_name)
+            ordered_union.append(feature_name)
+    return ordered_union, "union_fallback"
+
+
+def build_structural_matrix_bundle() -> BaselineMatrixBundle:
+    matrices_by_env: dict[str, dict[str, np.ndarray]] = {}
+    feature_lookup_df = make_generic_feature_lookup(
+        space_name="baseline_structural",
+        feature_names=list(STRUCTURAL_BASELINE_FEATURE_COLUMNS),
+        feature_root="baseline_structural",
+        metric_name="sentence_structure",
+        family_resolver=structural_feature_family,
+    )
+
+    for env_name in ENV_ORDER:
+        env_paths = DATASET_FILE_MAP[env_name]
+        split_bundle = split_cache_by_env[env_name]
+        raw_df = pd.read_parquet(
+            env_paths["structural_baseline_path"],
+            columns=list(STRUCTURAL_BASELINE_FEATURE_COLUMNS),
+        ).copy()
+        raw_df = raw_df.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        raw_matrix = raw_df.to_numpy(dtype=np.float32, copy=False)
+        matrices_by_env[env_name] = {
+            "train": np.asarray(raw_matrix[split_bundle["train_structural_row_idx"]], dtype=np.float32),
+            "val": np.asarray(raw_matrix[split_bundle["val_structural_row_idx"]], dtype=np.float32),
+        }
+
+    return BaselineMatrixBundle(
+        matrices_by_env=matrices_by_env,
+        feature_names=list(STRUCTURAL_BASELINE_FEATURE_COLUMNS),
+        feature_lookup_df=feature_lookup_df,
+    )
+
+
+def build_tfidf_matrix_bundle(*, text_field: str, space_name: str) -> BaselineMatrixBundle:
+    artifact_paths_by_env: OrderedDict[str, dict[str, Path]] = OrderedDict()
+    feature_names_by_env: OrderedDict[str, list[str]] = OrderedDict()
+
+    for env_name in ENV_ORDER:
+        env_paths = DATASET_FILE_MAP[env_name]
+        artifact_paths = locate_tfidf_artifact(env_paths["tfidf_cache_dir"], text_field)
+        if artifact_paths is None:
+            raise FileNotFoundError(
+                f"Could not find TF-IDF cache artifact for {env_name} / {text_field} under {env_paths['tfidf_cache_dir']}"
+            )
+        meta = parse_tfidf_artifact_meta(artifact_paths["meta_path"])
+        structural_metadata_df = structural_metadata_by_env.get(env_name)
+        if structural_metadata_df is None:
+            raise FileNotFoundError(f"{env_name} is missing structural baseline metadata needed to align TF-IDF rows.")
+        structural_key_df = pd.read_parquet(
+            env_paths["structural_baseline_path"],
+            columns=["example_id", "sentence_idx"],
+        ).copy()
+        expected_fingerprint = extractor.dataset_row_fingerprint(structural_key_df)
+        if str(meta.get("fingerprint", "")) != str(expected_fingerprint):
+            raise ValueError(
+                f"{env_name} TF-IDF fingerprint mismatch for {text_field}. "
+                f"expected={expected_fingerprint}, found={meta.get('fingerprint', '')}"
+            )
+        if int(meta.get("num_rows", len(structural_metadata_df))) != int(len(structural_metadata_df)):
+            raise ValueError(
+                f"{env_name} TF-IDF row-count mismatch for {text_field}. "
+                f"expected={len(structural_metadata_df)}, found={meta.get('num_rows')}"
+            )
+        feature_names = np.load(artifact_paths["feature_names_path"], allow_pickle=False).astype(str).tolist()
+        artifact_paths_by_env[env_name] = artifact_paths
+        feature_names_by_env[env_name] = feature_names
+
+    shared_feature_names, shared_mode = choose_cross_env_tfidf_feature_names(feature_names_by_env)
+    if not shared_feature_names:
+        raise ValueError(f"No shared TF-IDF features available for text field {text_field!r} across environments.")
+
+    feature_lookup_df = make_generic_feature_lookup(
+        space_name=space_name,
+        feature_names=shared_feature_names,
+        feature_root=space_name,
+        metric_name=f"tfidf__{text_field}__{shared_mode}",
+        family_resolver=tfidf_feature_family,
+    )
+    matrices_by_env: dict[str, dict[str, sp.csr_matrix]] = {}
+    for env_name in ENV_ORDER:
+        split_bundle = split_cache_by_env[env_name]
+        artifact_paths = artifact_paths_by_env[env_name]
+        env_feature_names = feature_names_by_env[env_name]
+        matrix = sp.load_npz(artifact_paths["matrix_path"]).tocsr().astype(np.float32)
+        aligned_matrix = align_matrix_to_feature_order(matrix, env_feature_names, shared_feature_names)
+        matrices_by_env[env_name] = {
+            "train": aligned_matrix[split_bundle["train_structural_row_idx"]].tocsr(),
+            "val": aligned_matrix[split_bundle["val_structural_row_idx"]].tocsr(),
+        }
+
+    return BaselineMatrixBundle(
+        matrices_by_env=matrices_by_env,
+        feature_names=shared_feature_names,
+        feature_lookup_df=feature_lookup_df,
+    )
 
 
 def build_activation_matrix_bundle(
@@ -1662,6 +2210,23 @@ for feature_space_name, feature_space in FEATURE_SPACES.items():
         pca_dim=int(ACTIVATION_PCA_DIM),
     )
 
+baseline_bundle_by_space: dict[str, BaselineMatrixBundle] = {}
+baseline_lookup_by_space: dict[str, pd.DataFrame] = {}
+for feature_space_name, feature_space in FEATURE_SPACES.items():
+    if feature_space.baseline_variant == "structural":
+        baseline_bundle = build_structural_matrix_bundle()
+    elif feature_space.baseline_variant == "tfidf":
+        if feature_space.baseline_text_field is None:
+            raise ValueError(f"{feature_space_name} baseline_variant='tfidf' is missing baseline_text_field.")
+        baseline_bundle = build_tfidf_matrix_bundle(
+            text_field=str(feature_space.baseline_text_field),
+            space_name=feature_space_name,
+        )
+    else:
+        continue
+    baseline_bundle_by_space[feature_space_name] = baseline_bundle
+    baseline_lookup_by_space[feature_space_name] = baseline_bundle.feature_lookup_df.copy()
+
 ranking_frames: list[pd.DataFrame] = []
 ranking_pools: dict[tuple[str, str], list[str]] = {}
 ranking_tables_by_key: dict[tuple[str, str], pd.DataFrame] = {}
@@ -1709,6 +2274,13 @@ for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Rank targets", to
                 feature_lookup_df=activation_lookup_df,
             )
             feature_pool = activation_lookup_df["feature"].astype(str).tolist()
+        elif feature_space.baseline_variant is not None:
+            baseline_lookup_df = baseline_lookup_by_space[feature_space_name].copy()
+            ranking_df = make_placeholder_ranking_df(
+                target_name=target_name,
+                feature_lookup_df=baseline_lookup_df,
+            )
+            feature_pool = baseline_lookup_df["feature"].astype(str).tolist()
         else:
             if feature_space.attention_subset_key is None:
                 raise ValueError(f"{feature_space_name} uses attention but has no attention subset key.")
@@ -1774,7 +2346,13 @@ def feature_size_to_label(feature_size: int) -> str:
 
 def selected_feature_size_label(feature_space: FeatureSpaceSpec, feature_size: int | None) -> str:
     if feature_space.family_title == "baseline":
-        return "raw_final"
+        if feature_space.baseline_variant == "structural":
+            return "sentence_structure"
+        if feature_space.baseline_variant == "tfidf":
+            return f"tfidf_{slugify(str(feature_space.baseline_text_field or 'text'))}"
+        if feature_space.activation_variant == "final_sentence" and not feature_space.activation_use_pca:
+            return "raw_final"
+        return slugify(feature_space.name)
     if feature_space.family_title == "attention_only":
         return "all_attention"
     if feature_size is None:
@@ -1846,14 +2424,14 @@ EXPERIMENT_RUN_SPECS, TRAIN_AXIS_LABELS_BY_SCENARIO = build_experiment_run_specs
 
 
 def assemble_split_matrix(
-    env_cache: dict[str, np.ndarray],
+    env_cache: dict[str, Any],
     *,
     split_name: str,
     feature_space: FeatureSpaceSpec,
     attention_dim: int,
     activation_dim: int,
-) -> np.ndarray:
-    parts: list[np.ndarray] = []
+) -> Any:
+    parts: list[Any] = []
     if feature_space.uses_attention:
         parts.append(np.asarray(env_cache[f"{split_name}_attention_pool"][:, :attention_dim], dtype=np.float32))
     if feature_space.activation_variant is not None:
@@ -1862,9 +2440,23 @@ def assemble_split_matrix(
             parts.append(np.asarray(activation_pool[:, :activation_dim], dtype=np.float32))
         else:
             parts.append(activation_pool)
+    if feature_space.baseline_variant is not None:
+        baseline_pool = env_cache[f"{split_name}_baseline_pool"]
+        if sp.issparse(baseline_pool):
+            parts.append(baseline_pool.tocsr())
+        else:
+            parts.append(np.asarray(baseline_pool, dtype=np.float32))
     if not parts:
         raise ValueError("assemble_split_matrix received no feature parts.")
-    return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=1)
+    if len(parts) == 1:
+        return parts[0]
+    if any(sp.issparse(part) for part in parts):
+        sparse_parts = [
+            part.tocsr() if sp.issparse(part) else sp.csr_matrix(np.asarray(part, dtype=np.float32))
+            for part in parts
+        ]
+        return sp.hstack(sparse_parts, format="csr")
+    return np.concatenate(parts, axis=1)
 
 
 all_transfer_metric_rows: list[dict[str, Any]] = []
@@ -1895,15 +2487,15 @@ def persist_core_artifacts(
 
 
 def concatenate_source_split_matrices(
-    env_pool_cache: dict[str, dict[str, np.ndarray]],
+    env_pool_cache: dict[str, dict[str, Any]],
     *,
     source_envs: tuple[str, ...],
     split_name: str,
     feature_space: FeatureSpaceSpec,
     attention_dim: int,
     activation_dim: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    x_parts: list[np.ndarray] = []
+) -> tuple[Any, np.ndarray]:
+    x_parts: list[Any] = []
     y_parts: list[np.ndarray] = []
     for env_name in source_envs:
         env_cache = env_pool_cache[env_name]
@@ -1917,7 +2509,12 @@ def concatenate_source_split_matrices(
             )
         )
         y_parts.append(np.asarray(env_cache[f"y_{split_name}"], dtype=np.int8))
-    return np.concatenate(x_parts, axis=0), np.concatenate(y_parts, axis=0)
+    x_out = (
+        sp.vstack([part.tocsr() if sp.issparse(part) else sp.csr_matrix(np.asarray(part, dtype=np.float32)) for part in x_parts], format="csr")
+        if any(sp.issparse(part) for part in x_parts)
+        else np.concatenate(x_parts, axis=0)
+    )
+    return x_out, np.concatenate(y_parts, axis=0)
 
 
 try:
@@ -1956,6 +2553,7 @@ try:
                 disable=DISABLE_TQDM,
             ):
                 activation_bundle: ActivationMatrixBundle | None = None
+                baseline_bundle: BaselineMatrixBundle | None = None
                 if feature_space.activation_variant is not None:
                     bundle_key = (run_spec.scenario_name, run_spec.train_env_label, feature_space_name)
                     activation_bundle = activation_bundle_cache.get(bundle_key)
@@ -1967,8 +2565,12 @@ try:
                             feature_space=feature_space,
                         )
                         activation_bundle_cache[bundle_key] = activation_bundle
+                if feature_space.baseline_variant is not None:
+                    baseline_bundle = baseline_bundle_by_space.get(feature_space_name)
+                    if baseline_bundle is None:
+                        raise ValueError(f"Missing baseline bundle for {feature_space_name}.")
 
-                env_pool_cache: dict[str, dict[str, np.ndarray]] = {}
+                env_pool_cache: dict[str, dict[str, Any]] = {}
                 for env_name in ENV_ORDER:
                     y_train = np.asarray(split_cache_by_env[env_name][f"y_train__{target_name}"], dtype=np.int8)
                     y_val = np.asarray(split_cache_by_env[env_name][f"y_val__{target_name}"], dtype=np.int8)
@@ -1991,6 +2593,9 @@ try:
                     if activation_bundle is not None:
                         env_entry["train_activation_pool"] = activation_bundle.matrices_by_env[env_name]["train"]
                         env_entry["val_activation_pool"] = activation_bundle.matrices_by_env[env_name]["val"]
+                    if baseline_bundle is not None:
+                        env_entry["train_baseline_pool"] = baseline_bundle.matrices_by_env[env_name]["train"]
+                        env_entry["val_baseline_pool"] = baseline_bundle.matrices_by_env[env_name]["val"]
                     env_pool_cache[env_name] = env_entry
 
                 for feature_size in size_options:
@@ -2011,6 +2616,8 @@ try:
                         else:
                             activation_dim = int(len(activation_bundle.feature_names))
                             current_feature_names.extend(activation_bundle.feature_names)
+                    if baseline_bundle is not None:
+                        current_feature_names.extend(baseline_bundle.feature_names)
 
                     if not current_feature_names:
                         raise ValueError(
@@ -3030,7 +3637,7 @@ def plot_feature_size_family_transfer_panels(
         title = (
             f"{FAMILY_DISPLAY_TITLES.get(family, str(row['feature_family_group']))}\n"
             f"{row['selected_feature_space_title']}\n"
-            f"attn={int(row['attention_feature_count'])}, act={int(row['activation_feature_count'])}"
+            f"selected={int(row['selected_feature_count'])}, attn={int(row['attention_feature_count'])}, act={int(row['activation_feature_count'])}"
         )
         ax.set_title(title, fontsize=10.0)
         midpoint = (vmin + vmax) / 2.0 if np.isfinite(vmin) and np.isfinite(vmax) else 0.5

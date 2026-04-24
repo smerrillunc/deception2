@@ -37,6 +37,29 @@ def parse_args() -> argparse.Namespace:
         help="Optional explicit output directory. Defaults to the notebook's scenario-aware output path.",
     )
     parser.add_argument(
+        "--structural-baseline-filename",
+        default=None,
+        help="Optional override for the sentence-structure baseline parquet filename inside each dataset directory.",
+    )
+    parser.add_argument(
+        "--tfidf-cache-dirname",
+        default=None,
+        help="Optional override for the TF-IDF cache directory name inside each dataset directory.",
+    )
+    parser.add_argument(
+        "--tfidf-text-fields",
+        default=None,
+        help="Optional comma-separated TF-IDF text fields to consider, e.g. last_sentence_text,prefix_text.",
+    )
+    parser.add_argument(
+        "--only-tfidf",
+        action="store_true",
+        help=(
+            "Run only the discovered TF-IDF baseline feature spaces. "
+            "This is useful when the full attention/activation sweep already exists."
+        ),
+    )
+    parser.add_argument(
         "--model-family",
         default="logreg",
         help="Model family to train for this run, e.g. logreg or xgb.",
@@ -206,12 +229,15 @@ def resolve_output_root(
     model_family: str,
     scenarios: list[str],
     explicit_output_root: str | None,
+    only_tfidf: bool,
 ) -> Path:
     if explicit_output_root:
         return Path(explicit_output_root)
     scenario_slug = "__".join(slugify(scenario_name) for scenario_name in scenarios)
+    suffix = "__only_tfidf" if only_tfidf else ""
     return source_path.parent / (
         f"OOD_Modeling_main3_consistency_ablation_outputs__{slugify(model_dirname)}__{slugify(model_family)}__{scenario_slug}"
+        f"{suffix}"
     )
 
 
@@ -240,6 +266,7 @@ def main() -> None:
         model_family=model_family,
         scenarios=scenarios,
         explicit_output_root=args.output_root,
+        only_tfidf=bool(args.only_tfidf),
     )
 
     set_env("OOD_MAIN3_COMPANION_MODEL_NAME", str(args.model_dirname))
@@ -265,6 +292,14 @@ def main() -> None:
     set_env("OOD_MAIN3_COMPANION_DISABLE_TQDM", "1" if args.disable_tqdm else "0")
     if args.dataset_root:
         set_env("OOD_MAIN3_COMPANION_DATASET_ROOT", str(Path(args.dataset_root)))
+    if args.structural_baseline_filename:
+        set_env("OOD_MAIN3_COMPANION_STRUCTURAL_BASELINE_FILENAME", str(args.structural_baseline_filename))
+    if args.tfidf_cache_dirname:
+        set_env("OOD_MAIN3_COMPANION_TFIDF_CACHE_DIRNAME", str(args.tfidf_cache_dirname))
+    if args.tfidf_text_fields:
+        set_env("OOD_MAIN3_COMPANION_TFIDF_TEXT_FIELDS", str(args.tfidf_text_fields))
+    if args.only_tfidf:
+        set_env("OOD_MAIN3_COMPANION_FEATURE_SPACE_MODE", "only_tfidf")
 
     print("Running OOD Main3 consistency ablation script")
     print(f"Source: {source_path}")
@@ -277,6 +312,13 @@ def main() -> None:
     print(f"Fixed XGBoost max_depth: {xgb_max_depth}")
     if args.dataset_root:
         print(f"Dataset root: {Path(args.dataset_root)}")
+    if args.structural_baseline_filename:
+        print(f"Structural baseline filename: {args.structural_baseline_filename}")
+    if args.tfidf_cache_dirname:
+        print(f"TF-IDF cache dirname: {args.tfidf_cache_dirname}")
+    if args.tfidf_text_fields:
+        print(f"TF-IDF text fields: {args.tfidf_text_fields}")
+    print(f"Feature space mode: {'only_tfidf' if args.only_tfidf else 'all'}")
     print(f"Output root: {output_root}")
 
     runpy.run_path(str(source_path), run_name="__main__")
