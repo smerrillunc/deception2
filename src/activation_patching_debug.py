@@ -160,6 +160,59 @@ def _make_random_unit_vector(*, dim: int, seed: int) -> torch.Tensor:
     return _normalize_vector(vector)
 
 
+def _estimate_direction_from_gradient_stack(
+    gradient_stack: torch.Tensor,
+    *,
+    fallback_seed: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    gradient_stack = gradient_stack.detach().float().cpu()
+    if gradient_stack.ndim != 2:
+        raise ValueError(f"Expected a rank-2 gradient stack, got shape {tuple(gradient_stack.shape)}")
+    row_norms = torch.linalg.vector_norm(gradient_stack, dim=1)
+    valid_mask = torch.isfinite(row_norms) & (row_norms > 1e-12)
+    valid_stack = gradient_stack[valid_mask]
+    if int(valid_stack.shape[0]) == 0:
+        random_unit = _make_random_unit_vector(dim=int(gradient_stack.shape[1]), seed=int(fallback_seed))
+        return random_unit, {
+            "direction_source": "random_fallback_all_zero",
+            "n_valid_gradients": 0,
+            "valid_fraction": 0.0,
+            "mean_normalized_norm": 0.0,
+        }
+
+    normalized_stack = valid_stack / torch.linalg.vector_norm(valid_stack, dim=1, keepdim=True).clamp_min(1e-12)
+    mean_normalized = normalized_stack.mean(dim=0)
+    mean_normalized_norm = float(torch.linalg.vector_norm(mean_normalized).item())
+    if math.isfinite(mean_normalized_norm) and mean_normalized_norm > 1e-12:
+        return _normalize_vector(mean_normalized), {
+            "direction_source": "mean_normalized_gradient",
+            "n_valid_gradients": int(valid_stack.shape[0]),
+            "valid_fraction": float(valid_stack.shape[0] / max(int(gradient_stack.shape[0]), 1)),
+            "mean_normalized_norm": float(mean_normalized_norm),
+        }
+
+    try:
+        _, _, vh = torch.linalg.svd(normalized_stack, full_matrices=False)
+        dominant = vh[0]
+        orientation_reference = valid_stack.mean(dim=0)
+        if float(torch.dot(dominant, orientation_reference).item()) < 0.0:
+            dominant = -dominant
+        return _normalize_vector(dominant), {
+            "direction_source": "svd_dominant_gradient",
+            "n_valid_gradients": int(valid_stack.shape[0]),
+            "valid_fraction": float(valid_stack.shape[0] / max(int(gradient_stack.shape[0]), 1)),
+            "mean_normalized_norm": float(mean_normalized_norm),
+        }
+    except Exception:
+        random_unit = _make_random_unit_vector(dim=int(gradient_stack.shape[1]), seed=int(fallback_seed))
+        return random_unit, {
+            "direction_source": "random_fallback_svd_failure",
+            "n_valid_gradients": int(valid_stack.shape[0]),
+            "valid_fraction": float(valid_stack.shape[0] / max(int(gradient_stack.shape[0]), 1)),
+            "mean_normalized_norm": float(mean_normalized_norm),
+        }
+
+
 def build_patch_conditions_with_modes(layer_candidates: list[int], *, patch_modes: Iterable[str]) -> list[dict[str, Any]]:
     if hasattr(ap, "build_single_layer_patch_conditions_with_modes"):
         return ap.build_single_layer_patch_conditions_with_modes(layer_candidates, patch_modes=patch_modes)
@@ -2823,7 +2876,10 @@ def _build_post_commitment_vector_bank(
         layer_idx = int(layer_idx)
         gradient_stack = torch.stack(per_layer_gradients[layer_idx], dim=0)
         mean_gradient = gradient_stack.mean(dim=0)
-        learned_unit = _normalize_vector(mean_gradient)
+        learned_unit, learned_meta = _estimate_direction_from_gradient_stack(
+            gradient_stack,
+            fallback_seed=int(base_seed) + 400_000 + int(layer_idx),
+        )
         shuffled_signs = torch.tensor(
             np.random.default_rng(int(base_seed) + 100_000 + int(layer_idx)).choice(
                 [-1.0, 1.0],
@@ -2832,10 +2888,10 @@ def _build_post_commitment_vector_bank(
             dtype=torch.float32,
         ).unsqueeze(1)
         shuffled_mean = (gradient_stack * shuffled_signs).mean(dim=0)
-        try:
-            shuffled_unit = _normalize_vector(shuffled_mean)
-        except ValueError:
-            shuffled_unit = _make_random_unit_vector(dim=int(mean_gradient.numel()), seed=int(base_seed) + 200_000 + int(layer_idx))
+        shuffled_unit, shuffled_meta = _estimate_direction_from_gradient_stack(
+            gradient_stack * shuffled_signs,
+            fallback_seed=int(base_seed) + 200_000 + int(layer_idx),
+        )
         random_unit = _make_random_unit_vector(dim=int(mean_gradient.numel()), seed=int(base_seed) + 300_000 + int(layer_idx))
         reference_norm = float(np.mean(per_layer_hidden_norms[layer_idx])) if per_layer_hidden_norms[layer_idx] else 1.0
         if not math.isfinite(reference_norm) or reference_norm <= 0.0:
@@ -2849,6 +2905,12 @@ def _build_post_commitment_vector_bank(
             "mean_prefix_hidden_norm": float(np.mean(per_layer_hidden_norms[layer_idx])) if per_layer_hidden_norms[layer_idx] else float("nan"),
             "mean_prefix_hidden_diff_norm": float(np.mean(per_layer_hidden_diff_norms[layer_idx])) if per_layer_hidden_diff_norms[layer_idx] else float("nan"),
             "n_train_pairs": int(len(per_layer_gradients[layer_idx])),
+            "learned_direction_source": str(learned_meta["direction_source"]),
+            "shuffled_direction_source": str(shuffled_meta["direction_source"]),
+            "learned_valid_fraction": float(learned_meta["valid_fraction"]),
+            "shuffled_valid_fraction": float(shuffled_meta["valid_fraction"]),
+            "learned_mean_normalized_norm": float(learned_meta["mean_normalized_norm"]),
+            "shuffled_mean_normalized_norm": float(shuffled_meta["mean_normalized_norm"]),
         }
         summary_rows.append(
             {
@@ -2858,6 +2920,12 @@ def _build_post_commitment_vector_bank(
                 "mean_gradient_norm": float(mean_gradient.norm().item()),
                 "mean_prefix_hidden_norm": float(np.mean(per_layer_hidden_norms[layer_idx])) if per_layer_hidden_norms[layer_idx] else float("nan"),
                 "mean_prefix_hidden_diff_norm": float(np.mean(per_layer_hidden_diff_norms[layer_idx])) if per_layer_hidden_diff_norms[layer_idx] else float("nan"),
+                "learned_direction_source": str(learned_meta["direction_source"]),
+                "shuffled_direction_source": str(shuffled_meta["direction_source"]),
+                "learned_valid_fraction": float(learned_meta["valid_fraction"]),
+                "shuffled_valid_fraction": float(shuffled_meta["valid_fraction"]),
+                "learned_mean_normalized_norm": float(learned_meta["mean_normalized_norm"]),
+                "shuffled_mean_normalized_norm": float(shuffled_meta["mean_normalized_norm"]),
             }
         )
     return vector_bank, pd.DataFrame(train_rows), pd.DataFrame(summary_rows)
