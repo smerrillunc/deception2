@@ -2682,6 +2682,7 @@ def _collect_branch_prefix_site_stats(
             if int(hidden.shape[1]) != int(branch_inputs["total_len"]):
                 return output
             site = hidden[:, prefix_pos : prefix_pos + 1, :].detach().clone().requires_grad_(True)
+            site.retain_grad()
             patched = hidden.detach().clone()
             patched[:, prefix_pos : prefix_pos + 1, :] = site
             captured[layer_idx] = {
@@ -2707,17 +2708,24 @@ def _collect_branch_prefix_site_stats(
                 branch_inputs["score_start_pos"],
                 branch_inputs["score_stop_pos"],
             )
-            total_logprob.backward()
+            site_tensors = [captured[int(layer_idx)]["site"] for layer_idx in layer_indices]
+            grad_tensors = torch.autograd.grad(
+                total_logprob,
+                site_tensors,
+                allow_unused=True,
+            )
     finally:
         for handle in hooks:
             handle.remove()
 
     layer_stats: dict[int, dict[str, Any]] = {}
-    for layer_idx in layer_indices:
+    for layer_idx, grad_tensor in zip(layer_indices, grad_tensors):
         layer_idx = int(layer_idx)
         site = captured[layer_idx]["site"]
+        if grad_tensor is None:
+            grad_tensor = torch.zeros_like(site)
         layer_stats[layer_idx] = {
-            "gradient": site.grad[0, 0, :].detach().clone().cpu(),
+            "gradient": grad_tensor[0, 0, :].detach().clone().cpu(),
             "hidden_value": captured[layer_idx]["hidden_value"],
         }
     model.zero_grad(set_to_none=True)
