@@ -6,6 +6,7 @@ import gc
 import json
 from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -81,6 +82,15 @@ class ExampleValidationError(RuntimeError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+@dataclass(frozen=True)
+class TokenizedSentenceAlignment:
+    input_ids: list[int]
+    offsets: list[tuple[int, int]]
+    aligned_sentence_df: pd.DataFrame
+    prompt_token_count: int
+    used_decoded_fallback: bool
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -337,10 +347,21 @@ def token_indices_for_char_span(
         midpoint = (tok_start + tok_end) / 2.0
         if start_char <= midpoint < end_char:
             token_idxs.append(token_idx)
+    if token_idxs:
+        return token_idxs
+    # Some localized sentence spans can be a single punctuation character that
+    # lives inside a tokenizer piece like "..." or merged whitespace+punctuation.
+    # In that case there is no token midpoint inside the span, so fall back to
+    # any token that overlaps the requested character interval.
+    for token_idx, (tok_start, tok_end) in enumerate(offsets):
+        if tok_start == tok_end:
+            continue
+        if int(tok_start) < int(end_char) and int(tok_end) > int(start_char):
+            token_idxs.append(token_idx)
     return token_idxs
 
 
-def align_localized_sentences_to_tokens(
+def _align_localized_sentences_to_offsets(
     offsets: Sequence[Sequence[int]],
     sentence_df: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -360,6 +381,185 @@ def align_localized_sentences_to_tokens(
     aligned["token_count"] = aligned["token_indices"].apply(len)
     aligned["context_token_count"] = aligned["start_token"].fillna(0).astype(int)
     return aligned
+
+
+def align_localized_sentences_to_tokens(
+    offsets: Sequence[Sequence[int]],
+    sentence_df: pd.DataFrame,
+) -> pd.DataFrame:
+    return _align_localized_sentences_to_offsets(offsets, sentence_df)
+
+
+def count_tokens_before_char_boundary(
+    offset_mapping: Sequence[Sequence[int]],
+    boundary_char: int,
+) -> int:
+    return int(sum(1 for _, end in offset_mapping if int(end) <= int(boundary_char)))
+
+
+def offsets_need_decoded_fallback(
+    offset_mapping: Sequence[Sequence[int]],
+    full_text: str,
+) -> bool:
+    prev_end: Optional[int] = None
+    for token_start, token_end in offset_mapping:
+        start = int(token_start)
+        end = int(token_end)
+        if start == end:
+            continue
+        if end < start:
+            return True
+        if prev_end is not None:
+            if start < prev_end:
+                return True
+            if start > prev_end and full_text[prev_end:start].strip():
+                return True
+        elif start > 0 and full_text[:start].strip():
+            return True
+        prev_end = end
+    if prev_end is None:
+        return False
+    return bool(prev_end < len(full_text) and full_text[prev_end:].strip())
+
+
+def _build_decoded_token_offsets(
+    tokenizer: Any,
+    input_ids: Sequence[int],
+) -> tuple[list[tuple[int, int]], str]:
+    token_pieces = [
+        tokenizer.decode([int(token_id)], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        for token_id in input_ids
+    ]
+    decoded_text = "".join(token_pieces)
+    offsets: list[tuple[int, int]] = []
+    cursor = 0
+    for piece in token_pieces:
+        start = cursor
+        cursor += len(piece)
+        offsets.append((start, cursor))
+    return offsets, decoded_text
+
+
+def _build_raw_to_decoded_prefix_map(
+    raw_text: str,
+    decoded_text: str,
+) -> list[int]:
+    prefix_map = [0] * (len(raw_text) + 1)
+    matcher = SequenceMatcher(a=raw_text, b=decoded_text, autojunk=False)
+    for tag, raw_start, raw_end, decoded_start, decoded_end in matcher.get_opcodes():
+        if tag == "insert":
+            prefix_map[raw_start] = max(prefix_map[raw_start], int(decoded_end))
+            continue
+
+        raw_len = int(raw_end) - int(raw_start)
+        decoded_len = int(decoded_end) - int(decoded_start)
+
+        if tag == "equal":
+            for rel_idx in range(raw_len + 1):
+                prefix_map[int(raw_start) + rel_idx] = int(decoded_start) + rel_idx
+            continue
+
+        if tag == "delete":
+            for rel_idx in range(raw_len + 1):
+                prefix_map[int(raw_start) + rel_idx] = int(decoded_start)
+            continue
+
+        for rel_idx in range(raw_len + 1):
+            mapped = int(decoded_start)
+            if raw_len > 0:
+                mapped += (rel_idx * decoded_len) // raw_len
+            else:
+                mapped = int(decoded_end)
+            prefix_map[int(raw_start) + rel_idx] = mapped
+
+    prefix_map[-1] = len(decoded_text)
+    running_max = 0
+    for idx, value in enumerate(prefix_map):
+        if value < running_max:
+            prefix_map[idx] = running_max
+        else:
+            running_max = value
+    return prefix_map
+
+
+def _try_align_localized_sentences_via_decoded_text(
+    *,
+    tokenizer: Any,
+    input_ids: Sequence[int],
+    full_text: str,
+    sentence_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[tuple[int, int]], str] | None:
+    decoded_offsets, decoded_text = _build_decoded_token_offsets(tokenizer, input_ids)
+    if len(decoded_offsets) != len(input_ids):
+        return None
+
+    raw_to_decoded_prefix = _build_raw_to_decoded_prefix_map(full_text, decoded_text)
+    if not raw_to_decoded_prefix or raw_to_decoded_prefix[-1] != len(decoded_text):
+        return None
+
+    mapped_sentence_df = sentence_df.copy()
+    mapped_starts = [int(raw_to_decoded_prefix[int(start)]) for start in sentence_df["full_start"].tolist()]
+    mapped_ends = [int(raw_to_decoded_prefix[int(end)]) for end in sentence_df["full_end"].tolist()]
+    mapped_sentence_df["full_start"] = mapped_starts
+    mapped_sentence_df["full_end"] = [max(start, end) for start, end in zip(mapped_starts, mapped_ends)]
+
+    aligned = _align_localized_sentences_to_offsets(decoded_offsets, mapped_sentence_df)
+    aligned["full_start"] = sentence_df["full_start"].to_numpy()
+    aligned["full_end"] = sentence_df["full_end"].to_numpy()
+    return aligned, decoded_offsets, decoded_text
+
+
+def tokenize_and_align_localized_sentences(
+    *,
+    tokenizer: Any,
+    full_text: str,
+    sentence_df: pd.DataFrame,
+    raw_text_start_char: int = 0,
+) -> TokenizedSentenceAlignment:
+    tokenized = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
+    input_ids_list = [int(token_id) for token_id in tokenized["input_ids"]]
+    raw_offsets = [(int(start), int(end)) for start, end in tokenized["offset_mapping"]]
+
+    raw_aligned = _align_localized_sentences_to_offsets(raw_offsets, sentence_df)
+    use_fallback = offsets_need_decoded_fallback(raw_offsets, full_text)
+    raw_zero_count = int((raw_aligned["token_count"] == 0).sum()) if not raw_aligned.empty else 0
+
+    if not use_fallback and raw_zero_count == 0:
+        return TokenizedSentenceAlignment(
+            input_ids=input_ids_list,
+            offsets=raw_offsets,
+            aligned_sentence_df=raw_aligned,
+            prompt_token_count=count_tokens_before_char_boundary(raw_offsets, raw_text_start_char),
+            used_decoded_fallback=False,
+        )
+
+    repaired = _try_align_localized_sentences_via_decoded_text(
+        tokenizer=tokenizer,
+        input_ids=input_ids_list,
+        full_text=full_text,
+        sentence_df=sentence_df,
+    )
+    if repaired is not None:
+        repaired_aligned, repaired_offsets, _decoded_text = repaired
+        repaired_zero_count = int((repaired_aligned["token_count"] == 0).sum()) if not repaired_aligned.empty else 0
+        if use_fallback or repaired_zero_count < raw_zero_count:
+            raw_to_decoded_prefix = _build_raw_to_decoded_prefix_map(full_text, _decoded_text)
+            repaired_boundary = int(raw_to_decoded_prefix[int(raw_text_start_char)])
+            return TokenizedSentenceAlignment(
+                input_ids=input_ids_list,
+                offsets=repaired_offsets,
+                aligned_sentence_df=repaired_aligned,
+                prompt_token_count=count_tokens_before_char_boundary(repaired_offsets, repaired_boundary),
+                used_decoded_fallback=True,
+            )
+
+    return TokenizedSentenceAlignment(
+        input_ids=input_ids_list,
+        offsets=raw_offsets,
+        aligned_sentence_df=raw_aligned,
+        prompt_token_count=count_tokens_before_char_boundary(raw_offsets, raw_text_start_char),
+        used_decoded_fallback=False,
+    )
 
 
 def compute_attention_features(
@@ -497,6 +697,8 @@ def cleanup_tensors() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
 
 
 def extract_example_feature_df(
@@ -526,13 +728,17 @@ def extract_example_feature_df(
             f"{example_id} has {bad_count} localized sentence spans that do not match raw_text.",
         )
 
-    tokenized = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
-    input_ids_list = tokenized["input_ids"]
-    offsets = tokenized["offset_mapping"]
+    token_alignment = tokenize_and_align_localized_sentences(
+        tokenizer=tokenizer,
+        full_text=full_text,
+        sentence_df=localized_sentence_df,
+        raw_text_start_char=0,
+    )
+    input_ids_list = token_alignment.input_ids
     if not input_ids_list:
         raise ExampleValidationError("no_tokens", f"{example_id} tokenized to zero tokens.")
 
-    aligned_sentence_df = align_localized_sentences_to_tokens(offsets, localized_sentence_df)
+    aligned_sentence_df = token_alignment.aligned_sentence_df
     if not (aligned_sentence_df["token_count"] > 0).all():
         bad_count = int((aligned_sentence_df["token_count"] == 0).sum())
         raise ExampleValidationError(
@@ -552,7 +758,7 @@ def extract_example_feature_df(
         feature_df = compute_attention_features(
             attentions,
             modeling_sentence_df,
-            prompt_token_count=0,
+            prompt_token_count=int(token_alignment.prompt_token_count),
             example_id=example_id,
         )
     finally:
@@ -603,7 +809,8 @@ class StreamingParquetWriter:
             self.writer.close()
         if self.output_path.exists():
             self.output_path.unlink()
-        self.temp_path.replace(self.output_path)
+        if self.temp_path.exists():
+            self.temp_path.replace(self.output_path)
 
     def abort(self) -> None:
         if self.writer is not None:
