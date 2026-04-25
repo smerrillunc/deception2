@@ -120,6 +120,7 @@ for model_key in "${MODELS[@]}"; do
     cmd=(
       sbatch
       --parsable
+      --export=ALL
       --account "$SBATCH_ACCOUNT"
       --job-name "$job_name"
       --cpus-per-task "$CPUS_PER_TASK"
