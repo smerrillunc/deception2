@@ -11,14 +11,23 @@ import h5py
 import numpy as np
 import pandas as pd
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+try:
+    from transformers import BitsAndBytesConfig
+except Exception:  # noqa: BLE001
+    BitsAndBytesConfig = None
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+except Exception:  # noqa: BLE001
+    _tqdm = None
 
 from attention_features import (
     DatasetPaths,
     ExampleValidationError,
     StreamingParquetWriter,
     add_span_match_columns,
-    align_localized_sentences_to_tokens,
     build_localized_sentence_df,
     cleanup_tensors,
     infer_model_id,
@@ -27,6 +36,7 @@ from attention_features import (
     maybe_raise_runtime_error,
     resolve_device,
     resolve_dtype,
+    tokenize_and_align_localized_sentences,
 )
 
 DEFAULT_ATTN_IMPLEMENTATION = "eager"
@@ -38,11 +48,13 @@ DEFAULT_RECENT_WINDOW_TOKENS = 64
 DEFAULT_NUM_PREFIX_SENTENCES = 5
 DEFAULT_COMPRESSION = "lzf"
 DEFAULT_GZIP_LEVEL = 4
+DEFAULT_MAX_INPUT_TOKENS = 10_000
 EPS = 1e-6
 
 ATTENTION_METRIC_NAMES = (
     "current_vs_prior",
     "current_vs_prev",
+    "current_vs_prev3",
     "recent_vs_early",
     "prev_share_of_prior",
     "current_share_total",
@@ -84,6 +96,7 @@ METADATA_COLUMNS = (
     "available_token_count",
     "prior_all_token_count",
     "previous_sentence_token_count",
+    "previous_three_sentence_token_count",
     "recent_token_count",
     "early_token_count",
     "available_prefix_sentence_count",
@@ -98,6 +111,71 @@ class DualOutputs:
     def __init__(self, feature_output: Path, activation_output: Path) -> None:
         self.feature_output = feature_output
         self.activation_output = activation_output
+
+
+def maybe_tqdm(iterable: Sequence[Any], *, desc: str, total: Optional[int] = None, disable: bool = False):
+    if disable or _tqdm is None:
+        return iterable
+    return _tqdm(iterable, desc=desc, total=total)
+
+
+def progress_write(progress_iter: Any, message: str) -> None:
+    if _tqdm is not None and hasattr(progress_iter, "write"):
+        progress_iter.write(message)
+    else:
+        print(message)
+
+
+def format_skip_message(path: Path, reason: str, exc: Exception) -> str:
+    return f"[skip:{reason}] {path.name}: {exc}"
+
+
+def resolve_cuda_index(device: str) -> int:
+    if device == "cuda":
+        return int(torch.cuda.current_device())
+    if device.startswith("cuda:"):
+        return int(device.split(":", 1)[1])
+    raise ValueError(f"8-bit loading requires a CUDA device, got: {device}")
+
+
+def build_quant_config(*, load_in_8bit: bool, device: str) -> BitsAndBytesConfig | None:
+    if not load_in_8bit:
+        return None
+    if BitsAndBytesConfig is None:
+        raise ImportError("transformers BitsAndBytesConfig is unavailable; cannot use --load-in-8bit.")
+    if not torch.cuda.is_available():
+        raise ValueError("--load-in-8bit requires CUDA, but torch.cuda.is_available() is false.")
+    if not str(device).startswith("cuda"):
+        raise ValueError(f"--load-in-8bit requires a CUDA device, got: {device}")
+    return BitsAndBytesConfig(load_in_8bit=True)
+
+
+def infer_repo_quant_method(model_id: str, *, trust_remote_code: bool) -> Optional[str]:
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    quant_config = getattr(config, "quantization_config", None)
+    if quant_config is None:
+        return None
+    if isinstance(quant_config, dict):
+        quant_method = quant_config.get("quant_method")
+    else:
+        quant_method = getattr(quant_config, "quant_method", None)
+    return str(quant_method) if quant_method else None
+
+
+def build_model_load_kwargs(*, args: argparse.Namespace, device: str, model_dtype: torch.dtype, load_in_8bit: bool) -> dict[str, Any]:
+    model_kwargs: dict[str, Any] = {
+        "low_cpu_mem_usage": True,
+        "attn_implementation": args.attn_implementation,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    quant_config = build_quant_config(load_in_8bit=bool(load_in_8bit), device=device)
+    if quant_config is not None:
+        model_kwargs["quantization_config"] = quant_config
+        model_kwargs["device_map"] = {"": resolve_cuda_index(device)}
+        model_kwargs["torch_dtype"] = model_dtype
+    else:
+        model_kwargs["torch_dtype"] = model_dtype
+    return model_kwargs
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -135,6 +213,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=str,
         default=DEFAULT_ATTN_IMPLEMENTATION,
         help="Attention implementation passed to from_pretrained.",
+    )
+    parser.add_argument(
+        "--load-in-8bit",
+        action="store_true",
+        default=False,
+        help="Load the model with bitsandbytes 8-bit quantization. Requires CUDA.",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -177,8 +261,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="HDF5 compression for activation arrays.",
     )
     parser.add_argument("--gzip-level", type=int, default=DEFAULT_GZIP_LEVEL, help="Compression level when --compression=gzip.")
+    parser.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=DEFAULT_MAX_INPUT_TOKENS,
+        help="Skip examples whose prompt + raw_text tokenized length exceeds this limit.",
+    )
     parser.add_argument("--strict", action="store_true", default=False, help="Fail immediately on invalid examples.")
     parser.add_argument("--overwrite", action="store_true", default=False, help="Overwrite existing outputs.")
+    parser.add_argument("--disable-tqdm", action="store_true", default=False, help="Disable tqdm progress bars.")
+    parser.add_argument("--quiet-skips", action="store_true", default=False, help="Do not print a line for each skipped example.")
     return parser.parse_args(argv)
 
 
@@ -561,6 +653,9 @@ def add_region_columns(aligned_sentence_df: pd.DataFrame, *, recent_window_token
     previous_sentence_start_tokens: list[Optional[int]] = []
     previous_sentence_end_tokens: list[Optional[int]] = []
     previous_sentence_token_counts: list[int] = []
+    previous_three_sentence_start_tokens: list[Optional[int]] = []
+    previous_three_sentence_end_tokens: list[Optional[int]] = []
+    previous_three_sentence_token_counts: list[int] = []
     recent_token_counts: list[int] = []
     early_token_counts: list[int] = []
     prior_all_token_counts: list[int] = []
@@ -571,6 +666,9 @@ def add_region_columns(aligned_sentence_df: pd.DataFrame, *, recent_window_token
             previous_sentence_start_tokens.append(None)
             previous_sentence_end_tokens.append(None)
             previous_sentence_token_counts.append(0)
+            previous_three_sentence_start_tokens.append(None)
+            previous_three_sentence_end_tokens.append(None)
+            previous_three_sentence_token_counts.append(0)
             recent_token_counts.append(0)
             early_token_counts.append(0)
             prior_all_token_counts.append(0)
@@ -584,6 +682,9 @@ def add_region_columns(aligned_sentence_df: pd.DataFrame, *, recent_window_token
             previous_sentence_start_tokens.append(None)
             previous_sentence_end_tokens.append(None)
             previous_sentence_token_counts.append(0)
+            previous_three_sentence_start_tokens.append(None)
+            previous_three_sentence_end_tokens.append(None)
+            previous_three_sentence_token_counts.append(0)
         else:
             prev_row = df.iloc[row_idx - 1]
             prev_start = int(prev_row["start_token"])
@@ -591,6 +692,11 @@ def add_region_columns(aligned_sentence_df: pd.DataFrame, *, recent_window_token
             previous_sentence_start_tokens.append(prev_start)
             previous_sentence_end_tokens.append(prev_end)
             previous_sentence_token_counts.append(prev_end - prev_start + 1)
+            prev3_row = df.iloc[max(0, row_idx - 3)]
+            prev3_start = int(prev3_row["start_token"])
+            previous_three_sentence_start_tokens.append(prev3_start)
+            previous_three_sentence_end_tokens.append(prev_end)
+            previous_three_sentence_token_counts.append(prev_end - prev3_start + 1)
         recent_start = max(0, start_token - int(recent_window_tokens))
         recent_token_counts.append(start_token - recent_start)
         early_token_counts.append(recent_start)
@@ -598,6 +704,9 @@ def add_region_columns(aligned_sentence_df: pd.DataFrame, *, recent_window_token
     df["previous_sentence_start_token"] = previous_sentence_start_tokens
     df["previous_sentence_end_token"] = previous_sentence_end_tokens
     df["previous_sentence_token_count"] = previous_sentence_token_counts
+    df["previous_three_sentence_start_token"] = previous_three_sentence_start_tokens
+    df["previous_three_sentence_end_token"] = previous_three_sentence_end_tokens
+    df["previous_three_sentence_token_count"] = previous_three_sentence_token_counts
     df["recent_token_count"] = recent_token_counts
     df["early_token_count"] = early_token_counts
     df["prior_all_token_count"] = prior_all_token_counts
@@ -650,6 +759,16 @@ def compute_attention_metric_tensors(
         if sentence_row.previous_sentence_end_token is None or pd.isna(sentence_row.previous_sentence_end_token)
         else int(sentence_row.previous_sentence_end_token)
     )
+    prev3_start = (
+        None
+        if sentence_row.previous_three_sentence_start_token is None or pd.isna(sentence_row.previous_three_sentence_start_token)
+        else int(sentence_row.previous_three_sentence_start_token)
+    )
+    prev3_end = (
+        None
+        if sentence_row.previous_three_sentence_end_token is None or pd.isna(sentence_row.previous_three_sentence_end_token)
+        else int(sentence_row.previous_three_sentence_end_token)
+    )
 
     num_layers = len(attentions)
     num_heads = int(attentions[0].shape[1])
@@ -666,12 +785,14 @@ def compute_attention_metric_tensors(
         prior_slice = query_attn[:, :start_token]
         current_slice = query_attn[:, start_token : end_token + 1]
         prev_slice = query_attn[:, prev_start : prev_end + 1] if prev_start is not None and prev_end is not None else _empty_slice(query_attn)
+        prev3_slice = query_attn[:, prev3_start : prev3_end + 1] if prev3_start is not None and prev3_end is not None else _empty_slice(query_attn)
         recent_slice = query_attn[:, recent_start:start_token]
         early_slice = query_attn[:, :recent_start]
 
         current_mass = current_slice.sum(dim=1)
         prior_mass = prior_slice.sum(dim=1)
         prev_mass = prev_slice.sum(dim=1)
+        prev3_mass = prev3_slice.sum(dim=1)
         recent_mass = recent_slice.sum(dim=1)
         early_mass = early_slice.sum(dim=1)
 
@@ -683,6 +804,15 @@ def compute_attention_metric_tensors(
 
         metric_tensors["current_vs_prior"][layer_idx] = _ratio_from_per_token_mass(current_ptm, prior_ptm)
         metric_tensors["current_vs_prev"][layer_idx] = _ratio_from_per_token_mass(current_ptm, prev_ptm)
+        current_vs_prev3 = torch.full_like(current_mass, float("nan"), dtype=torch.float32)
+        total_prev3 = current_mass + prev3_mass
+        valid_prev3 = total_prev3 > 0
+        current_vs_prev3[valid_prev3] = torch.clamp(
+            current_mass[valid_prev3] / (total_prev3[valid_prev3] + EPS),
+            min=0.0,
+            max=1.0,
+        )
+        metric_tensors["current_vs_prev3"][layer_idx] = current_vs_prev3
         metric_tensors["recent_vs_early"][layer_idx] = _ratio_from_per_token_mass(recent_ptm, early_ptm)
 
         prev_share = torch.full_like(prev_mass, float("nan"), dtype=torch.float32)
@@ -759,6 +889,7 @@ def build_base_feature_record(
         "available_token_count": int(sentence_row.available_token_count),
         "prior_all_token_count": int(sentence_row.prior_all_token_count),
         "previous_sentence_token_count": int(sentence_row.previous_sentence_token_count),
+        "previous_three_sentence_token_count": int(sentence_row.previous_three_sentence_token_count),
         "recent_token_count": int(sentence_row.recent_token_count),
         "early_token_count": int(sentence_row.early_token_count),
         "available_prefix_sentence_count": int(sentence_row.available_prefix_sentence_count),
@@ -885,6 +1016,7 @@ def extract_example_outputs(
     device: str,
     recent_window_tokens: int,
     num_prefix_sentences: int,
+    max_input_tokens: int,
 ) -> tuple[pd.DataFrame, dict[str, Any], int]:
     example_id = example.get("example_id")
     if not isinstance(example_id, str) or not example_id:
@@ -921,16 +1053,25 @@ def extract_example_outputs(
     for column in ("raw_start", "raw_end", "full_start", "full_end"):
         shifted_df[column] = shifted_df[column].astype(int) + prompt_char_count
 
-    tokenized = tokenizer(model_input_text, add_special_tokens=False, return_offsets_mapping=True)
-    input_ids_list = tokenized["input_ids"]
-    offsets = tokenized["offset_mapping"]
+    token_alignment = tokenize_and_align_localized_sentences(
+        tokenizer=tokenizer,
+        full_text=model_input_text,
+        sentence_df=shifted_df,
+        raw_text_start_char=prompt_char_count,
+    )
+    input_ids_list = token_alignment.input_ids
     if not input_ids_list:
         raise ExampleValidationError("no_tokens", f"{example_id} tokenized to zero tokens.")
+    if int(max_input_tokens) > 0 and len(input_ids_list) > int(max_input_tokens):
+        raise ExampleValidationError(
+            "context_too_long",
+            f"{example_id} tokenized to {len(input_ids_list)} tokens, exceeding max_input_tokens={int(max_input_tokens)}.",
+        )
 
-    prompt_token_count = int(sum(1 for _, end in offsets if int(end) <= prompt_char_count))
+    prompt_token_count = int(token_alignment.prompt_token_count)
     total_input_token_count = int(len(input_ids_list))
 
-    aligned_sentence_df = align_localized_sentences_to_tokens(offsets, shifted_df)
+    aligned_sentence_df = token_alignment.aligned_sentence_df
     if not (aligned_sentence_df["token_count"] > 0).all():
         bad_count = int((aligned_sentence_df["token_count"] == 0).sum())
         raise ExampleValidationError(
@@ -1003,6 +1144,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     model_id = infer_model_id(dataset_paths, args.model_id)
     device, gpu_df = resolve_device(args.device)
     model_dtype = resolve_dtype(args.dtype, device)
+    repo_quant_method = infer_repo_quant_method(model_id, trust_remote_code=args.trust_remote_code)
+    effective_load_in_8bit = bool(args.load_in_8bit)
+    if effective_load_in_8bit and repo_quant_method and repo_quant_method != "bitsandbytes":
+        print(
+            f"Requested --load-in-8bit, but model {model_id} already declares native quantization "
+            f"method '{repo_quant_method}'. Ignoring --load-in-8bit and using the repo's native quantization."
+        )
+        effective_load_in_8bit = False
     write_every_examples = max(1, int(args.write_every_examples))
     num_prefix_sentences = max(1, int(args.num_prefix_sentences))
 
@@ -1033,12 +1182,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=model_dtype,
-        low_cpu_mem_usage=True,
-        attn_implementation=args.attn_implementation,
-        trust_remote_code=args.trust_remote_code,
+        **build_model_load_kwargs(args=args, device=device, model_dtype=model_dtype, load_in_8bit=effective_load_in_8bit),
     )
-    model.to(device)
+    if not effective_load_in_8bit:
+        model.to(device)
     model.eval()
     base_model = model.base_model
     num_layers = int(getattr(base_model.config, "num_hidden_layers", getattr(model.config, "num_hidden_layers", 0)))
@@ -1070,6 +1217,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"Model id: {model_id}")
     print(f"Device: {device}")
     print(f"Model dtype: {model_dtype}")
+    print(f"Repo quantization method: {repo_quant_method or 'none'}")
+    print(f"8-bit quantization: {'enabled' if effective_load_in_8bit else 'disabled'}")
     print(f"Layers: {num_layers}")
     print(f"Shard: {int(args.shard_id) + 1}/{int(args.num_shards)}")
     print(
@@ -1079,6 +1228,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         f"{transition_feature_count} transition = {len(ordered_columns) - len(METADATA_COLUMNS)}"
     )
     print(f"Recent window tokens: {int(args.recent_window_tokens)}")
+    print(f"Max input tokens: {int(args.max_input_tokens)}")
     print(f"Saved prefix sentence slots: {num_prefix_sentences}")
     print(f"Localization files before sharding: {len(all_localization_paths)}")
     print(f"Localization files to process on this shard: {len(localization_paths)}")
@@ -1087,7 +1237,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print(gpu_df.to_string(index=False))
 
     try:
-        for path in localization_paths:
+        path_iter = maybe_tqdm(
+            localization_paths,
+            desc="Extract prefix features",
+            total=len(localization_paths),
+            disable=bool(args.disable_tqdm),
+        )
+        for path in path_iter:
             processed += 1
             had_error = False
             try:
@@ -1099,29 +1255,42 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     device=device,
                     recent_window_tokens=int(args.recent_window_tokens),
                     num_prefix_sentences=num_prefix_sentences,
+                    max_input_tokens=int(args.max_input_tokens),
                 )
             except json.JSONDecodeError as exc:
                 had_error = True
-                skip_counts["invalid_json"] = skip_counts.get("invalid_json", 0) + 1
+                reason = "invalid_json"
+                skip_counts[reason] = skip_counts.get(reason, 0) + 1
+                if not args.quiet_skips:
+                    progress_write(path_iter, format_skip_message(path, reason, exc))
                 maybe_raise_invalid_example(args, path, exc)
                 feature_df = None
                 activation_batch = None
             except ExampleValidationError as exc:
                 had_error = True
-                skip_counts[exc.reason] = skip_counts.get(exc.reason, 0) + 1
+                reason = str(exc.reason)
+                skip_counts[reason] = skip_counts.get(reason, 0) + 1
+                if not args.quiet_skips:
+                    progress_write(path_iter, format_skip_message(path, reason, exc))
                 maybe_raise_invalid_example(args, path, exc)
                 feature_df = None
                 activation_batch = None
             except (KeyError, TypeError, ValueError, IndexError) as exc:
                 had_error = True
-                skip_counts["malformed_example"] = skip_counts.get("malformed_example", 0) + 1
+                reason = "malformed_example"
+                skip_counts[reason] = skip_counts.get(reason, 0) + 1
+                if not args.quiet_skips:
+                    progress_write(path_iter, format_skip_message(path, reason, exc))
                 maybe_raise_invalid_example(args, path, exc)
                 feature_df = None
                 activation_batch = None
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower():
                     had_error = True
-                    skip_counts["oom"] = skip_counts.get("oom", 0) + 1
+                    reason = "oom"
+                    skip_counts[reason] = skip_counts.get(reason, 0) + 1
+                    if not args.quiet_skips:
+                        progress_write(path_iter, format_skip_message(path, reason, exc))
                     cleanup_tensors()
                     maybe_raise_runtime_error(args, path, exc)
                     feature_df = None
@@ -1142,10 +1311,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
             if int(args.progress_every) > 0 and processed % int(args.progress_every) == 0:
                 buffered_rows = sum(len(df) for df in feature_buffer)
-                print(
+                progress_write(
+                    path_iter,
                     f"Processed {processed}/{len(localization_paths)} files | "
                     f"successful={successful} | skipped={sum(skip_counts.values())} | "
-                    f"rows_buffered_or_written={activation_writer.rows_written + buffered_rows}"
+                    f"rows_buffered_or_written={activation_writer.rows_written + buffered_rows}",
                 )
 
         flush_feature_buffer(feature_writer, feature_buffer, ordered_columns=ordered_columns)
