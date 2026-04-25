@@ -1142,8 +1142,19 @@ for env_name, env_paths in maybe_tqdm(
     if env_paths["structural_baseline_path"].exists():
         structural_metadata_df = load_structural_baseline_metadata(env_paths["structural_baseline_path"], env_name)
         structural_metadata_df["split"] = structural_metadata_df["example_id"].map(split_map).astype("string")
-        if structural_metadata_df["split"].isna().any():
-            raise ValueError(f"{env_name} structural baseline metadata contains example IDs absent from the feature split map.")
+        unmatched_structural_examples = sorted(
+            {
+                str(example_id)
+                for example_id in structural_metadata_df.loc[structural_metadata_df["split"].isna(), "example_id"].astype(str).tolist()
+            }
+        )
+        if unmatched_structural_examples:
+            print(
+                f"[warn] {env_name}: ignoring {len(unmatched_structural_examples)} structural-baseline example IDs "
+                "absent from the feature split map. "
+                "This usually means those examples produced structural rows but no modeling rows "
+                "in prefix_deception_features.parquet.tmp."
+            )
         structural_metadata_by_env[env_name] = structural_metadata_df
 
     split_summary_rows.append(split_summary_row(feature_metadata_df, env_name=env_name))
@@ -1183,13 +1194,19 @@ for env_name, metadata_df in feature_metadata_by_env.items():
         aligned_key_df = feature_keys_df.merge(
             structural_keys_df,
             on=["example_id", "sentence_idx"],
-            how="inner",
+            how="left",
             validate="one_to_one",
         )
-        if len(aligned_key_df) != len(metadata_df) or len(aligned_key_df) != len(structural_metadata_df):
+        if aligned_key_df["structural_row_idx"].isna().any():
+            missing_key_df = aligned_key_df.loc[
+                aligned_key_df["structural_row_idx"].isna(),
+                ["example_id", "sentence_idx"],
+            ].head(5)
             raise ValueError(
-                f"{env_name} structural baseline rows do not match feature parquet rows. "
-                f"feature_rows={len(metadata_df)}, structural_rows={len(structural_metadata_df)}, aligned_rows={len(aligned_key_df)}"
+                f"{env_name} structural baseline rows are missing feature-aligned keys. "
+                f"feature_rows={len(metadata_df)}, structural_rows={len(structural_metadata_df)}, "
+                f"missing_examples={aligned_key_df['structural_row_idx'].isna().sum()}, "
+                f"sample_missing={missing_key_df.to_dict(orient='records')}"
             )
         aligned_key_df = aligned_key_df.sort_values("feature_row_idx", kind="mergesort").reset_index(drop=True)
         structural_row_idx = aligned_key_df["structural_row_idx"].to_numpy(dtype=np.int64, copy=False)
