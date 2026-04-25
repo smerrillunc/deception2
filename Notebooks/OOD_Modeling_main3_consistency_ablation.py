@@ -90,6 +90,7 @@ for search_root in (NOTEBOOK_ROOT, SRC_DIR):
 
 import ood_modeling_main_lib as oml
 import deception_prefix_feature_and_activation_extractor as extractor
+import deception_prefix_text_structural_baseline_extractor as baseline_extractor
 
 oml = importlib.reload(oml)
 slugify = oml.slugify
@@ -239,16 +240,16 @@ FEATURE_FILENAME = "prefix_deception_features.parquet.tmp"
 ACTIVATION_FILENAME = "prefix_deception_activations.h5"
 STRUCTURAL_BASELINE_FILENAME = os.environ.get(
     "OOD_MAIN3_COMPANION_STRUCTURAL_BASELINE_FILENAME",
-    getattr(extractor, "DEFAULT_OUTPUT_NAME", "commitment_text_structural_baselines.parquet"),
+    getattr(baseline_extractor, "DEFAULT_OUTPUT_NAME", "commitment_text_structural_baselines.parquet"),
 )
 TFIDF_CACHE_DIRNAME = os.environ.get(
     "OOD_MAIN3_COMPANION_TFIDF_CACHE_DIRNAME",
-    getattr(extractor, "DEFAULT_TFIDF_CACHE_DIRNAME", "commitment_text_baseline_tfidf_cache"),
+    getattr(baseline_extractor, "DEFAULT_TFIDF_CACHE_DIRNAME", "commitment_text_baseline_tfidf_cache"),
 )
 TFIDF_TEXT_FIELDS = tuple(
     env_str_tuple(
         "OOD_MAIN3_COMPANION_TFIDF_TEXT_FIELDS",
-        tuple(getattr(extractor, "DEFAULT_TFIDF_TEXT_FIELDS", ("last_sentence_text", "prefix_text"))),
+        tuple(getattr(baseline_extractor, "DEFAULT_TFIDF_TEXT_FIELDS", ("last_sentence_text", "prefix_text"))),
     )
 )
 RANDOM_SEED = env_int("OOD_MAIN3_COMPANION_SEED", env_int("OOD_MAIN3_SEED", 42))
@@ -347,12 +348,12 @@ STRUCTURAL_BASELINE_EXCLUDED_COLUMNS = {
 }
 STRUCTURAL_BASELINE_FEATURE_COLUMNS = tuple(
     column_name
-    for column_name in extractor.OUTPUT_COLUMNS
+    for column_name in baseline_extractor.OUTPUT_COLUMNS
     if column_name not in STRUCTURAL_BASELINE_EXCLUDED_COLUMNS
     and (
-        column_name in extractor.INT_COLUMNS
-        or column_name in extractor.FLOAT_COLUMNS
-        or column_name in extractor.BOOL_COLUMNS
+        column_name in baseline_extractor.INT_COLUMNS
+        or column_name in baseline_extractor.FLOAT_COLUMNS
+        or column_name in baseline_extractor.BOOL_COLUMNS
     )
 )
 
@@ -775,10 +776,10 @@ def locate_tfidf_artifact(cache_dir: Path, text_field: str) -> dict[str, Path] |
                 "feature_names_path": feature_names_path,
                 "meta": meta,
                 "is_default_config": (
-                    int(vectorizer_params.get("max_features", -1)) == int(getattr(extractor, "DEFAULT_TFIDF_MAX_FEATURES", 20000))
+                    int(vectorizer_params.get("max_features", -1)) == int(getattr(baseline_extractor, "DEFAULT_TFIDF_MAX_FEATURES", 20000))
                     and tuple(vectorizer_params.get("ngram_range", [])) == (
-                        int(getattr(extractor, "DEFAULT_TFIDF_MIN_NGRAM", 1)),
-                        int(getattr(extractor, "DEFAULT_TFIDF_MAX_NGRAM", 2)),
+                        int(getattr(baseline_extractor, "DEFAULT_TFIDF_MIN_NGRAM", 1)),
+                        int(getattr(baseline_extractor, "DEFAULT_TFIDF_MAX_NGRAM", 2)),
                     )
                     and bool(vectorizer_params.get("lowercase", True))
                     and bool(vectorizer_params.get("sublinear_tf", True))
@@ -2081,7 +2082,7 @@ def build_tfidf_matrix_bundle(*, text_field: str, space_name: str) -> BaselineMa
             env_paths["structural_baseline_path"],
             columns=["example_id", "sentence_idx"],
         ).copy()
-        expected_fingerprint = extractor.dataset_row_fingerprint(structural_key_df)
+        expected_fingerprint = baseline_extractor.dataset_row_fingerprint(structural_key_df)
         if str(meta.get("fingerprint", "")) != str(expected_fingerprint):
             raise ValueError(
                 f"{env_name} TF-IDF fingerprint mismatch for {text_field}. "
