@@ -102,6 +102,28 @@ first_csv_value() {
   printf '%s' "$raw"
 }
 
+csv_from_tag() {
+  local raw="${1:-}"
+  printf '%s' "${raw//__/,}"
+}
+
+infer_only_tfidf_from_run_identity() {
+  [[ "${RUN_TAG:-}" == "only_tfidf" || "${RUN_NAME:-}" == *__only_tfidf__* ]]
+}
+
+infer_tfidf_text_fields_from_run_name() {
+  local raw="${RUN_NAME:-}"
+  local suffix=""
+  if [[ "$raw" != *"__only_tfidf__tfidf_"* ]]; then
+    return 1
+  fi
+  suffix="${raw##*__only_tfidf__tfidf_}"
+  if [[ -z "$suffix" ]]; then
+    return 1
+  fi
+  csv_from_tag "$suffix"
+}
+
 normalize_train_model() {
   local raw="${1:-logreg}"
   raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
@@ -188,6 +210,11 @@ RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_ROOT/Results/OOD_Modeling_main3_consisten
 RUN_TAG="${RUN_TAG:-baseline}"
 RUN_NAME="${RUN_NAME:-${MODEL_KEY}__${SCENARIO_KEY}__${TRAIN_MODEL_KEY}__${RUN_TAG}}"
 
+FEATURE_SIZES="${FEATURE_SIZES:-}"
+FEATURE_SIZES_TAG="${FEATURE_SIZES_TAG:-}"
+if [[ -z "$FEATURE_SIZES" && -n "$FEATURE_SIZES_TAG" ]]; then
+  FEATURE_SIZES="$(csv_from_tag "$FEATURE_SIZES_TAG")"
+fi
 FEATURE_SIZES="${FEATURE_SIZES:-128}"
 ATTENTION_TOP_K="${ATTENTION_TOP_K:-}"
 LOGREG_C="${LOGREG_C:-}"
@@ -206,6 +233,20 @@ TOP_FEATURES_TO_SHOW="${TOP_FEATURES_TO_SHOW:-20}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 DISABLE_TQDM="${DISABLE_TQDM:-0}"
 SHOW_PLOTS="${SHOW_PLOTS:-0}"
+ONLY_TFIDF="${ONLY_TFIDF:-0}"
+TFIDF_TEXT_FIELDS="${TFIDF_TEXT_FIELDS:-}"
+TFIDF_TEXT_FIELDS_TAG="${TFIDF_TEXT_FIELDS_TAG:-}"
+if [[ -z "$TFIDF_TEXT_FIELDS" && -n "$TFIDF_TEXT_FIELDS_TAG" ]]; then
+  TFIDF_TEXT_FIELDS="$(csv_from_tag "$TFIDF_TEXT_FIELDS_TAG")"
+fi
+if [[ "$ONLY_TFIDF" != "1" ]] && infer_only_tfidf_from_run_identity; then
+  ONLY_TFIDF="1"
+fi
+if [[ -z "$TFIDF_TEXT_FIELDS" && "$ONLY_TFIDF" == "1" ]]; then
+  TFIDF_TEXT_FIELDS="$(infer_tfidf_text_fields_from_run_name || true)"
+fi
+TFIDF_CACHE_DIRNAME="${TFIDF_CACHE_DIRNAME:-}"
+STRUCTURAL_BASELINE_FILENAME="${STRUCTURAL_BASELINE_FILENAME:-}"
 XGB_MAX_DEPTH="${XGB_MAX_DEPTH:-}"
 if [[ -z "$XGB_MAX_DEPTH" && -n "${XGB_MAX_DEPTH_GRID:-}" ]]; then
   XGB_MAX_DEPTH="$(first_csv_value "$XGB_MAX_DEPTH_GRID")"
@@ -313,6 +354,18 @@ CMD=(
 if [[ -n "$ATTENTION_TOP_K" ]]; then
   CMD+=(--attention-top-k "$ATTENTION_TOP_K")
 fi
+if [[ "$ONLY_TFIDF" == "1" ]]; then
+  CMD+=(--only-tfidf)
+fi
+if [[ -n "$TFIDF_TEXT_FIELDS" ]]; then
+  CMD+=(--tfidf-text-fields "$TFIDF_TEXT_FIELDS")
+fi
+if [[ -n "$TFIDF_CACHE_DIRNAME" ]]; then
+  CMD+=(--tfidf-cache-dirname "$TFIDF_CACHE_DIRNAME")
+fi
+if [[ -n "$STRUCTURAL_BASELINE_FILENAME" ]]; then
+  CMD+=(--structural-baseline-filename "$STRUCTURAL_BASELINE_FILENAME")
+fi
 if [[ "$FORCE_REBUILD" == "1" ]]; then
   CMD+=(--force-rebuild)
 fi
@@ -337,6 +390,14 @@ echo "RUN_TAG: $RUN_TAG"
 echo "RUN_NAME: $RUN_NAME"
 echo "OUTPUT_ROOT: $OUTPUT_ROOT"
 echo "FEATURE_SIZES: $FEATURE_SIZES"
+echo "ONLY_TFIDF: $ONLY_TFIDF"
+echo "TFIDF_TEXT_FIELDS: ${TFIDF_TEXT_FIELDS:-default}"
+if [[ -n "$TFIDF_CACHE_DIRNAME" ]]; then
+  echo "TFIDF_CACHE_DIRNAME: $TFIDF_CACHE_DIRNAME"
+fi
+if [[ -n "$STRUCTURAL_BASELINE_FILENAME" ]]; then
+  echo "STRUCTURAL_BASELINE_FILENAME: $STRUCTURAL_BASELINE_FILENAME"
+fi
 echo "OOD_MAIN3_COMPANION_MODEL_FAMILY: ${OOD_MAIN3_COMPANION_MODEL_FAMILY}"
 echo "LOGREG_C: $LOGREG_C"
 if [[ "$TRAIN_MODEL_FAMILY" == "xgboost" ]]; then

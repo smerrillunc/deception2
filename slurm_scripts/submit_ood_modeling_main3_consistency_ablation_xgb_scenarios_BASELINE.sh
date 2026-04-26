@@ -59,6 +59,13 @@ slugify() {
   printf '%s' "$raw"
 }
 
+csv_to_tag() {
+  local raw="$1"
+  raw="${raw//[[:space:]]/}"
+  raw="${raw//,/__}"
+  printf '%s' "$raw"
+}
+
 build_bundle_name() {
   local model_key="$1"
   local scenario_key="$2"
@@ -67,6 +74,44 @@ build_bundle_name() {
   run_tag_slug="$(slugify "$RUN_TAG")"
   tfidf_tag="$(slugify "tfidf_${TFIDF_TEXT_FIELDS//,/__}")"
   printf '%s__%s__xgb__%s__%s' "$model_key" "$scenario_key" "$run_tag_slug" "$tfidf_tag"
+}
+
+build_export_spec() {
+  local model_key="$1"
+  local scenario_key="$2"
+  local bundle_name="$3"
+  local output_root="$4"
+  local feature_sizes_tag
+  local tfidf_text_fields_tag
+  local export_spec
+
+  feature_sizes_tag="$(csv_to_tag "$FEATURE_SIZES")"
+  tfidf_text_fields_tag="$(csv_to_tag "$TFIDF_TEXT_FIELDS")"
+
+  export_spec="ALL"
+  export_spec+=",PROJECT_ROOT=$PROJECT_ROOT"
+  export_spec+=",DATASET_ROOT=$DATASET_ROOT"
+  export_spec+=",RESULTS_ROOT=$RESULTS_ROOT"
+  export_spec+=",MODEL_PRESET=$model_key"
+  export_spec+=",TRAIN_MODEL=xgb"
+  export_spec+=",SCENARIOS=$scenario_key"
+  export_spec+=",FEATURE_SIZES_TAG=$feature_sizes_tag"
+  export_spec+=",RUN_TAG=$RUN_TAG"
+  export_spec+=",RUN_NAME=$bundle_name"
+  export_spec+=",OUTPUT_ROOT=$output_root"
+  export_spec+=",THREADS=$THREADS"
+  export_spec+=",DISABLE_TQDM=$DISABLE_TQDM"
+  export_spec+=",SHOW_PLOTS=$SHOW_PLOTS"
+  export_spec+=",ONLY_TFIDF=$ONLY_TFIDF"
+  export_spec+=",TFIDF_TEXT_FIELDS_TAG=$tfidf_text_fields_tag"
+  if [[ -n "$TFIDF_CACHE_DIRNAME" ]]; then
+    export_spec+=",TFIDF_CACHE_DIRNAME=$TFIDF_CACHE_DIRNAME"
+  fi
+  if [[ -n "$STRUCTURAL_BASELINE_FILENAME" ]]; then
+    export_spec+=",STRUCTURAL_BASELINE_FILENAME=$STRUCTURAL_BASELINE_FILENAME"
+  fi
+
+  printf '%s' "$export_spec"
 }
 
 if [[ ! -f "$RUN_SCRIPT" ]]; then
@@ -110,6 +155,7 @@ for model_key in "${MODELS[@]}"; do
     job_name="oodm3_${model_key}_${scenario_key}_xgb"
     log_out="$LOG_ROOT/${job_name}_%j.out"
     log_err="$LOG_ROOT/${job_name}_%j.err"
+    export_spec="$(build_export_spec "$model_key" "$scenario_key" "$bundle_name" "$output_root")"
 
     echo
     echo "Bundle: $bundle_name"
@@ -120,7 +166,7 @@ for model_key in "${MODELS[@]}"; do
     cmd=(
       sbatch
       --parsable
-      --export=ALL
+      "--export=$export_spec"
       --account "$SBATCH_ACCOUNT"
       --job-name "$job_name"
       --cpus-per-task "$CPUS_PER_TASK"
@@ -133,15 +179,12 @@ for model_key in "${MODELS[@]}"; do
 
     if [[ "$DRY_RUN" == "1" ]]; then
       printf 'DRY RUN:'
-      printf ' %q' env         PROJECT_ROOT="$PROJECT_ROOT"         DATASET_ROOT="$DATASET_ROOT"         RESULTS_ROOT="$RESULTS_ROOT"         MODEL_PRESET="$model_key"         TRAIN_MODEL="xgb"         SCENARIOS="$scenario_key"         FEATURE_SIZES="$FEATURE_SIZES"         RUN_TAG="$RUN_TAG"         RUN_NAME="$bundle_name"         OUTPUT_ROOT="$output_root"         THREADS="$THREADS"         DISABLE_TQDM="$DISABLE_TQDM"         SHOW_PLOTS="$SHOW_PLOTS"         ONLY_TFIDF="$ONLY_TFIDF"         TFIDF_TEXT_FIELDS="$TFIDF_TEXT_FIELDS"         TFIDF_CACHE_DIRNAME="$TFIDF_CACHE_DIRNAME"         STRUCTURAL_BASELINE_FILENAME="$STRUCTURAL_BASELINE_FILENAME"
       printf ' %q' "${cmd[@]}"
       printf '\n'
       continue
     fi
 
-    job_id="$({
-      env         PROJECT_ROOT="$PROJECT_ROOT"         DATASET_ROOT="$DATASET_ROOT"         RESULTS_ROOT="$RESULTS_ROOT"         MODEL_PRESET="$model_key"         TRAIN_MODEL="xgb"         SCENARIOS="$scenario_key"         FEATURE_SIZES="$FEATURE_SIZES"         RUN_TAG="$RUN_TAG"         RUN_NAME="$bundle_name"         OUTPUT_ROOT="$output_root"         THREADS="$THREADS"         DISABLE_TQDM="$DISABLE_TQDM"         SHOW_PLOTS="$SHOW_PLOTS"         ONLY_TFIDF="$ONLY_TFIDF"         TFIDF_TEXT_FIELDS="$TFIDF_TEXT_FIELDS"         TFIDF_CACHE_DIRNAME="$TFIDF_CACHE_DIRNAME"         STRUCTURAL_BASELINE_FILENAME="$STRUCTURAL_BASELINE_FILENAME"         "${cmd[@]}"
-    })"
+    job_id="$("${cmd[@]}")"
 
     echo "  Submitted job: $job_id"
     echo "  Logs: $log_out / $log_err"
