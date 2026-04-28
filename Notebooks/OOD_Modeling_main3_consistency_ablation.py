@@ -255,6 +255,9 @@ TFIDF_TEXT_FIELDS = tuple(
 RANDOM_SEED = env_int("OOD_MAIN3_COMPANION_SEED", env_int("OOD_MAIN3_SEED", 42))
 VAL_SIZE = env_float("OOD_MAIN3_COMPANION_VAL_SIZE", env_float("OOD_MAIN3_VAL_SIZE", 0.20))
 DELTA_THRESHOLD = env_float("OOD_MAIN3_COMPANION_DELTA_THRESHOLD", env_float("OOD_MAIN3_DELTA_THRESHOLD", 0.30))
+MIN_NUM_VALID = int(env_int("OOD_MAIN3_COMPANION_MIN_NUM_VALID", 11) or 11)
+MIN_SENTENCE_ALPHA_WORDS = int(env_int("OOD_MAIN3_COMPANION_MIN_SENTENCE_ALPHA_WORDS", 4) or 4)
+EXCLUDE_MULTILINE_SENTENCES = os.environ.get("OOD_MAIN3_COMPANION_EXCLUDE_MULTILINE_SENTENCES", "1") == "1"
 FEATURE_SIZE_GRID = env_int_tuple("OOD_MAIN3_COMPANION_FEATURE_SIZES", (32, 64, 128, 256))
 ATTENTION_TOP_K = env_int("OOD_MAIN3_COMPANION_ATTENTION_TOP_K", max(FEATURE_SIZE_GRID))
 SCENARIO_KEYS = tuple(
@@ -431,6 +434,9 @@ config_df = pd.DataFrame(
         {"setting": "scenario_keys", "value": ", ".join(SCENARIO_KEYS)},
         {"setting": "val_size", "value": VAL_SIZE},
         {"setting": "delta_threshold", "value": DELTA_THRESHOLD},
+        {"setting": "min_num_valid", "value": MIN_NUM_VALID},
+        {"setting": "min_sentence_alpha_words", "value": MIN_SENTENCE_ALPHA_WORDS},
+        {"setting": "exclude_multiline_sentences", "value": EXCLUDE_MULTILINE_SENTENCES},
         {"setting": "model_family", "value": MODEL_FAMILY},
         {"setting": "model_family_title", "value": MODEL_FAMILY_TITLE},
         {"setting": "model_weight_kind", "value": MODEL_WEIGHT_KIND},
@@ -971,12 +977,47 @@ config_df.to_csv(OUTPUT_ROOT / "config.csv", index=False)
 
 
 # %%
+def count_alpha_words(text: Any) -> int:
+    return len(re.findall(r"[A-Za-z]+", str(text or "")))
+
+
+def load_parquet_with_optional_columns(
+    path: Path,
+    *,
+    required_columns: list[str],
+    optional_columns: list[str],
+) -> pd.DataFrame:
+    requested_columns = list(required_columns) + list(optional_columns)
+    try:
+        return pd.read_parquet(path, columns=requested_columns).copy()
+    except Exception:
+        df = pd.read_parquet(path, columns=required_columns).copy()
+        for column_name in optional_columns:
+            try:
+                optional_df = pd.read_parquet(path, columns=[column_name]).copy()
+            except Exception:
+                continue
+            if column_name in optional_df.columns:
+                df[column_name] = optional_df[column_name]
+        return df
+
+
 def annotate_prefix_metadata(df: pd.DataFrame, *, env_name: str) -> pd.DataFrame:
     out = df.copy()
     out["env_name"] = env_name
     out["example_id"] = out["example_id"].astype(str)
     out["sentence_idx"] = pd.to_numeric(out["sentence_idx"], errors="coerce")
     out["deception_rate"] = pd.to_numeric(out["deception_rate"], errors="coerce")
+    has_num_valid = "num_valid" in out.columns
+    has_sentence_text = "sentence_text" in out.columns
+    if has_num_valid:
+        out["num_valid"] = pd.to_numeric(out["num_valid"], errors="coerce")
+    else:
+        out["num_valid"] = np.nan
+    if has_sentence_text:
+        out["sentence_text"] = out["sentence_text"].fillna("").astype(str)
+    else:
+        out["sentence_text"] = ""
     out = out.replace([np.inf, -np.inf], np.nan)
     out = out.dropna(subset=["example_id", "sentence_idx", "deception_rate"]).copy()
     out["sentence_idx"] = out["sentence_idx"].astype(int)
@@ -985,7 +1026,33 @@ def annotate_prefix_metadata(df: pd.DataFrame, *, env_name: str) -> pd.DataFrame
     out["prev_deception_rate"] = (
         out.groupby("example_id", sort=False)["deception_rate"].shift(1).astype(np.float32)
     )
+    out["prev_num_valid"] = out.groupby("example_id", sort=False)["num_valid"].shift(1)
     out["delta_deception_rate"] = (out["deception_rate"] - out["prev_deception_rate"]).astype(np.float32)
+    if has_sentence_text:
+        out["sentence_alpha_word_count"] = out["sentence_text"].map(count_alpha_words).astype(np.int32)
+        usable_sentence_mask = out["sentence_text"].astype(str).str.strip().ne("").to_numpy(dtype=bool, copy=False)
+        if EXCLUDE_MULTILINE_SENTENCES:
+            usable_sentence_mask &= ~out["sentence_text"].astype(str).str.contains("\n", regex=False).to_numpy(
+                dtype=bool,
+                copy=False,
+            )
+        if int(MIN_SENTENCE_ALPHA_WORDS) > 0:
+            usable_sentence_mask &= out["sentence_alpha_word_count"].ge(int(MIN_SENTENCE_ALPHA_WORDS)).to_numpy(
+                dtype=bool,
+                copy=False,
+            )
+    else:
+        out["sentence_alpha_word_count"] = pd.Series(np.nan, index=out.index, dtype=np.float32)
+        usable_sentence_mask = np.ones(len(out), dtype=bool)
+
+    if has_num_valid and int(MIN_NUM_VALID) > 0:
+        enough_num_valid_mask = (
+            out["num_valid"].ge(int(MIN_NUM_VALID)) & out["prev_num_valid"].ge(int(MIN_NUM_VALID))
+        ).to_numpy(dtype=bool, copy=False)
+    else:
+        enough_num_valid_mask = np.ones(len(out), dtype=bool)
+
+    out["passes_commitment_pair_filters"] = usable_sentence_mask & enough_num_valid_mask
     valid_delta = out["delta_deception_rate"].notna()
     for target_name, target_spec in TARGET_SPECS.items():
         out[f"label__{target_name}"] = np.where(
@@ -1017,6 +1084,12 @@ def build_example_split_map(example_ids: pd.Series, *, seed: int, val_size: floa
 def split_summary_row(df: pd.DataFrame, *, env_name: str) -> dict[str, Any]:
     train_df = df.loc[df["split"].eq("train")].copy()
     val_df = df.loc[df["split"].eq("val")].copy()
+    train_modeled_df = train_df.loc[
+        train_df["delta_deception_rate"].notna() & train_df["passes_commitment_pair_filters"].astype(bool)
+    ].copy()
+    val_modeled_df = val_df.loc[
+        val_df["delta_deception_rate"].notna() & val_df["passes_commitment_pair_filters"].astype(bool)
+    ].copy()
     row: dict[str, Any] = {
         "env_name": env_name,
         "rows": int(len(df)),
@@ -1025,15 +1098,40 @@ def split_summary_row(df: pd.DataFrame, *, env_name: str) -> dict[str, Any]:
         "val_rows": int(len(val_df)),
         "train_delta_rows": int(train_df["delta_deception_rate"].notna().sum()),
         "val_delta_rows": int(val_df["delta_deception_rate"].notna().sum()),
+        "train_modeled_rows": int(len(train_modeled_df)),
+        "val_modeled_rows": int(len(val_modeled_df)),
+        "train_modeled_examples": int(train_modeled_df["example_id"].nunique()),
+        "val_modeled_examples": int(val_modeled_df["example_id"].nunique()),
     }
     for target_name in TARGET_SPECS:
-        row[f"train_pos_rate__{target_name}"] = float(pd.to_numeric(train_df[f"label__{target_name}"], errors="coerce").mean())
-        row[f"val_pos_rate__{target_name}"] = float(pd.to_numeric(val_df[f"label__{target_name}"], errors="coerce").mean())
+        row[f"train_pos_rate__{target_name}"] = float(
+            pd.to_numeric(train_modeled_df[f"label__{target_name}"], errors="coerce").mean()
+        )
+        row[f"val_pos_rate__{target_name}"] = float(
+            pd.to_numeric(val_modeled_df[f"label__{target_name}"], errors="coerce").mean()
+        )
     return row
 
 
 def load_feature_metadata(feature_path: Path, env_name: str) -> pd.DataFrame:
-    df = pd.read_parquet(feature_path, columns=["example_id", "sentence_idx", "deception_rate"]).copy()
+    df = load_parquet_with_optional_columns(
+        feature_path,
+        required_columns=["example_id", "sentence_idx", "deception_rate"],
+        optional_columns=["sentence_text", "num_valid"],
+    )
+    missing_optional_columns = [column_name for column_name in ("sentence_text", "num_valid") if column_name not in df.columns]
+    if "num_valid" in missing_optional_columns and int(MIN_NUM_VALID) > 0:
+        print(
+            f"[warn] {env_name}: feature parquet is missing `num_valid`; "
+            "skipping the MIN_NUM_VALID-style filter for this environment."
+        )
+    if "sentence_text" in missing_optional_columns and (
+        bool(EXCLUDE_MULTILINE_SENTENCES) or int(MIN_SENTENCE_ALPHA_WORDS) > 0
+    ):
+        print(
+            f"[warn] {env_name}: feature parquet is missing `sentence_text`; "
+            "skipping the sentence-text usability filters for this environment."
+        )
     df["row_idx"] = np.arange(len(df), dtype=np.int64)
     return annotate_prefix_metadata(df, env_name=env_name)
 
@@ -1173,8 +1271,9 @@ ACTIVATION_HIDDEN_DIM = int(
 split_cache_by_env: dict[str, dict[str, Any]] = {}
 for env_name, metadata_df in feature_metadata_by_env.items():
     valid_delta = metadata_df["delta_deception_rate"].notna().to_numpy(dtype=bool, copy=False)
-    train_mask = metadata_df["split"].eq("train").to_numpy(dtype=bool, copy=False) & valid_delta
-    val_mask = metadata_df["split"].eq("val").to_numpy(dtype=bool, copy=False) & valid_delta
+    passes_commitment_pair_filters = metadata_df["passes_commitment_pair_filters"].to_numpy(dtype=bool, copy=False)
+    train_mask = metadata_df["split"].eq("train").to_numpy(dtype=bool, copy=False) & valid_delta & passes_commitment_pair_filters
+    val_mask = metadata_df["split"].eq("val").to_numpy(dtype=bool, copy=False) & valid_delta & passes_commitment_pair_filters
     bundle: dict[str, Any] = {
         "train_mask": train_mask,
         "val_mask": val_mask,
@@ -1363,10 +1462,15 @@ def feature_columns_for_env(env_df: pd.DataFrame) -> list[str]:
         "env_name",
         "example_id",
         "sentence_idx",
+        "sentence_text",
+        "sentence_alpha_word_count",
         "deception_rate",
+        "num_valid",
+        "prev_num_valid",
         "row_idx",
         "prev_deception_rate",
         "delta_deception_rate",
+        "passes_commitment_pair_filters",
         "split",
         *(f"label__{target_name}" for target_name in TARGET_SPECS),
     }
