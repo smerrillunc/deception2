@@ -1048,7 +1048,7 @@ def annotate_prefix_metadata(df: pd.DataFrame, *, env_name: str) -> pd.DataFrame
     if has_num_valid and int(MIN_NUM_VALID) > 0:
         enough_num_valid_mask = (
             out["num_valid"].ge(int(MIN_NUM_VALID)) & out["prev_num_valid"].ge(int(MIN_NUM_VALID))
-        ).to_numpy(dtype=bool, copy=False)
+        ).fillna(False).to_numpy(dtype=bool, copy=False)
     else:
         enough_num_valid_mask = np.ones(len(out), dtype=bool)
 
