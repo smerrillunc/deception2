@@ -32,9 +32,9 @@ DEFAULT_CANDIDATE_CIRCUIT_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 DEFAULT_CROSS_CORPUS_ENVS = ("advisor_audit", "car_sales", "gridworld", "interview")
 DEFAULT_MODEL_ID = "gpt-oss-20b"
 DEFAULT_DTYPE_NAME = "bfloat16"
-DEFAULT_TRAIN_PAIR_COUNT = 50
-DEFAULT_VALIDATION_PAIR_COUNT = 25
-DEFAULT_TEST_PAIR_COUNT = 25
+DEFAULT_TRAIN_PAIR_COUNT = 300
+DEFAULT_VALIDATION_PAIR_COUNT = 50
+DEFAULT_TEST_PAIR_COUNT = 50
 DEFAULT_BATCH_PAIR_COUNT = 1
 DEFAULT_CONTROL_CIRCUIT_COUNT = 8
 DEFAULT_STEERING_ALPHA = 1.0
@@ -68,7 +68,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import activation_patching as ap
 import activation_patching_debug as apd
-from activation_patching import encode_text_for_model, resolve_decoder_layers
+from activation_patching import encode_text_for_model, get_nested_attr, resolve_decoder_layers
 
 
 @dataclass(frozen=True)
@@ -113,6 +113,8 @@ class HeadModelRuntime:
     tokenizer: Any
     layers: Any
     layer_path: str
+    output_head_module: Any
+    output_head_path: str | None
     n_layers: int
     n_heads: int
     head_dim: int
@@ -339,6 +341,20 @@ def clear_memory(model: Any | None = None) -> None:
         torch.cuda.empty_cache()
 
 
+def freeze_model_parameters(model: Any) -> None:
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+
+def zero_model_gradients(model: Any) -> None:
+    if not hasattr(model, "zero_grad"):
+        return
+    try:
+        model.zero_grad(set_to_none=True)
+    except TypeError:
+        model.zero_grad()
+
+
 def saved_value(x: Any) -> Any:
     return getattr(x, "value", x)
 
@@ -357,6 +373,47 @@ def attn_out_proj_module(layer: Any) -> Any:
     if hasattr(layer, "attn") and hasattr(layer.attn, "c_proj"):
         return layer.attn.c_proj
     raise AttributeError("Could not find the attention output projection module for this layer.")
+
+
+def resolve_output_head(model: Any) -> tuple[Any, str | None]:
+    output_module = None
+    for getter_target in (model, getattr(model, "_model", None)):
+        if getter_target is None:
+            continue
+        try:
+            output_module = getter_target.get_output_embeddings()
+        except Exception:
+            continue
+        if output_module is not None:
+            break
+    if output_module is None:
+        underlying = getattr(model, "_model", model)
+        for dotted_name in ("lm_head", "embed_out", "output_projection"):
+            try:
+                output_module = get_nested_attr(underlying, dotted_name)
+            except Exception:
+                continue
+            if output_module is not None:
+                break
+
+    output_path = None
+    for dotted_name in ("lm_head", "embed_out", "output_projection"):
+        try:
+            get_nested_attr(model, dotted_name)
+        except Exception:
+            continue
+        output_path = dotted_name
+        break
+
+    if output_module is None:
+        raise ValueError("Could not resolve the model output head module.")
+    return output_module, output_path
+
+
+def output_head_input(runtime: HeadModelRuntime) -> Any:
+    if runtime.output_head_path is None:
+        raise ValueError("Could not resolve the model output head path for traced scoring.")
+    return get_nested_attr(runtime.model, runtime.output_head_path).input
 
 
 def load_head_runtime(
@@ -389,11 +446,13 @@ def load_head_runtime(
     )
     if hasattr(model, "eval"):
         model.eval()
+    freeze_model_parameters(model)
     tokenizer = model.tokenizer
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     layers, layer_path = resolve_decoder_layers(model)
+    output_head_module, output_head_path = resolve_output_head(model)
     n_layers = len(layers)
     n_heads = int(model.config.num_attention_heads)
     head_dim = int(getattr(model.config, "head_dim", 0) or (model.config.hidden_size // n_heads))
@@ -402,6 +461,8 @@ def load_head_runtime(
         tokenizer=tokenizer,
         layers=layers,
         layer_path=layer_path,
+        output_head_module=output_head_module,
+        output_head_path=output_head_path,
         n_layers=n_layers,
         n_heads=n_heads,
         head_dim=head_dim,
@@ -760,6 +821,21 @@ def scored_logits_and_targets(logits: torch.Tensor, batch: dict[str, Any]) -> tu
     return torch.cat(scored_logits, dim=0), torch.cat(scored_targets, dim=0), row_lengths
 
 
+def scored_hidden_and_targets(hidden: torch.Tensor, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    scored_hidden = []
+    scored_targets = []
+    row_lengths = []
+    for row_idx, row in enumerate(batch["rows"]):
+        start = int(row["score_start_pos"])
+        stop = int(row["score_stop_pos"])
+        row_hidden = hidden[row_idx, start - 1 : stop - 1, :]
+        row_targets = batch["input_ids"][row_idx, start:stop].to(hidden.device)
+        scored_hidden.append(row_hidden)
+        scored_targets.append(row_targets)
+        row_lengths.append(int(stop - start))
+    return torch.cat(scored_hidden, dim=0), torch.cat(scored_targets, dim=0), row_lengths
+
+
 def score_sentence_token_log_probs(row_token_log_probs: torch.Tensor, *, sentence_score_mode: str) -> torch.Tensor:
     row_token_log_probs = row_token_log_probs.float()
     if sentence_score_mode == "mean_logprob":
@@ -780,6 +856,21 @@ def sentence_score_by_row(
     sentence_score_mode: str,
 ) -> torch.Tensor:
     flat_logits, flat_targets, row_lengths = scored_logits_and_targets(logits, batch)
+    return sentence_scores_from_flat_logits(
+        flat_logits,
+        flat_targets,
+        row_lengths,
+        sentence_score_mode=sentence_score_mode,
+    )
+
+
+def sentence_scores_from_flat_logits(
+    flat_logits: torch.Tensor,
+    flat_targets: torch.Tensor,
+    row_lengths: list[int],
+    *,
+    sentence_score_mode: str,
+) -> torch.Tensor:
     token_log_probs = -F.cross_entropy(flat_logits, flat_targets, reduction="none")
     scores = []
     offset = 0
@@ -798,6 +889,46 @@ def target_metric_from_logits(
 ) -> torch.Tensor:
     target_scores = sentence_score_by_row(logits, target_batch, sentence_score_mode=sentence_score_mode)
     return -target_scores.mean()
+
+
+def target_metric_from_hidden(
+    hidden: torch.Tensor,
+    target_batch: dict[str, Any],
+    *,
+    output_head_module: Any,
+    sentence_score_mode: str,
+) -> torch.Tensor:
+    flat_hidden, flat_targets, row_lengths = scored_hidden_and_targets(hidden, target_batch)
+    flat_logits = F.linear(
+        flat_hidden,
+        output_head_module.weight,
+        getattr(output_head_module, "bias", None),
+    )
+    target_scores = sentence_scores_from_flat_logits(
+        flat_logits,
+        flat_targets,
+        row_lengths,
+        sentence_score_mode=sentence_score_mode,
+    )
+    return -target_scores.mean()
+
+
+def traced_target_metric(
+    runtime: HeadModelRuntime,
+    target_batch: dict[str, Any],
+    *,
+    sentence_score_mode: str,
+) -> torch.Tensor:
+    if runtime.output_head_path is not None:
+        hidden = output_head_input(runtime)
+        return target_metric_from_hidden(
+            hidden,
+            target_batch,
+            output_head_module=runtime.output_head_module,
+            sentence_score_mode=sentence_score_mode,
+        )
+    logits = runtime.model.lm_head.output
+    return target_metric_from_logits(logits, target_batch, sentence_score_mode=sentence_score_mode)
 
 
 def first_commitment_token_span(source_row: dict[str, Any], target_row: dict[str, Any], max_tokens: int) -> tuple[int, int, int]:
@@ -1023,35 +1154,45 @@ def compute_head_attributions(
 
         for layer_idx, layer in enumerate(runtime.layers):
             clear_memory(runtime.model)
-            with runtime.model.trace(source_inputs):
-                source_proxy = attn_out_input(layer)
-                source_out = source_proxy.save()
+            with torch.inference_mode():
+                with runtime.model.trace(source_inputs):
+                    source_proxy = attn_out_input(layer)
+                    source_out = source_proxy.save()
+            source_tensor = saved_value(source_out).detach().to("cpu")
+            del source_out, source_proxy
+            clear_memory(runtime.model)
+
             with runtime.model.trace(target_inputs):
                 target_proxy = attn_out_input(layer)
+                target_proxy.requires_grad_()
                 target_out = target_proxy.save()
                 target_grad = target_proxy.grad.save()
-                logits = runtime.model.lm_head.output
-                value = target_metric_from_logits(logits, target_batch, sentence_score_mode=sentence_score_mode)
+                value = traced_target_metric(runtime, target_batch, sentence_score_mode=sentence_score_mode)
                 traced_value = value.save()
                 value.backward()
+            zero_model_gradients(runtime.model)
+            objective_value = float(saved_value(traced_value).item())
+            target_tensor = saved_value(target_out).detach().to("cpu")
+            target_grad_tensor = saved_value(target_grad).detach().to("cpu")
+            del target_out, target_grad, traced_value, value, target_proxy
+            clear_memory(runtime.model)
 
             patch_delta = activation_delta_for_patch_scope(
                 patch_scope,
                 patch_first_n_tokens,
-                saved_value(source_out),
-                saved_value(target_out),
+                source_tensor,
+                target_tensor,
                 list(source_batch["rows"]),
                 list(target_batch["rows"]),
             )
             layer_attr = einops.reduce(
-                saved_value(target_grad) * patch_delta,
+                target_grad_tensor * patch_delta,
                 "batch pos (head d_head) -> head",
                 "sum",
                 head=runtime.n_heads,
                 d_head=runtime.head_dim,
             )
-            objective_value = float(saved_value(traced_value).item())
-            grad_norm = float(saved_value(target_grad).float().norm().item())
+            grad_norm = float(target_grad_tensor.float().norm().item())
             attr_abs_sum = float(layer_attr.float().abs().sum().item())
             attr_max_abs = float(layer_attr.float().abs().max().item())
 
@@ -1072,7 +1213,7 @@ def compute_head_attributions(
                 f"  Layer {layer_idx:02d} | obj={objective_value:.4f} | "
                 f"grad_norm={grad_norm:.4f} | attr_abs_sum={attr_abs_sum:.4f}"
             )
-            del source_out, target_out, target_grad, traced_value, value, patch_delta, layer_attr
+            del source_tensor, target_tensor, target_grad_tensor, patch_delta, layer_attr
             clear_memory(runtime.model)
 
         del source_batch, target_batch, source_inputs, target_inputs
@@ -1339,8 +1480,7 @@ def patch_circuit_chunk(
                     target_rows,
                     heads,
                 )
-            logits = runtime.model.lm_head.output
-            metric = target_metric_from_logits(logits, target_batch, sentence_score_mode=sentence_score_mode).save()
+            metric = traced_target_metric(runtime, target_batch, sentence_score_mode=sentence_score_mode).save()
 
     value = float(saved_value(metric).item())
     del metric, target_batch, target_inputs, source_tensors, device_sources
@@ -3045,7 +3185,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--train-pair-count", type=int, default=DEFAULT_TRAIN_PAIR_COUNT)
     analyze.add_argument("--validation-pair-count", type=int, default=DEFAULT_VALIDATION_PAIR_COUNT)
     analyze.add_argument("--test-pair-count", type=int, default=DEFAULT_TEST_PAIR_COUNT)
-    analyze.add_argument("--pair-search-limit", type=int, default=128)
+    analyze.add_argument("--pair-search-limit", type=int, default=5000)
     analyze.add_argument("--batch-pair-count", type=int, default=DEFAULT_BATCH_PAIR_COUNT)
     analyze.add_argument("--split-seed", type=int, default=17)
     analyze.add_argument("--control-seed", type=int, default=17)
