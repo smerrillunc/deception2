@@ -676,6 +676,8 @@ def main() -> None:
         {
             "completed_at_utc": utc_now_iso(),
             "script": str(Path(__file__).resolve()),
+            "prevalence_helper_module": str(Path(cj.__file__).resolve()),
+            "threshold_helper_module": str(Path(cjt.__file__).resolve()),
             "repo_root": repo_root,
             "datasetmain_root": datasetmain_root,
             "output_dir": output_dir,
@@ -710,6 +712,8 @@ def main() -> None:
     print(bucket_message)
     print(f"Dataset root: {datasetmain_root}")
     print(f"Output dir: {output_dir}")
+    print(f"Prevalence helper module: {Path(cj.__file__).resolve()}")
+    print(f"Threshold helper module: {Path(cjt.__file__).resolve()}")
     print(f"Inventory rows: {len(inventory_table_df):,}")
     print(f"Positive overall rows: {len(positive_overall_table_df):,}")
     print(f"Negative overall rows: {len(negative_overall_table_df):,}")

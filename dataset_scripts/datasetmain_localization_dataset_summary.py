@@ -236,6 +236,7 @@ def main() -> None:
         {
             "completed_at_utc": utc_now_iso(),
             "script": str(Path(__file__).resolve()),
+            "helper_module": str(Path(dsum.__file__).resolve()),
             "repo_root": repo_root,
             "datasetmain_root": datasetmain_root,
             "output_dir": output_dir,
@@ -264,6 +265,7 @@ def main() -> None:
     print(f"Dataset root: {datasetmain_root}")
     print(f"HF cache root: {hf_cache_root}")
     print(f"Output dir: {output_dir}")
+    print(f"Helper module: {Path(dsum.__file__).resolve()}")
     print(f"Bundles: {len(bundle_df):,}")
     print(f"Localization files processed: {total_files:,}")
     print(f"Requested model rows: {len(requested_model_table_df):,}")

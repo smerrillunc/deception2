@@ -76,12 +76,12 @@ def resolve_hf_cache_root(
 def ensure_import_paths(repo_root: Path, *, include_styles: bool = False) -> None:
     notebooks_dir = repo_root / "Notebooks"
     if str(notebooks_dir) not in sys.path:
-        sys.path.insert(0, str(notebooks_dir))
+        sys.path.append(str(notebooks_dir))
 
     if include_styles:
         styles_dir = repo_root / "styles"
         if str(styles_dir) not in sys.path:
-            sys.path.insert(0, str(styles_dir))
+            sys.path.append(str(styles_dir))
 
 
 def ensure_dir(path: Path) -> Path:

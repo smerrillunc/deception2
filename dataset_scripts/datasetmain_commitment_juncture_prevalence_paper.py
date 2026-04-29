@@ -181,6 +181,7 @@ def main() -> None:
         {
             "completed_at_utc": utc_now_iso(),
             "script": str(Path(__file__).resolve()),
+            "helper_module": str(Path(cj.__file__).resolve()),
             "repo_root": repo_root,
             "datasetmain_root": datasetmain_root,
             "output_dir": output_dir,
@@ -205,6 +206,7 @@ def main() -> None:
     print(f"Summary source: {summary_source}")
     print(f"Dataset root: {datasetmain_root}")
     print(f"Output dir: {output_dir}")
+    print(f"Helper module: {Path(cj.__file__).resolve()}")
     print(f"Coverage rows: {len(coverage_table_df):,}")
     print(f"Example rows: {len(example_df):,}")
     print(f"Parse errors: {len(parse_error_df):,}")
