@@ -1,0 +1,25 @@
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.35}
+\caption{
+\textbf{Per-model MTurk validation statistics for Task B.}
+For each model, we report worker-level and majority-vote unclear rate and localization accuracy.
+Values are percentages with bootstrap \(95\%\) confidence intervals in brackets. Majority-vote statistics drop tied votes, and localization accuracy excludes Unclear responses.
+}
+\label{tab:taskb_per_model_mturk}
+\begin{tabular*}{\columnwidth}{@{\extracolsep{\fill}}lcccc@{}}
+\toprule
+& \multicolumn{2}{c}{Worker-level} & \multicolumn{2}{c}{Majority-vote} \\
+\cmidrule(lr){2-3}
+\cmidrule(lr){4-5}
+Model & Unclear rate & Localization accuracy & Unclear rate & Localization accuracy \\
+\midrule
+Qwen-7B & \makecell{\(41.6\) \\ {\scriptsize \([32.8,50.4]\)}} & \makecell{\(76.7\) \\ {\scriptsize \([65.6,86.8]\)}} & \makecell{\(52.0\) \\ {\scriptsize \([32.0,72.0]\)}} & \makecell{\(100.0\) \\ {\scriptsize \([100.0,100.0]\)}} \\
+Qwen-14B & \makecell{\(29.6\) \\ {\scriptsize \([19.2,40.8]\)}} & \makecell{\(78.4\) \\ {\scriptsize \([69.1,86.2]\)}} & \makecell{\(29.2\) \\ {\scriptsize \([12.0,48.0]\)}} & \makecell{\(100.0\) \\ {\scriptsize \([100.0,100.0]\)}} \\
+Llama-8B & \makecell{\(24.0\) \\ {\scriptsize \([15.2,32.8]\)}} & \makecell{\(88.4\) \\ {\scriptsize \([83.0,93.9]\)}} & \makecell{\(12.0\) \\ {\scriptsize \([0.0,24.0]\)}} & \makecell{\(100.0\) \\ {\scriptsize \([100.0,100.0]\)}} \\
+GPT-OSS-20B & \makecell{\(41.6\) \\ {\scriptsize \([29.6,53.6]\)}} & \makecell{\(63.0\) \\ {\scriptsize \([44.8,80.0]\)}} & \makecell{\(42.9\) \\ {\scriptsize \([21.7,65.0]\)}} & \makecell{\(83.3\) \\ {\scriptsize \([58.3,100.0]\)}} \\
+\bottomrule
+\end{tabular*}
+\end{table}

@@ -1,0 +1,6 @@
+{
+  "description": "Task A qwen7b | advisor_audit",
+  "cache_path": "/playpen-ssd/smerrill/deception2/Notebooks/mturk_outputs/cache/taska_mining/taska/taska__qwen7b__advisor_audit__thr0p5__recent3__maxall.jsonl",
+  "n_rows": 690,
+  "built_at_unix": 1776984436.0993886
+}

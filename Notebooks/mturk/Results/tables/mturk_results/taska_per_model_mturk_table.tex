@@ -1,0 +1,32 @@
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.35}
+\caption{
+\textbf{Per-model MTurk validation statistics for Task A.}
+For each model, we report worker-level and majority-vote unclear rate and accuracy separately for pre-spike and spike snippets.
+Values are percentages with bootstrap \(95\%\) confidence intervals in brackets. Majority-vote statistics drop tied votes.
+}
+\label{tab:taska_per_model_mturk}
+\begin{tabular*}{\columnwidth}{@{\extracolsep{\fill}}lcccc@{}}
+\toprule
+& \multicolumn{2}{c}{Unclear rate} & \multicolumn{2}{c}{Accuracy} \\
+\cmidrule(lr){2-3}
+\cmidrule(lr){4-5}
+Model & Pre-spike & Spike & Pre-spike & Spike \\
+\midrule
+\multicolumn{5}{@{}l}{\textbf{Worker-level}} \\
+Qwen-7B & \makecell{\(58.5\) \\ {\scriptsize \([40.0,75.4]\)}} & \makecell{\(12.3\) \\ {\scriptsize \([6.2,18.5]\)}} & \makecell{\(14.8\) \\ {\scriptsize \([4.0,27.8]\)}} & \makecell{\(91.2\) \\ {\scriptsize \([82.1,98.3]\)}} \\
+Qwen-14B & \makecell{\(72.3\) \\ {\scriptsize \([58.5,86.2]\)}} & \makecell{\(35.4\) \\ {\scriptsize \([23.1,47.7]\)}} & \makecell{\(5.6\) \\ {\scriptsize \([0.0,16.7]\)}} & \makecell{\(90.5\) \\ {\scriptsize \([81.6,97.7]\)}} \\
+Llama-8B & \makecell{\(51.7\) \\ {\scriptsize \([35.0,68.3]\)}} & \makecell{\(35.0\) \\ {\scriptsize \([23.3,46.7]\)}} & \makecell{\(20.7\) \\ {\scriptsize \([6.9,39.3]\)}} & \makecell{\(94.9\) \\ {\scriptsize \([85.4,100.0]\)}} \\
+GPT-OSS-20B & \makecell{\(80.0\) \\ {\scriptsize \([66.7,91.7]\)}} & \makecell{\(45.0\) \\ {\scriptsize \([33.3,56.7]\)}} & \makecell{\(41.7\) \\ {\scriptsize \([9.5,83.3]\)}} & \makecell{\(90.9\) \\ {\scriptsize \([81.5,100.0]\)}} \\
+\addlinespace[2pt]
+\multicolumn{5}{@{}l}{\textbf{Majority-vote}} \\
+Qwen-7B & \makecell{\(72.7\) \\ {\scriptsize \([45.5,100.0]\)}} & \makecell{\(0.0\) \\ {\scriptsize \([0.0,0.0]\)}} & \makecell{\(0.0\) \\ {\scriptsize \([0.0,0.0]\)}} & \makecell{\(100.0\) \\ {\scriptsize \([100.0,100.0]\)}} \\
+Qwen-14B & \makecell{\(83.3\) \\ {\scriptsize \([60.0,100.0]\)}} & \makecell{\(33.3\) \\ {\scriptsize \([8.3,61.5]\)}} & \makecell{\(0.0\) \\ {\scriptsize \([0.0,0.0]\)}} & \makecell{\(100.0\) \\ {\scriptsize \([100.0,100.0]\)}} \\
+Llama-8B & \makecell{\(45.5\) \\ {\scriptsize \([16.7,75.0]\)}} & \makecell{\(16.7\) \\ {\scriptsize \([0.0,41.7]\)}} & \makecell{\(0.0\) \\ {\scriptsize \([0.0,0.0]\)}} & \makecell{\(100.0\) \\ {\scriptsize \([100.0,100.0]\)}} \\
+GPT-OSS-20B & \makecell{\(91.7\) \\ {\scriptsize \([75.0,100.0]\)}} & \makecell{\(36.4\) \\ {\scriptsize \([9.1,66.7]\)}} & \makecell{\(0.0\) \\ {\scriptsize \([0.0,0.0]\)}} & \makecell{\(100.0\) \\ {\scriptsize \([100.0,100.0]\)}} \\
+\bottomrule
+\end{tabular*}
+\end{table}

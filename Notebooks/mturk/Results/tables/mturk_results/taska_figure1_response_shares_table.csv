@@ -1,0 +1,13 @@
+analysis_level,pair_role,label,count,share,ci_low,ci_high,tasks_used,tied_tasks_dropped
+Worker-level responses,Pre-spike,Truthful,16,0.064000,0.036000,0.096000,50,0
+Worker-level responses,Pre-spike,Deceptive,70,0.280000,0.204000,0.364000,50,0
+Worker-level responses,Pre-spike,Unclear,164,0.656000,0.571900,0.736000,50,0
+Worker-level responses,Spike,Truthful,14,0.056000,0.028000,0.088000,50,0
+Worker-level responses,Spike,Deceptive,157,0.628000,0.560000,0.696000,50,0
+Worker-level responses,Spike,Unclear,79,0.316000,0.252000,0.384000,50,0
+Example-level majority labels,Pre-spike,Truthful,0,0.000000,0.000000,0.000000,46,4
+Example-level majority labels,Pre-spike,Deceptive,12,0.260870,0.133333,0.395833,46,4
+Example-level majority labels,Pre-spike,Unclear,34,0.739130,0.604167,0.866667,46,4
+Example-level majority labels,Spike,Truthful,0,0.000000,0.000000,0.000000,47,3
+Example-level majority labels,Spike,Deceptive,37,0.787234,0.666667,0.895833,47,3
+Example-level majority labels,Spike,Unclear,10,0.212766,0.104167,0.333333,47,3

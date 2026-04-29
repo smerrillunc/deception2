@@ -11,6 +11,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.colors import LinearSegmentedColormap
 
 try:
     from IPython import get_ipython
@@ -24,11 +25,14 @@ except ImportError:  # pragma: no cover
 
 
 NOTEBOOK_DIR = Path(__file__).resolve().parent
-if str(NOTEBOOK_DIR) not in sys.path:
-    sys.path.insert(0, str(NOTEBOOK_DIR))
+STYLE_DIR = NOTEBOOK_DIR.parent / "styles"
+for search_path in (NOTEBOOK_DIR, STYLE_DIR):
+    if str(search_path) not in sys.path:
+        sys.path.insert(0, str(search_path))
 
 import ood_main3_consistency_precomputed_tables_lib as base_tables
 import ood_main3_consistency_scenario_tables_lib as scenario_tables
+from neurips import COLORS, FIGURE_SIZES, style_axes
 
 
 DEFAULT_RESULTS_ROOT = scenario_tables.DEFAULT_RESULTS_ROOT
@@ -54,12 +58,17 @@ GROUP_DISPLAY = {
     "grounding_transition": "Grounding transition",
     "concentration_transition": "Concentration transition",
 }
+ATTENTION_BLUE_SEQUENCE = [COLORS["blue"], "#5E83A5", "#86A6BF", "#B8C7E0"]
 GROUP_COLORS = {
-    "grounding": "#1d4ed8",
-    "concentration": "#d97706",
-    "grounding_transition": "#0f766e",
-    "concentration_transition": "#b91c1c",
+    "grounding": ATTENTION_BLUE_SEQUENCE[0],
+    "concentration": ATTENTION_BLUE_SEQUENCE[1],
+    "grounding_transition": ATTENTION_BLUE_SEQUENCE[2],
+    "concentration_transition": ATTENTION_BLUE_SEQUENCE[3],
 }
+ATTENTION_HEATMAP_CMAP = LinearSegmentedColormap.from_list(
+    "attention_feature_blues",
+    ["#F8FBFF", COLORS["light_gray"], ATTENTION_BLUE_SEQUENCE[2], ATTENTION_BLUE_SEQUENCE[0]],
+)
 
 BAND_ORDER = ["early", "mid", "late"]
 BAND_DISPLAY = {"early": "Early", "mid": "Mid", "late": "Late"}
@@ -93,17 +102,23 @@ PLOT_RC = {
     "font.serif": ["DejaVu Serif"],
     "axes.spines.top": False,
     "axes.spines.right": False,
-    "axes.edgecolor": "#111827",
+    "axes.edgecolor": COLORS["ink"],
     "axes.linewidth": 0.8,
-    "axes.labelcolor": "#111827",
-    "xtick.color": "#111827",
-    "ytick.color": "#111827",
-    "text.color": "#111827",
+    "axes.labelcolor": COLORS["ink"],
+    "xtick.color": COLORS["ink"],
+    "ytick.color": COLORS["ink"],
+    "text.color": COLORS["ink"],
     "axes.titleweight": "semibold",
+    "axes.prop_cycle": plt.cycler(color=ATTENTION_BLUE_SEQUENCE),
+    "grid.color": COLORS["grid"],
+    "grid.linewidth": 0.8,
+    "grid.alpha": 1.0,
     "axes.grid": False,
     "savefig.facecolor": "white",
     "figure.facecolor": "white",
     "axes.facecolor": "white",
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
 }
 
 RESULTS_MARKER = "/deception2/Results/"
@@ -117,6 +132,17 @@ COMBINED_TARGET_TITLE = "Average of truthful and deceptive commitment"
 
 
 pd.options.display.max_columns = 200
+
+
+def _set_panel_title(ax: plt.Axes, title: str) -> None:
+    ax.set_title(
+        title,
+        loc="left",
+        fontsize=PANEL_TITLE_FONTSIZE,
+        pad=PANEL_TITLE_PAD,
+        color=COLORS["ink"],
+        fontweight="semibold",
+    )
 
 
 def _is_notebook_shell() -> bool:
@@ -741,7 +767,8 @@ def plot_top_features_across_models(
     figure_height = max(5.8, 0.48 * top_k + 2.0)
 
     with plt.rc_context(PLOT_RC):
-        fig, axes = plt.subplots(1, n_models, figsize=(6.0 * n_models, figure_height), constrained_layout=True)
+        fig_width = max(FIGURE_SIZES["double"][0], 4.1 * n_models)
+        fig, axes = plt.subplots(1, n_models, figsize=(fig_width, figure_height), constrained_layout=True)
         axes_array = np.atleast_1d(axes)
 
         legend_handles: dict[str, Any] = {}
@@ -766,25 +793,34 @@ def plot_top_features_across_models(
                 100.0 * pd.to_numeric(feature_summary_df["mean_importance_share"], errors="coerce"),
                 xerr=100.0 * pd.to_numeric(feature_summary_df["se_importance_share"], errors="coerce").fillna(0.0),
                 color=colors,
-                edgecolor="none",
-                alpha=0.95,
-                error_kw={"ecolor": "#374151", "elinewidth": 1.0, "capsize": 2.0},
+                edgecolor=COLORS["light_gray"],
+                linewidth=0.7,
+                alpha=0.96,
+                error_kw={
+                    "ecolor": COLORS["ink"],
+                    "elinewidth": 1.05,
+                    "capsize": 3.0,
+                    "capthick": 1.05,
+                },
+                zorder=3,
             )
             ax.set_yticks(y_positions)
             ax.set_yticklabels([compact_feature_label(row) for _, row in feature_summary_df.iterrows()], fontsize=8.8)
-            ax.set_xlabel("Mean importance share (%)", fontsize=10)
+            style_axes(ax, xlabel="Mean importance share (%)", grid_axis="x")
             ax.set_xlim(0.0, 100.0 * max_share * 1.18)
-            ax.set_title(selection_heading_label(selection_row), fontsize=PANEL_TITLE_FONTSIZE, pad=PANEL_TITLE_PAD)
-            ax.grid(axis="x", alpha=0.20, linewidth=0.6)
+            _set_panel_title(ax, selection_heading_label(selection_row))
+            ax.tick_params(axis="y", length=0)
+            ax.tick_params(axis="x", labelsize=9)
             for row in feature_summary_df.itertuples(index=False):
                 group_name = _text_or_empty(getattr(row, "attention_feature_group", ""))
                 if group_name not in legend_handles:
                     legend_handles[group_name] = plt.Rectangle((0, 0), 1, 1, color=GROUP_COLORS.get(group_name, "#6b7280"))
 
-        legend_labels = [GROUP_DISPLAY.get(name, name) for name in legend_handles]
+        legend_order = [group_name for group_name in GROUP_ORDER if group_name in legend_handles]
+        legend_labels = [GROUP_DISPLAY.get(name, name) for name in legend_order]
         if legend_handles:
             fig.legend(
-                [legend_handles[name] for name in legend_handles],
+                [legend_handles[name] for name in legend_order],
                 legend_labels,
                 ncol=min(4, len(legend_handles)),
                 loc="lower center",
@@ -825,29 +861,37 @@ def plot_group_band_heatmaps_across_models(
     vmax = max(vmax, 1e-6)
 
     with plt.rc_context(PLOT_RC):
-        fig, axes = plt.subplots(1, n_models, figsize=(4.2 * n_models, 4.8), constrained_layout=True)
+        fig_width = max(FIGURE_SIZES["double_tall"][0], 3.7 * n_models)
+        fig, axes = plt.subplots(1, n_models, figsize=(fig_width, 4.8), constrained_layout=True)
         axes_array = np.atleast_1d(axes)
         image = None
         for ax, payload in zip(axes_array, payloads, strict=False):
             selection_row = payload["selection"]
             matrix_df = payload["group_band_df"].reindex(index=GROUP_ORDER, columns=BAND_ORDER).fillna(0.0)
             heat_values = 100.0 * matrix_df.to_numpy(dtype=float)
-            image = ax.imshow(heat_values, cmap="YlOrBr", vmin=0.0, vmax=100.0 * vmax, aspect="auto")
+            image = ax.imshow(heat_values, cmap=ATTENTION_HEATMAP_CMAP, vmin=0.0, vmax=100.0 * vmax, aspect="auto")
             ax.set_xticks(np.arange(len(BAND_ORDER)))
             ax.set_xticklabels([BAND_DISPLAY[band] for band in BAND_ORDER], fontsize=9)
             ax.set_yticks(np.arange(len(GROUP_ORDER)))
             ax.set_yticklabels([GROUP_DISPLAY[group_name] for group_name in GROUP_ORDER], fontsize=9)
-            ax.set_title(selection_heading_label(selection_row), fontsize=PANEL_TITLE_FONTSIZE, pad=PANEL_TITLE_PAD)
+            _set_panel_title(ax, selection_heading_label(selection_row))
+            label_threshold = 58.0 * vmax
             for row_idx in range(matrix_df.shape[0]):
                 for col_idx in range(matrix_df.shape[1]):
                     value = heat_values[row_idx, col_idx]
-                    text_color = "white" if value > 50.0 * vmax else "#111827"
+                    text_color = "white" if value > label_threshold else COLORS["ink"]
                     ax.text(col_idx, row_idx, f"{value:.1f}%", ha="center", va="center", fontsize=8.6, color=text_color)
             ax.set_xlabel("Layer band", fontsize=10)
             ax.set_ylabel("Attention family", fontsize=10)
+            ax.set_xticks(np.arange(-0.5, len(BAND_ORDER), 1), minor=True)
+            ax.set_yticks(np.arange(-0.5, len(GROUP_ORDER), 1), minor=True)
+            ax.grid(which="minor", color="white", linewidth=1.1)
+            ax.tick_params(which="minor", bottom=False, left=False)
+            ax.tick_params(axis="both", length=0)
 
         if image is not None:
-            fig.colorbar(image, ax=axes_array.ravel().tolist(), fraction=0.035, pad=0.03, label="Mean importance share (%)")
+            cbar = fig.colorbar(image, ax=axes_array.ravel().tolist(), fraction=0.035, pad=0.03, label="Mean importance share (%)")
+            cbar.outline.set_visible(False)
         out_path = save_figure(
             fig,
             export_root,

@@ -1182,6 +1182,45 @@ def _record_id(example: Dict[str, Any]) -> str:
     return f"{run_id}/line"
 
 
+def _example_output_path(out_dir: Path, example: Dict[str, Any]) -> Path:
+    safe_id = _record_id(example).replace("/", "_")
+    return out_dir / f"sentence_localization_{safe_id}.json"
+
+
+def _filter_pending_examples(
+    example_list: List[Dict[str, Any]],
+    *,
+    out_dir: Optional[Path],
+    overwrite: bool,
+) -> Tuple[List[Dict[str, Any]], int]:
+    if out_dir is None or overwrite:
+        return example_list, 0
+
+    pending_examples: List[Dict[str, Any]] = []
+    existing_outputs = 0
+    for example in example_list:
+        if _example_output_path(out_dir, example).exists():
+            existing_outputs += 1
+            continue
+        pending_examples.append(example)
+    return pending_examples, existing_outputs
+
+
+def _shard_examples(
+    example_list: List[Dict[str, Any]],
+    *,
+    shard_id: int,
+    num_shards: int,
+) -> List[Dict[str, Any]]:
+    if num_shards <= 1:
+        return example_list
+    return [
+        ex
+        for i, ex in enumerate(example_list)
+        if (i % num_shards) == shard_id
+    ]
+
+
 def _extract_raw_text(example: Dict[str, Any], text_field: str) -> Optional[str]:
     candidates = []
 
@@ -1254,6 +1293,15 @@ def main(argv=None):
     parser.add_argument("--overwrite", action="store_true", default=False)
     parser.add_argument("--shard_id", type=int, default=0)
     parser.add_argument("--num_shards", type=int, default=1)
+    parser.add_argument(
+        "--rebalance_pending_shards",
+        action="store_true",
+        default=False,
+        help=(
+            "When resuming with --out_dir, exclude already-written outputs before "
+            "assigning shard membership so the remaining work is spread more evenly."
+        ),
+    )
     parser.add_argument("--log_every", type=int, default=25)
     parser.add_argument("--flush_every", type=int, default=1)
     parser.add_argument("--text_field", type=str, default="action_reasoning")
@@ -1287,13 +1335,30 @@ def main(argv=None):
     example_list = [e for e in example_list if keep_record_for_label_filter(e, label_filter)]
     if args.limit:
         example_list = example_list[: args.limit]
+    total_candidate_examples = len(example_list)
 
-    if args.num_shards > 1:
-        example_list = [
-            ex
-            for i, ex in enumerate(example_list)
-            if (i % args.num_shards) == args.shard_id
-        ]
+    if args.rebalance_pending_shards:
+        if out_dir is None:
+            print("Ignoring --rebalance_pending_shards because --out_dir is not set.", flush=True)
+        elif args.overwrite:
+            print("Ignoring --rebalance_pending_shards because --overwrite was requested.", flush=True)
+        else:
+            example_list, existing_outputs = _filter_pending_examples(
+                example_list,
+                out_dir=out_dir,
+                overwrite=args.overwrite,
+            )
+            print(
+                "Pending-aware sharding: "
+                f"{len(example_list)} pending / {total_candidate_examples} total examples "
+                f"({existing_outputs} already localized)."
+            , flush=True)
+
+    example_list = _shard_examples(
+        example_list,
+        shard_id=args.shard_id,
+        num_shards=args.num_shards,
+    )
 
     total_examples = len(example_list)
     print(
@@ -1340,8 +1405,7 @@ def main(argv=None):
 
         out_path = None
         if out_dir:
-            safe_id = example_id.replace("/", "_")
-            out_path = out_dir / f"sentence_localization_{safe_id}.json"
+            out_path = _example_output_path(out_dir, ex)
             if out_path.exists() and not args.overwrite:
                 continue
 

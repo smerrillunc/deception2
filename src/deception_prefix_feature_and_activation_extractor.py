@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -138,6 +139,43 @@ def resolve_cuda_index(device: str) -> int:
     raise ValueError(f"8-bit loading requires a CUDA device, got: {device}")
 
 
+def resolve_requested_device_map(device_map_arg: str) -> Optional[str]:
+    value = str(device_map_arg).strip().lower()
+    if value in {"", "single", "none"}:
+        return None
+    return str(device_map_arg).strip()
+
+
+def infer_model_input_device(model: Any, fallback_device: str) -> str:
+    try:
+        for parameter in model.parameters():
+            param_device = getattr(parameter, "device", None)
+            if param_device is None or str(param_device) == "meta":
+                continue
+            return str(param_device)
+    except Exception:  # noqa: BLE001
+        pass
+
+    hf_device_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_device_map, dict):
+        for target in hf_device_map.values():
+            if isinstance(target, int):
+                return f"cuda:{int(target)}"
+            if isinstance(target, str) and target not in {"cpu", "disk", "meta"}:
+                return str(target)
+
+    return str(fallback_device)
+
+
+def summarize_hf_device_map(model: Any) -> str:
+    hf_device_map = getattr(model, "hf_device_map", None)
+    if not isinstance(hf_device_map, dict) or not hf_device_map:
+        return "single-device"
+    counts = Counter(str(target) for target in hf_device_map.values())
+    summary_parts = [f"{target}={count}" for target, count in sorted(counts.items())]
+    return ", ".join(summary_parts)
+
+
 def build_quant_config(*, load_in_8bit: bool, device: str) -> BitsAndBytesConfig | None:
     if not load_in_8bit:
         return None
@@ -162,7 +200,14 @@ def infer_repo_quant_method(model_id: str, *, trust_remote_code: bool) -> Option
     return str(quant_method) if quant_method else None
 
 
-def build_model_load_kwargs(*, args: argparse.Namespace, device: str, model_dtype: torch.dtype, load_in_8bit: bool) -> dict[str, Any]:
+def build_model_load_kwargs(
+    *,
+    args: argparse.Namespace,
+    device: str,
+    model_dtype: torch.dtype,
+    load_in_8bit: bool,
+    requested_device_map: Optional[str],
+) -> dict[str, Any]:
     model_kwargs: dict[str, Any] = {
         "low_cpu_mem_usage": True,
         "attn_implementation": args.attn_implementation,
@@ -171,10 +216,12 @@ def build_model_load_kwargs(*, args: argparse.Namespace, device: str, model_dtyp
     quant_config = build_quant_config(load_in_8bit=bool(load_in_8bit), device=device)
     if quant_config is not None:
         model_kwargs["quantization_config"] = quant_config
-        model_kwargs["device_map"] = {"": resolve_cuda_index(device)}
+        model_kwargs["device_map"] = requested_device_map if requested_device_map is not None else {"": resolve_cuda_index(device)}
         model_kwargs["torch_dtype"] = model_dtype
     else:
         model_kwargs["torch_dtype"] = model_dtype
+        if requested_device_map is not None:
+            model_kwargs["device_map"] = requested_device_map
     return model_kwargs
 
 
@@ -201,6 +248,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--model-id", type=str, default=None, help="HF model id. Defaults to value inferred from examples.jsonl.")
     parser.add_argument("--device", type=str, default="auto", help="Device to run on: auto, cpu, cuda, or cuda:<idx>.")
+    parser.add_argument(
+        "--device-map",
+        type=str,
+        default="single",
+        help=(
+            "How to place model weights. Use 'single' (default) to keep the model on one device, "
+            "or a Transformers device_map string such as 'auto', 'balanced', 'balanced_low_0', or 'sequential'."
+        ),
+    )
     parser.add_argument(
         "--dtype",
         type=str,
@@ -773,13 +829,15 @@ def compute_attention_metric_tensors(
     num_layers = len(attentions)
     num_heads = int(attentions[0].shape[1])
     metric_tensors = {
-        name: torch.full((num_layers, num_heads), float("nan"), device=attentions[0].device, dtype=torch.float32)
+        name: np.full((num_layers, num_heads), np.nan, dtype=np.float32)
         for name in ATTENTION_METRIC_NAMES
     }
 
     for layer_idx, layer_attn in enumerate(attentions):
-        layer = layer_attn[0].to(dtype=torch.float32)
-        query_attn = layer[:, q_idx, : end_token + 1]
+        layer = layer_attn[0]
+        # Only the single query row is needed for the sentence metrics, so avoid
+        # upcasting the full [heads, seq, seq] attention map to float32 on GPU.
+        query_attn = layer[:, q_idx, : end_token + 1].to(dtype=torch.float32)
 
         full_slice = query_attn
         prior_slice = query_attn[:, :start_token]
@@ -802,8 +860,9 @@ def compute_attention_metric_tensors(
         recent_ptm = _per_token_mass(recent_mass, int(recent_slice.shape[1]))
         early_ptm = _per_token_mass(early_mass, int(early_slice.shape[1]))
 
-        metric_tensors["current_vs_prior"][layer_idx] = _ratio_from_per_token_mass(current_ptm, prior_ptm)
-        metric_tensors["current_vs_prev"][layer_idx] = _ratio_from_per_token_mass(current_ptm, prev_ptm)
+        layer_metrics: dict[str, torch.Tensor] = {}
+        layer_metrics["current_vs_prior"] = _ratio_from_per_token_mass(current_ptm, prior_ptm)
+        layer_metrics["current_vs_prev"] = _ratio_from_per_token_mass(current_ptm, prev_ptm)
         current_vs_prev3 = torch.full_like(current_mass, float("nan"), dtype=torch.float32)
         total_prev3 = current_mass + prev3_mass
         valid_prev3 = total_prev3 > 0
@@ -812,28 +871,31 @@ def compute_attention_metric_tensors(
             min=0.0,
             max=1.0,
         )
-        metric_tensors["current_vs_prev3"][layer_idx] = current_vs_prev3
-        metric_tensors["recent_vs_early"][layer_idx] = _ratio_from_per_token_mass(recent_ptm, early_ptm)
+        layer_metrics["current_vs_prev3"] = current_vs_prev3
+        layer_metrics["recent_vs_early"] = _ratio_from_per_token_mass(recent_ptm, early_ptm)
 
         prev_share = torch.full_like(prev_mass, float("nan"), dtype=torch.float32)
         valid_prior = prior_mass > 0
         prev_share[valid_prior] = torch.clamp(prev_mass[valid_prior] / (prior_mass[valid_prior] + EPS), min=0.0, max=1.0)
-        metric_tensors["prev_share_of_prior"][layer_idx] = prev_share
+        layer_metrics["prev_share_of_prior"] = prev_share
 
         current_share_total = torch.full_like(current_mass, float("nan"), dtype=torch.float32)
         total_mass = current_mass + prior_mass
         valid_total = total_mass > 0
         current_share_total[valid_total] = torch.clamp(current_mass[valid_total] / (total_mass[valid_total] + EPS), min=0.0, max=1.0)
-        metric_tensors["current_share_total"][layer_idx] = current_share_total
+        layer_metrics["current_share_total"] = current_share_total
 
-        metric_tensors["entropy_prior"][layer_idx] = _normalized_entropy(prior_slice)
-        metric_tensors["entropy_full"][layer_idx] = _normalized_entropy(full_slice)
-        metric_tensors["top1_prior"][layer_idx] = _topk_mass(prior_slice, 1)
-        metric_tensors["top5_prior"][layer_idx] = _topk_mass(prior_slice, 5)
-        metric_tensors["herfindahl_prior"][layer_idx] = _herfindahl(prior_slice)
-        metric_tensors["effective_support_prior"][layer_idx] = _effective_support(prior_slice)
+        layer_metrics["entropy_prior"] = _normalized_entropy(prior_slice)
+        layer_metrics["entropy_full"] = _normalized_entropy(full_slice)
+        layer_metrics["top1_prior"] = _topk_mass(prior_slice, 1)
+        layer_metrics["top5_prior"] = _topk_mass(prior_slice, 5)
+        layer_metrics["herfindahl_prior"] = _herfindahl(prior_slice)
+        layer_metrics["effective_support_prior"] = _effective_support(prior_slice)
 
-    return {name: tensor.detach().cpu().numpy() for name, tensor in metric_tensors.items()}
+        for metric_name, metric_value in layer_metrics.items():
+            metric_tensors[metric_name][layer_idx] = metric_value.detach().to(device="cpu", dtype=torch.float32).numpy()
+
+    return metric_tensors
 
 
 def compute_activation_scalars_for_row(last_hidden_np: np.ndarray, sentence_row: Any, *, num_prefix_sentences: int) -> dict[str, float]:
@@ -1013,7 +1075,7 @@ def extract_example_outputs(
     example: dict[str, Any],
     tokenizer: Any,
     base_model: Any,
-    device: str,
+    model_input_device: str,
     recent_window_tokens: int,
     num_prefix_sentences: int,
     max_input_tokens: int,
@@ -1100,7 +1162,7 @@ def extract_example_outputs(
         }
         return empty_feature_df, empty_batch, num_layers
 
-    input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=device)
+    input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=model_input_device)
     try:
         with torch.no_grad():
             base_outputs = base_model(
@@ -1144,6 +1206,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     model_id = infer_model_id(dataset_paths, args.model_id)
     device, gpu_df = resolve_device(args.device)
     model_dtype = resolve_dtype(args.dtype, device)
+    requested_device_map = resolve_requested_device_map(str(args.device_map))
     repo_quant_method = infer_repo_quant_method(model_id, trust_remote_code=args.trust_remote_code)
     effective_load_in_8bit = bool(args.load_in_8bit)
     if effective_load_in_8bit and repo_quant_method and repo_quant_method != "bitsandbytes":
@@ -1182,11 +1245,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        **build_model_load_kwargs(args=args, device=device, model_dtype=model_dtype, load_in_8bit=effective_load_in_8bit),
+        **build_model_load_kwargs(
+            args=args,
+            device=device,
+            model_dtype=model_dtype,
+            load_in_8bit=effective_load_in_8bit,
+            requested_device_map=requested_device_map,
+        ),
     )
-    if not effective_load_in_8bit:
+    model_is_dispatched = requested_device_map is not None or effective_load_in_8bit
+    if not model_is_dispatched:
         model.to(device)
     model.eval()
+    model_input_device = infer_model_input_device(model, device)
     base_model = model.base_model
     num_layers = int(getattr(base_model.config, "num_hidden_layers", getattr(model.config, "num_hidden_layers", 0)))
     ordered_columns = list(METADATA_COLUMNS) + build_feature_columns(num_layers)
@@ -1216,6 +1287,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"Activation output: {outputs.activation_output}")
     print(f"Model id: {model_id}")
     print(f"Device: {device}")
+    print(f"Requested device map: {requested_device_map or 'single'}")
+    print(f"Resolved device map: {summarize_hf_device_map(model)}")
+    print(f"Model input device: {model_input_device}")
     print(f"Model dtype: {model_dtype}")
     print(f"Repo quantization method: {repo_quant_method or 'none'}")
     print(f"8-bit quantization: {'enabled' if effective_load_in_8bit else 'disabled'}")
@@ -1252,7 +1326,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     example=example,
                     tokenizer=tokenizer,
                     base_model=base_model,
-                    device=device,
+                    model_input_device=model_input_device,
                     recent_window_tokens=int(args.recent_window_tokens),
                     num_prefix_sentences=num_prefix_sentences,
                     max_input_tokens=int(args.max_input_tokens),

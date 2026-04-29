@@ -1,0 +1,6 @@
+{
+  "description": "Task B qwen14b | bs",
+  "cache_path": "/playpen-ssd/smerrill/deception2/Notebooks/mturk_outputs/cache/taskb_mining/taskb/taskb__qwen14b__bs__thr0p5__sentmin5__sentmax12__oneper0__maxall.jsonl",
+  "n_rows": 1,
+  "built_at_unix": 1776979326.502151
+}

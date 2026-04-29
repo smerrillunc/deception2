@@ -1,0 +1,6 @@
+env_name,env_dirname,model_dirname,total_examples,label_examples,short_label_examples
+AdvisorAudit,advisor_audit,DeepSeek-R1-Distill-Qwen-7B,5000,2500,42
+BS,bs,DeepSeek-R1-Distill-Qwen-7B,5000,2500,14
+CarSales,car_sales,DeepSeek-R1-Distill-Qwen-7B,5000,2500,1547
+Gridworld,gridworld,DeepSeek-R1-Distill-Qwen-7B,5000,2500,1125
+Interview,interview,DeepSeek-R1-Distill-Qwen-7B,5000,2500,867

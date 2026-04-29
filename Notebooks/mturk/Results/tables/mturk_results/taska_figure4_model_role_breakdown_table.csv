@@ -1,0 +1,17 @@
+metric,model,pair_role,count,value,ci_low,ci_high
+Unclear rate,Qwen-7B,Pre-spike,65,0.584615,0.415385,0.753846
+Unclear rate,Qwen-7B,Spike,65,0.123077,0.061538,0.200000
+Unclear rate,Qwen-14B,Pre-spike,65,0.723077,0.569231,0.861538
+Unclear rate,Qwen-14B,Spike,65,0.353846,0.230769,0.492308
+Unclear rate,Llama-8B,Pre-spike,60,0.516667,0.333333,0.700000
+Unclear rate,Llama-8B,Spike,60,0.350000,0.233333,0.466667
+Unclear rate,GPT-OSS-20B,Pre-spike,60,0.800000,0.666667,0.916667
+Unclear rate,GPT-OSS-20B,Spike,60,0.450000,0.333333,0.566667
+Worker accuracy,Qwen-7B,Pre-spike,27,0.148148,0.040000,0.272727
+Worker accuracy,Qwen-7B,Spike,57,0.912281,0.827586,0.982456
+Worker accuracy,Qwen-14B,Pre-spike,18,0.055556,0.000000,0.166667
+Worker accuracy,Qwen-14B,Spike,42,0.904762,0.815789,0.977778
+Worker accuracy,Llama-8B,Pre-spike,29,0.206897,0.066667,0.400000
+Worker accuracy,Llama-8B,Spike,39,0.948718,0.853659,1.000000
+Worker accuracy,GPT-OSS-20B,Pre-spike,12,0.416667,0.100000,0.857143
+Worker accuracy,GPT-OSS-20B,Spike,33,0.909091,0.812500,1.000000

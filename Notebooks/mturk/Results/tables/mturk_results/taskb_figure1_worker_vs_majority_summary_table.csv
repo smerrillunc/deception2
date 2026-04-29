@@ -1,0 +1,5 @@
+metric,level,tasks_total,tasks_used,tied_tasks_dropped,numerator_count,denominator_count,value,ci_low,ci_high
+Unclear rate,Worker-level,100,100,0,171,500,0.342000,0.289950,0.398000
+Unclear rate,Majority-vote,100,95,5,32,95,0.336842,0.244681,0.432990
+Localization accuracy,Worker-level,100,100,0,255,329,0.775076,0.716922,0.829737
+Localization accuracy,Majority-vote,100,95,5,61,63,0.968254,0.919355,1.000000

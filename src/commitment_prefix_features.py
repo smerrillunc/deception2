@@ -16,7 +16,6 @@ from attention_features import (
     ExampleValidationError,
     StreamingParquetWriter,
     add_span_match_columns,
-    align_localized_sentences_to_tokens,
     build_localized_sentence_df,
     cleanup_tensors,
     infer_model_id,
@@ -25,6 +24,7 @@ from attention_features import (
     maybe_raise_runtime_error,
     resolve_device,
     resolve_dtype,
+    tokenize_and_align_localized_sentences,
 )
 
 
@@ -194,10 +194,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Pass trust_remote_code=True to the tokenizer, config, and model loaders.",
     )
     parser.add_argument(
+        "--recent-window-sentences",
         "--recent-window-tokens",
+        dest="recent_window_sentences",
         type=int,
         default=DEFAULT_RECENT_WINDOW_TOKENS,
-        help="Number of trailing prefix tokens to treat as the recent prefix window.",
+        help="Number of recent sentences to treat as the recent prefix window.",
     )
     parser.add_argument(
         "--feature-set",
@@ -506,7 +508,8 @@ def add_trace_region_columns(aligned_sentence_df: pd.DataFrame, *, recent_window
             previous_sentence_end_tokens.append(prev_end)
             previous_sentence_token_counts.append(prev_end - prev_start + 1)
 
-        recent_start = max(0, end_token + 1 - int(recent_window_tokens))
+        recent_start_sentence_idx = max(0, row_idx - int(recent_window_tokens) + 1)
+        recent_start = int(df.iloc[recent_start_sentence_idx]["start_token"])
         recent_token_counts.append(end_token + 1 - recent_start)
         early_token_counts.append(recent_start)
 
@@ -547,7 +550,8 @@ def _compute_state_cache(hidden_states: Sequence[torch.Tensor], aligned_sentence
 
     for row_idx, row in enumerate(aligned_sentence_df.itertuples()):
         end_token = int(row.end_token)
-        recent_start = max(0, end_token + 1 - int(recent_window_tokens))
+        recent_start_sentence_idx = max(0, row_idx - int(recent_window_tokens) + 1)
+        recent_start = int(aligned_sentence_df.iloc[recent_start_sentence_idx]["start_token"])
         q_idx = torch.tensor(row.token_indices, device=hidden_states[0].device, dtype=torch.long)
 
         for layer_idx, layer_hidden in enumerate(hidden_states):
@@ -980,13 +984,17 @@ def extract_example_feature_df(
             f"{example_id} has {bad_count} localized sentence spans that do not match raw_text.",
         )
 
-    tokenized = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
-    input_ids_list = tokenized["input_ids"]
-    offsets = tokenized["offset_mapping"]
+    token_alignment = tokenize_and_align_localized_sentences(
+        tokenizer=tokenizer,
+        full_text=full_text,
+        sentence_df=localized_sentence_df,
+        raw_text_start_char=0,
+    )
+    input_ids_list = token_alignment.input_ids
     if not input_ids_list:
         raise ExampleValidationError("no_tokens", f"{example_id} tokenized to zero tokens.")
 
-    aligned_sentence_df = align_localized_sentences_to_tokens(offsets, localized_sentence_df)
+    aligned_sentence_df = token_alignment.aligned_sentence_df
     if not (aligned_sentence_df["token_count"] > 0).all():
         bad_count = int((aligned_sentence_df["token_count"] == 0).sum())
         raise ExampleValidationError(
@@ -1113,7 +1121,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         f"{base_feature_count} base + {change_feature_count} transition + {normalized_feature_count} within-trace "
         f"= {len(ordered_columns) - len(METADATA_COLUMNS)}"
     )
-    print(f"Recent window tokens: {int(args.recent_window_tokens)}")
+    print(f"Recent window sentences: {int(args.recent_window_sentences)}")
     if state_cache_dir is not None:
         print(f"State cache dir: {state_cache_dir}")
     if not gpu_df.empty:
@@ -1132,7 +1140,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     tokenizer=tokenizer,
                     model=model,
                     device=device,
-                    recent_window_tokens=int(args.recent_window_tokens),
+                    recent_window_tokens=int(args.recent_window_sentences),
                     num_layers=num_layers,
                     state_cache_dir=state_cache_dir,
                     feature_set=args.feature_set,

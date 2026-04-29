@@ -924,6 +924,10 @@ def _normalize_commitment_text(text: Any) -> str:
     return ap.normalize_sentence_for_compare(str(text or ""))
 
 
+def _count_alpha_words(text: Any) -> int:
+    return len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", str(text or "")))
+
+
 def _is_usable_commitment_text(text: Any) -> bool:
     clean = str(text or "").strip()
     if not clean:
@@ -943,6 +947,9 @@ def load_commitment_pairs(
     min_commitment_delta: float,
     min_commitment_deception_rate: float,
     min_donor_clarity_score: float,
+    min_num_valid: int = 0,
+    min_sentence_alpha_words: int = 0,
+    exclude_multiline_sentences: bool = False,
     disable_tqdm: bool,
 ) -> pd.DataFrame:
     pair_cache_path = Path(pair_cache_path).expanduser().resolve()
@@ -984,8 +991,26 @@ def load_commitment_pairs(
         shared_context_text = str(row.get("shared_context_text", ""))
         deceptive_sentence = str(row.get("deceptive_commitment_sentence", ""))
         truthful_sentence = str(row.get("truthful_donor_sentence", ""))
+        try:
+            shared_context_num_valid = int(row.get("shared_context_num_valid"))
+            deceptive_prefix_num_valid = int(row.get("deceptive_prefix_num_valid"))
+        except Exception:
+            shared_context_num_valid = -1
+            deceptive_prefix_num_valid = -1
         if not prompt or not shared_context_text:
             continue
+        if int(min_num_valid) > 0:
+            if shared_context_num_valid < int(min_num_valid) or deceptive_prefix_num_valid < int(min_num_valid):
+                continue
+        if bool(exclude_multiline_sentences):
+            if "\n" in deceptive_sentence or "\n" in truthful_sentence:
+                continue
+        if int(min_sentence_alpha_words) > 0:
+            if (
+                _count_alpha_words(deceptive_sentence) < int(min_sentence_alpha_words)
+                or _count_alpha_words(truthful_sentence) < int(min_sentence_alpha_words)
+            ):
+                continue
         if not _is_usable_commitment_text(deceptive_sentence) or not _is_usable_commitment_text(truthful_sentence):
             continue
         if _normalize_commitment_text(deceptive_sentence) == _normalize_commitment_text(truthful_sentence):

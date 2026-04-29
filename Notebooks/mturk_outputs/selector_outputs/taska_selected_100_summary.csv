@@ -1,0 +1,9 @@
+model_id,environment,pair_role,n_rows,n_pairs,mean_spike_delta
+gptoss,bs,pre_spike,12,12,0.8197619047619047
+gptoss,bs,spike,12,12,0.8197619047619047
+llama8b,bs,pre_spike,12,12,0.7341666666666667
+llama8b,bs,spike,12,12,0.7341666666666667
+qwen14b,bs,pre_spike,13,13,0.62
+qwen14b,bs,spike,13,13,0.62
+qwen7b,bs,pre_spike,13,13,0.696043956043956
+qwen7b,bs,spike,13,13,0.696043956043956

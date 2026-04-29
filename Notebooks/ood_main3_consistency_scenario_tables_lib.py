@@ -286,7 +286,10 @@ def infer_requested_feature_sizes(metrics_df: pd.DataFrame) -> list[int]:
         match = re.fullmatch(r"k(\d+)", label.strip().lower())
         if match is not None:
             sizes.add(int(match.group(1)))
-    return sorted(sizes)
+    if sizes:
+        return sorted(sizes)
+    numeric_sizes = pd.to_numeric(_series_or_empty(metrics_df, "feature_size"), errors="coerce").dropna()
+    return sorted({int(size) for size in numeric_sizes.tolist()})
 
 
 def model_sort_key(model_name: str) -> tuple[int, str]:
@@ -337,6 +340,15 @@ def target_rows(metrics_df: pd.DataFrame) -> list[tuple[str, str]]:
     return rows
 
 
+def _is_size_agnostic_feature_label(feature_size_label: str) -> bool:
+    return (
+        feature_size_label == ""
+        or feature_size_label == "raw_final"
+        or feature_size_label == "sentence_structure"
+        or feature_size_label.startswith("tfidf_")
+    )
+
+
 def _family_requested_size_mask(
     metrics_df: pd.DataFrame,
     *,
@@ -351,7 +363,7 @@ def _family_requested_size_mask(
     if family_name == "attention_only":
         return pd.Series(True, index=metrics_df.index)
     if family_name == "baseline":
-        return labels.eq("raw_final") | labels.eq("") | numeric_sizes.isna()
+        return labels.map(_is_size_agnostic_feature_label) | numeric_sizes.isna()
     return labels.eq(requested_label) | numeric_sizes.eq(requested_numeric)
 
 
@@ -657,7 +669,11 @@ def _feature_requested_size_mask(
     if canonical_feature_set.startswith("Attention only"):
         return labels.eq("all_attention") | labels.eq("")
     if canonical_feature_set == "Baseline (Activation only: raw)":
-        return labels.eq("raw_final") | labels.eq("") | numeric_sizes.isna()
+        return labels.map(_is_size_agnostic_feature_label) | numeric_sizes.isna()
+    if canonical_feature_set == "Baseline: sentence structure":
+        return labels.map(_is_size_agnostic_feature_label) | numeric_sizes.isna()
+    if canonical_feature_set.startswith("Baseline: TF-IDF"):
+        return labels.map(_is_size_agnostic_feature_label) | numeric_sizes.isna()
     return labels.eq(requested_label) | numeric_sizes.eq(requested_numeric)
 
 
@@ -1586,6 +1602,9 @@ def render_scenario_notebook(
     results_root: Path | None = None,
     show_heatmaps: bool = True,
     save_heatmaps: bool = False,
+    feature_order: list[str] | None = None,
+    feature_group_specs: list[tuple[str, list[str]]] | None = None,
+    include_attention_ablation: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     resolved_results_root = (
         Path(os.environ.get("OOD_MAIN3_SCENARIO_RESULTS_ROOT", str(DEFAULT_RESULTS_ROOT))).expanduser().resolve()
@@ -1594,6 +1613,8 @@ def render_scenario_notebook(
     )
     resolved_scenario_title = scenario_title or SCENARIO_TITLE_OVERRIDES.get(scenario_name, scenario_name)
     requested_feature_sizes = [64, 128, 256] if requested_feature_sizes is None else list(requested_feature_sizes)
+    feature_order = SCENARIO_FEATURE_ORDER if feature_order is None else list(feature_order)
+    feature_group_specs = FEATURE_GROUP_SPECS if feature_group_specs is None else list(feature_group_specs)
     heatmap_export_dir = resolved_results_root / "notebook_exports" / scenario_name
 
     inventory_df, panel_df, model_df, metrics_df = load_scenario_bundle_frames(
@@ -1608,7 +1629,10 @@ def render_scenario_notebook(
     available_sizes = sorted(
         set(pd.to_numeric(_series_or_empty(panel_df, "requested_feature_size"), errors="coerce").dropna().astype(int).tolist())
     )
-    selected_sizes = [size for size in requested_feature_sizes if size in available_sizes] or available_sizes
+    if available_sizes:
+        selected_sizes = [size for size in requested_feature_sizes if size in available_sizes] or available_sizes
+    else:
+        selected_sizes = list(requested_feature_sizes)
     available_target_rows = target_rows(metrics_df)
 
     md("## Bundle Inventory")
@@ -1635,6 +1659,7 @@ def render_scenario_notebook(
                 scenario_name=scenario_name,
                 target_name=target_name,
                 requested_feature_size=requested_feature_size,
+                feature_order=feature_order,
             )
             if split_metrics_df.empty:
                 continue
@@ -1657,17 +1682,18 @@ def render_scenario_notebook(
                 split_metrics_df,
                 ood_column="OOD AUROC",
                 validation_column="Validation AUROC",
+                feature_order=feature_order,
             )
             aggregated_markdown_df = build_transposed_combined_metric_table(
                 aggregated_ood_stats_df,
                 style="markdown",
-                feature_order=SCENARIO_FEATURE_ORDER,
+                feature_order=feature_order,
                 bold_best=True,
             )
             aggregated_latex_df = build_transposed_combined_metric_table(
                 aggregated_ood_stats_df,
                 style="latex",
-                feature_order=SCENARIO_FEATURE_ORDER,
+                feature_order=feature_order,
                 bold_best=True,
             )
             panel_title = PANEL_TITLE_OVERRIDES.get(target_name, target_title)
@@ -1680,17 +1706,20 @@ def render_scenario_notebook(
                 render_latex_feature_table(
                     aggregated_latex_df,
                     panel_title=f"{panel_title} | PCA size {requested_feature_size}",
-                    feature_order=SCENARIO_FEATURE_ORDER,
-                    feature_group_specs=FEATURE_GROUP_SPECS,
+                    feature_order=feature_order,
+                    feature_group_specs=feature_group_specs,
                 )
             )
 
             if scenario_name == "holdout_env_ood":
-                holdout_detail_df = build_holdout_split_detail_table(detail_metrics_df)
+                holdout_detail_df = build_holdout_split_detail_table(
+                    detail_metrics_df,
+                    feature_order=feature_order,
+                )
                 holdout_detail_df = transpose_detail_table(
                     holdout_detail_df,
                     id_columns=["Training Split", "Held-Out Environment"],
-                    feature_order=SCENARIO_FEATURE_ORDER,
+                    feature_order=feature_order,
                 )
                 md("#### 3. Split-Level AUROC Table (Markdown)")
                 md(render_simple_markdown_table(_detail_table_for_style(holdout_detail_df, style="markdown")))
@@ -1699,17 +1728,23 @@ def render_scenario_notebook(
                     render_simple_latex_table(_detail_table_for_style(holdout_detail_df, style="latex"))
                 )
             else:
-                validation_detail_df = build_single_source_validation_detail_table(split_metrics_df)
+                validation_detail_df = build_single_source_validation_detail_table(
+                    split_metrics_df,
+                    feature_order=feature_order,
+                )
                 validation_detail_df = transpose_detail_table(
                     validation_detail_df,
                     id_columns=["Training Source"],
-                    feature_order=SCENARIO_FEATURE_ORDER,
+                    feature_order=feature_order,
                 )
-                ood_detail_df = build_single_source_ood_by_environment_table(detail_metrics_df)
+                ood_detail_df = build_single_source_ood_by_environment_table(
+                    detail_metrics_df,
+                    feature_order=feature_order,
+                )
                 ood_detail_df = transpose_detail_table(
                     ood_detail_df,
                     id_columns=["Evaluation Environment"],
-                    feature_order=SCENARIO_FEATURE_ORDER,
+                    feature_order=feature_order,
                 )
                 md("#### 3. AUROC By Training Source (Markdown)")
                 md(render_simple_markdown_table(_detail_table_for_style(validation_detail_df, style="markdown")))
@@ -1729,7 +1764,7 @@ def render_scenario_notebook(
 
         attention_panel_title = PANEL_TITLE_OVERRIDES.get(target_name, target_title)
         attention_requested_feature_size = selected_sizes[0] if selected_sizes else None
-        if attention_requested_feature_size is not None:
+        if include_attention_ablation and attention_requested_feature_size is not None:
             attention_split_metrics_df, attention_detail_metrics_df = build_feature_metric_rows(
                 metrics_df,
                 scenario_name=scenario_name,

@@ -1,0 +1,27 @@
+{
+  "taska_input_path": "/playpen-ssd/smerrill/deception2/Notebooks/mturk_outputs/taska.csv",
+  "taskb_input_path": "/playpen-ssd/smerrill/deception2/Notebooks/mturk_outputs/taskb.csv",
+  "openai_model_name": "gpt-4o-mini",
+  "openai_api_mode": "auto",
+  "openai_base_url": null,
+  "taska_target_pairs": 50,
+  "taska_target_rows": 100,
+  "taska_min_pairs_per_model": 10,
+  "taska_model_pair_targets": {
+    "qwen7b": 13,
+    "qwen14b": 13,
+    "llama8b": 12,
+    "gptoss": 12
+  },
+  "taskb_target_rows": 100,
+  "taskb_model_row_targets": {
+    "qwen7b": 25,
+    "qwen14b": 25,
+    "llama8b": 25,
+    "gptoss": 25
+  },
+  "overwrite_llm_cache": false,
+  "taska_llm_limit": 0,
+  "taskb_llm_limit": 0,
+  "sleep_seconds_between_calls": 0.0
+}

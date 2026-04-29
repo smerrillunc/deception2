@@ -6,6 +6,7 @@ import json
 import math
 import re
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
@@ -252,8 +253,21 @@ def _compute_downstream_attention_features(
             downstream_token_counts.append(0)
 
     input_ids = input_ids.unsqueeze(0).to(device)
+    autocast_context = nullcontext()
+    if str(device).startswith("cuda"):
+        model_dtype = None
+        try:
+            for param in model.parameters():
+                if param.is_floating_point():
+                    model_dtype = param.dtype
+                    break
+        except Exception:
+            model_dtype = None
+        if model_dtype in {torch.float16, torch.bfloat16}:
+            autocast_context = torch.autocast(device_type="cuda", dtype=model_dtype)
     with torch.no_grad():
-        outputs = model(input_ids, output_attentions=True, use_cache=False)
+        with autocast_context:
+            outputs = model(input_ids, output_attentions=True, use_cache=False)
     attn_layers = outputs.attentions
 
     if not attn_layers:

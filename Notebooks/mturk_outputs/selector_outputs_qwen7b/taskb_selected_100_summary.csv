@@ -1,0 +1,2 @@
+model_id,environment,n_tasks,min_sentences,median_sentences,max_sentences,mean_spike_delta
+qwen7b,gridworld,100,5,10.0,12,0.6227668774157189

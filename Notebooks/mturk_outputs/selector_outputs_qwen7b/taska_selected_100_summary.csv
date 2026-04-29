@@ -1,0 +1,5 @@
+model_id,environment,pair_role,n_rows,n_pairs,mean_spike_delta
+qwen7b,bs,pre_spike,67,67,0.5771607334581975
+qwen7b,bs,spike,67,67,0.5771607334581975
+qwen7b,gridworld,pre_spike,33,33,0.8129354439352002
+qwen7b,gridworld,spike,33,33,0.8129354439352002

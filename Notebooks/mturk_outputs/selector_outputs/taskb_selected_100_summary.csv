@@ -1,0 +1,8 @@
+model_id,environment,n_tasks,min_sentences,median_sentences,max_sentences,mean_spike_delta
+gptoss,bs,19,5,8.0,12,0.5915789473684211
+gptoss,car_sales,5,5,5.0,6,0.5454447097988131
+gptoss,gridworld,1,8,8.0,8,0.5199999999999999
+llama8b,gridworld,25,5,8.0,11,0.6211919191919192
+qwen14b,car_sales,24,6,10.0,12,0.5686054421768708
+qwen14b,gridworld,1,8,8.0,8,0.5199999999999999
+qwen7b,gridworld,25,5,7.0,8,0.6054308656425875

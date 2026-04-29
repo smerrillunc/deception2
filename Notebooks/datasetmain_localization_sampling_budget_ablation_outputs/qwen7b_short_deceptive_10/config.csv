@@ -1,0 +1,17 @@
+setting,value
+dataset_root,/playpen-ssd/smerrill/deception2/DatasetMain
+model_dirname,DeepSeek-R1-Distill-Qwen-7B
+envs,"AdvisorAudit, BS, CarSales, Gridworld, Interview"
+num_examples,100
+max_sentences,20
+sample_sizes,"10, 25, 50, 100"
+reference_sample_size,100
+resample_repeats,25
+bootstrap_repeats,1000
+selection_seed,1234
+base_seed,1234
+resample_seed,2026
+jump_agreement_min_reference_magnitude,0.3
+selection_only,False
+analysis_only,False
+output_root,/playpen-ssd/smerrill/deception2/Notebooks/datasetmain_localization_sampling_budget_ablation_outputs/qwen7b_short_deceptive_10

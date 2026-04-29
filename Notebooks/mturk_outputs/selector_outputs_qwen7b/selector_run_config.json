@@ -1,0 +1,14 @@
+{
+  "taska_input_path": "/playpen-ssd/smerrill/deception2/Notebooks/mturk_outputs/taska.csv",
+  "taskb_input_path": "/playpen-ssd/smerrill/deception2/Notebooks/mturk_outputs/taskb.csv",
+  "openai_model_name": "gpt-4o-mini",
+  "openai_api_mode": "auto",
+  "openai_base_url": null,
+  "taska_target_examples": 100,
+  "taska_target_output_rows": 200,
+  "taskb_target_examples": 100,
+  "overwrite_llm_cache": false,
+  "taska_llm_limit": 0,
+  "taskb_llm_limit": 0,
+  "sleep_seconds_between_calls": 0.0
+}

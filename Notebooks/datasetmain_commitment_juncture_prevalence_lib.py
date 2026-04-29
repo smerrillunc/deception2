@@ -9,6 +9,12 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    def tqdm(iterable=None, *args, **kwargs):  # type: ignore[no-redef]
+        return iterable
+
 
 DATASETMAIN_ROOT = Path("/playpen-ssd/smerrill/deception2/DatasetMain")
 DELTA_DECEPTION_THRESHOLD = 0.3
@@ -462,7 +468,9 @@ def _summarize_localization_example_payload(
             }
         )
     sorted_history.sort(key=lambda item: item["sentence_idx"])
-    trace_length = len(sorted_history)
+    localized_sentence_count = len(sorted_history)
+    max_sentence_idx = max((item["sentence_idx"] for item in sorted_history), default=-1)
+    trace_length = max_sentence_idx + 1 if max_sentence_idx >= 0 else localized_sentence_count
 
     deceptive_commitment_sentence_idx = np.nan
     truthful_commitment_sentence_idx = np.nan
@@ -473,12 +481,15 @@ def _summarize_localization_example_payload(
         current_rate = entry["deception_rate"]
         if pd.notna(previous_rate) and pd.notna(current_rate):
             delta = float(current_rate) - float(previous_rate)
+            location_fraction = (entry["sentence_idx"] + 1) / trace_length if trace_length else np.nan
+            if pd.notna(location_fraction):
+                location_fraction = float(np.clip(location_fraction, 0.0, 1.0))
             if math.isnan(deceptive_commitment_location) and delta > delta_threshold:
                 deceptive_commitment_sentence_idx = entry["sentence_idx"]
-                deceptive_commitment_location = (entry["sentence_idx"] + 1) / trace_length if trace_length else np.nan
+                deceptive_commitment_location = location_fraction
             if math.isnan(truthful_commitment_location) and delta < -delta_threshold:
                 truthful_commitment_sentence_idx = entry["sentence_idx"]
-                truthful_commitment_location = (entry["sentence_idx"] + 1) / trace_length if trace_length else np.nan
+                truthful_commitment_location = location_fraction
         previous_rate = current_rate
 
     full_score = payload.get("full_score") or {}
@@ -489,6 +500,7 @@ def _summarize_localization_example_payload(
     return {
         "example_id": example_id,
         "trace_length": trace_length,
+        "localized_sentence_count": localized_sentence_count,
         "full_deception_rate": pd.to_numeric(pd.Series([full_score.get("deception_rate")]), errors="coerce").iloc[0],
         "example_label": example_label,
         "is_usable_example": example_label in {"deceptive", "truthful"},
@@ -585,6 +597,8 @@ def read_bundle_localization_example_summaries(
     model_name: str,
     max_json_files_per_bundle: int | None = None,
     delta_threshold: float = DELTA_DECEPTION_THRESHOLD,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     bundle_path = Path(bundle_dir)
     json_paths = _localization_paths(bundle_path, max_json_files_per_bundle=max_json_files_per_bundle)
@@ -592,7 +606,16 @@ def read_bundle_localization_example_summaries(
 
     rows: list[dict[str, Any]] = []
     parse_errors: list[dict[str, Any]] = []
-    for path in json_paths:
+    path_iterable = json_paths
+    if show_progress:
+        path_iterable = tqdm(
+            json_paths,
+            total=len(json_paths),
+            desc=progress_desc or f"{canonical_model_display(model_name)} / {canonical_env_display(env_name)}",
+            unit="file",
+            leave=False,
+        )
+    for path in path_iterable:
         try:
             row = _parse_localization_example_file_worker(
                 str(path),
@@ -662,18 +685,36 @@ def load_datasetmain_localization_example_df(
     *,
     max_json_files_per_bundle: int | None = None,
     delta_threshold: float = DELTA_DECEPTION_THRESHOLD,
+    show_progress: bool = False,
+    progress_level: str = "bundle",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    progress_level_key = str(progress_level or "bundle").strip().lower()
+    if progress_level_key not in {"bundle", "file"}:
+        raise ValueError(f"Unsupported progress_level={progress_level!r}. Choose from {'bundle', 'file'}.")
+
     inventory_rows: list[dict[str, Any]] = []
     example_frames: list[pd.DataFrame] = []
     parse_error_frames: list[pd.DataFrame] = []
 
-    for env_name, model_name, bundle_dir in _bundle_dirs(root):
+    bundle_rows = _bundle_dirs(root)
+    bundle_iterable = bundle_rows
+    if show_progress:
+        bundle_iterable = tqdm(
+            bundle_rows,
+            total=len(bundle_rows),
+            desc="DatasetMain bundles",
+            unit="bundle",
+        )
+
+    for env_name, model_name, bundle_dir in bundle_iterable:
         example_df, parse_error_df, inventory_row = read_bundle_localization_example_summaries(
             bundle_dir,
             env_name=env_name,
             model_name=model_name,
             max_json_files_per_bundle=max_json_files_per_bundle,
             delta_threshold=delta_threshold,
+            show_progress=show_progress and progress_level_key == "file",
+            progress_desc=f"{canonical_model_display(model_name)} / {canonical_env_display(env_name)}",
         )
         inventory_rows.append(inventory_row)
         if not example_df.empty:
@@ -944,6 +985,100 @@ def make_commitment_paper_table(
             "Truthful Commitment Examples",
             "Truthful Commitment Example Fraction",
             "Truthful Commitment Example Location",
+        ]
+    )
+    return out.loc[:, desired_columns]
+
+
+
+def make_commitment_fraction_location_table(
+    stats_df: pd.DataFrame,
+    *,
+    location_interval_style: str = "se",
+) -> pd.DataFrame:
+    if stats_df.empty:
+        columns = ["Model"]
+        if "env_display" in stats_df.columns:
+            columns.append("Environment")
+        columns.extend(
+            [
+                "Deceptive Examples",
+                "Deceptive Commitment Fraction",
+                "Deceptive Commitment Location",
+                "Truthful Examples",
+                "Truthful Commitment Fraction",
+                "Truthful Commitment Location",
+            ]
+        )
+        return pd.DataFrame(columns=columns)
+
+    out = pd.DataFrame()
+    if "model_display" in stats_df.columns:
+        out["Model"] = stats_df["model_display"].astype(str)
+    if "env_display" in stats_df.columns:
+        out["Environment"] = stats_df["env_display"].astype(str)
+
+    out["Deceptive Examples"] = stats_df["deceptive_examples"].astype(int)
+    out["Deceptive Commitment Fraction"] = pd.to_numeric(
+        stats_df["deceptive_commitment_example_fraction"],
+        errors="coerce",
+    )
+    if location_interval_style == "bootstrap_ci":
+        out["Deceptive Commitment Location"] = [
+            _format_location_with_ci(mean_value, lower_value, upper_value)
+            for mean_value, lower_value, upper_value in zip(
+                stats_df["deceptive_commitment_example_location_mean"],
+                stats_df["deceptive_commitment_example_location_ci_lower"],
+                stats_df["deceptive_commitment_example_location_ci_upper"],
+                strict=False,
+            )
+        ]
+    else:
+        out["Deceptive Commitment Location"] = [
+            _format_location_with_se(mean_value, se_value)
+            for mean_value, se_value in zip(
+                stats_df["deceptive_commitment_example_location_mean"],
+                stats_df["deceptive_commitment_example_location_se"],
+                strict=False,
+            )
+        ]
+
+    out["Truthful Examples"] = stats_df["truthful_examples"].astype(int)
+    out["Truthful Commitment Fraction"] = pd.to_numeric(
+        stats_df["truthful_commitment_example_fraction"],
+        errors="coerce",
+    )
+    if location_interval_style == "bootstrap_ci":
+        out["Truthful Commitment Location"] = [
+            _format_location_with_ci(mean_value, lower_value, upper_value)
+            for mean_value, lower_value, upper_value in zip(
+                stats_df["truthful_commitment_example_location_mean"],
+                stats_df["truthful_commitment_example_location_ci_lower"],
+                stats_df["truthful_commitment_example_location_ci_upper"],
+                strict=False,
+            )
+        ]
+    else:
+        out["Truthful Commitment Location"] = [
+            _format_location_with_se(mean_value, se_value)
+            for mean_value, se_value in zip(
+                stats_df["truthful_commitment_example_location_mean"],
+                stats_df["truthful_commitment_example_location_se"],
+                strict=False,
+            )
+        ]
+
+    desired_columns = ["Model"]
+    if "Environment" in out.columns:
+        desired_columns.append("Environment")
+    desired_columns.extend(
+        [
+            "Deceptive Examples",
+            "Deceptive Commitment Fraction",
+            "Deceptive Commitment Location",
+            "Truthful Examples",
+            "Truthful Commitment Fraction",
+            "Truthful Commitment Location",
         ]
     )
     return out.loc[:, desired_columns]

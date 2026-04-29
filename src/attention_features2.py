@@ -17,7 +17,6 @@ from attention_features import (
     ExampleValidationError,
     StreamingParquetWriter,
     add_span_match_columns,
-    align_localized_sentences_to_tokens,
     build_localized_sentence_df,
     cleanup_tensors,
     infer_model_id,
@@ -26,6 +25,7 @@ from attention_features import (
     maybe_raise_runtime_error,
     resolve_device,
     resolve_dtype,
+    tokenize_and_align_localized_sentences,
 )
 
 
@@ -1024,13 +1024,17 @@ def extract_example_feature_df(
             f"{example_id} has {bad_count} localized sentence spans that do not match raw_text.",
         )
 
-    tokenized = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
-    input_ids_list = tokenized["input_ids"]
-    offsets = tokenized["offset_mapping"]
+    token_alignment = tokenize_and_align_localized_sentences(
+        tokenizer=tokenizer,
+        full_text=full_text,
+        sentence_df=localized_sentence_df,
+        raw_text_start_char=0,
+    )
+    input_ids_list = token_alignment.input_ids
     if not input_ids_list:
         raise ExampleValidationError("no_tokens", f"{example_id} tokenized to zero tokens.")
 
-    aligned_sentence_df = align_localized_sentences_to_tokens(offsets, localized_sentence_df)
+    aligned_sentence_df = token_alignment.aligned_sentence_df
     if not (aligned_sentence_df["token_count"] > 0).all():
         bad_count = int((aligned_sentence_df["token_count"] == 0).sum())
         raise ExampleValidationError(
