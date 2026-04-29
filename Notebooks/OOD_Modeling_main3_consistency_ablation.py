@@ -816,27 +816,6 @@ def discover_optional_feature_spaces() -> tuple[OrderedDict[str, FeatureSpaceSpe
     active_feature_spaces: OrderedDict[str, FeatureSpaceSpec] = OrderedDict(BASE_FEATURE_SPACES)
 
     structural_ready = all(env_paths["structural_baseline_path"].exists() for env_paths in DATASET_FILE_MAP.values())
-    availability_rows.append(
-        {
-            "feature_space": "baseline_structural",
-            "feature_space_title": "Baseline: sentence structure",
-            "artifact_kind": "structural_parquet",
-            "is_available": bool(structural_ready),
-            "detail": STRUCTURAL_BASELINE_FILENAME,
-        }
-    )
-    if structural_ready:
-        active_feature_spaces["baseline_structural"] = FeatureSpaceSpec(
-            name="baseline_structural",
-            title="Baseline: sentence structure",
-            family_title="baseline",
-            uses_attention=False,
-            attention_subset_key=None,
-            activation_variant=None,
-            activation_use_pca=False,
-            baseline_variant="structural",
-            baseline_text_field=None,
-        )
 
     known_tfidf_titles = {
         "last_sentence_text": "Baseline: TF-IDF last sentence",
@@ -2335,9 +2314,7 @@ for feature_space_name, feature_space in FEATURE_SPACES.items():
 baseline_bundle_by_space: dict[str, BaselineMatrixBundle] = {}
 baseline_lookup_by_space: dict[str, pd.DataFrame] = {}
 for feature_space_name, feature_space in FEATURE_SPACES.items():
-    if feature_space.baseline_variant == "structural":
-        baseline_bundle = build_structural_matrix_bundle()
-    elif feature_space.baseline_variant == "tfidf":
+    if feature_space.baseline_variant == "tfidf":
         if feature_space.baseline_text_field is None:
             raise ValueError(f"{feature_space_name} baseline_variant='tfidf' is missing baseline_text_field.")
         baseline_bundle = build_tfidf_matrix_bundle(
@@ -2468,8 +2445,6 @@ def feature_size_to_label(feature_size: int) -> str:
 
 def selected_feature_size_label(feature_space: FeatureSpaceSpec, feature_size: int | None) -> str:
     if feature_space.family_title == "baseline":
-        if feature_space.baseline_variant == "structural":
-            return "sentence_structure"
         if feature_space.baseline_variant == "tfidf":
             return f"tfidf_{slugify(str(feature_space.baseline_text_field or 'text'))}"
         if feature_space.activation_variant == "final_sentence" and not feature_space.activation_use_pca:
