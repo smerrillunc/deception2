@@ -41,6 +41,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import scipy.sparse as sp
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
@@ -236,7 +237,10 @@ ENV_SPECS = OrderedDict(
 )
 ENV_ORDER = list(ENV_SPECS.keys())
 
-FEATURE_FILENAME = "prefix_deception_features.parquet.tmp"
+FEATURE_FILENAME_CANDIDATES = (
+    "prefix_deception_features.parquet",
+    "prefix_deception_features.parquet.tmp",
+)
 ACTIVATION_FILENAME = "prefix_deception_activations.h5"
 STRUCTURAL_BASELINE_FILENAME = os.environ.get(
     "OOD_MAIN3_COMPANION_STRUCTURAL_BASELINE_FILENAME",
@@ -729,13 +733,78 @@ FAMILY_DISPLAY_TITLES = {
 }
 
 
-def build_dataset_file_map(model_dirname: str) -> OrderedDict[str, dict[str, Path]]:
-    file_map: OrderedDict[str, dict[str, Path]] = OrderedDict()
+def validate_parquet_file(path: Path) -> None:
+    pq.ParquetFile(path)
+
+
+def resolve_feature_path_optional(env_name: str, env_dir: str, model_dirname: str) -> Path | None:
+    candidate_paths = [
+        (DATASET_ROOT / env_dir / model_dirname / filename).resolve()
+        for filename in FEATURE_FILENAME_CANDIDATES
+    ]
+    existing_paths = [path for path in candidate_paths if path.exists()]
+    if not existing_paths:
+        return None
+
+    for path in existing_paths:
+        try:
+            validate_parquet_file(path)
+            return path
+        except Exception:
+            continue
+    return None
+
+
+def resolve_feature_path(env_name: str, env_dir: str, model_dirname: str) -> Path:
+    candidate_paths = [
+        (DATASET_ROOT / env_dir / model_dirname / filename).resolve()
+        for filename in FEATURE_FILENAME_CANDIDATES
+    ]
+    resolved_path = resolve_feature_path_optional(env_name, env_dir, model_dirname)
+    if resolved_path is not None:
+        return resolved_path
+
+    existing_paths = [path for path in candidate_paths if path.exists()]
+    if not existing_paths:
+        raise FileNotFoundError(
+            "Missing feature parquet for "
+            f"{env_name}: checked {', '.join(str(path) for path in candidate_paths)}"
+        )
+
+    validation_errors: list[str] = []
+    for path in existing_paths:
+        try:
+            validate_parquet_file(path)
+            return path
+        except Exception as exc:
+            validation_errors.append(f"{path}: {type(exc).__name__}: {exc}")
+
+    raise ValueError(
+        "No readable feature parquet for "
+        f"{env_name} / {model_dirname}. Checked: " + " | ".join(validation_errors)
+    )
+
+
+def feature_mode_requires_attention(mode: str) -> bool:
+    normalized_mode = str(mode or "all").strip().lower()
+    return normalized_mode not in {
+        "activation_only",
+        "baseline_only",
+        "no_attention",
+        "non_attention",
+        "only_tfidf",
+    }
+
+
+def build_dataset_file_map(model_dirname: str, *, require_feature_parquet: bool) -> OrderedDict[str, dict[str, Path | None]]:
+    file_map: OrderedDict[str, dict[str, Path | None]] = OrderedDict()
     for env_name, env_dir in ENV_SPECS.items():
-        feature_path = DATASET_ROOT / env_dir / model_dirname / FEATURE_FILENAME
+        feature_path = (
+            resolve_feature_path(env_name, env_dir, model_dirname)
+            if require_feature_parquet
+            else resolve_feature_path_optional(env_name, env_dir, model_dirname)
+        )
         activation_path = DATASET_ROOT / env_dir / model_dirname / ACTIVATION_FILENAME
-        if not feature_path.exists():
-            raise FileNotFoundError(f"Missing feature parquet for {env_name}: {feature_path}")
         if not activation_path.exists():
             raise FileNotFoundError(f"Missing activation h5 for {env_name}: {activation_path}")
         file_map[env_name] = {
@@ -747,7 +816,10 @@ def build_dataset_file_map(model_dirname: str) -> OrderedDict[str, dict[str, Pat
     return file_map
 
 
-DATASET_FILE_MAP = build_dataset_file_map(MODEL_DIRNAME)
+DATASET_FILE_MAP = build_dataset_file_map(
+    MODEL_DIRNAME,
+    require_feature_parquet=feature_mode_requires_attention(FEATURE_SPACE_MODE),
+)
 
 
 def parse_tfidf_artifact_meta(meta_path: Path) -> dict[str, Any]:
@@ -882,9 +954,38 @@ def filter_feature_spaces_for_mode(
                 "Check that the TF-IDF cache exists for every environment."
             )
         return filtered
+    if normalized_mode == "activation_only":
+        filtered = OrderedDict(
+            (feature_space_name, feature_space)
+            for feature_space_name, feature_space in feature_spaces.items()
+            if feature_space.family_title == "activation_only"
+        )
+        if not filtered:
+            raise ValueError("FEATURE_SPACE_MODE='activation_only' found no activation-only feature spaces.")
+        return filtered
+    if normalized_mode == "baseline_only":
+        filtered = OrderedDict(
+            (feature_space_name, feature_space)
+            for feature_space_name, feature_space in feature_spaces.items()
+            if feature_space.family_title == "baseline"
+        )
+        if not filtered:
+            raise ValueError("FEATURE_SPACE_MODE='baseline_only' found no baseline feature spaces.")
+        return filtered
+    if normalized_mode in {"no_attention", "non_attention"}:
+        filtered = OrderedDict(
+            (feature_space_name, feature_space)
+            for feature_space_name, feature_space in feature_spaces.items()
+            if not feature_space.uses_attention
+        )
+        if not filtered:
+            raise ValueError(
+                f"FEATURE_SPACE_MODE={mode!r} found no non-attention feature spaces."
+            )
+        return filtered
     raise ValueError(
         f"Unsupported FEATURE_SPACE_MODE={mode!r}. "
-        "Expected one of ['all', 'only_tfidf']."
+        "Expected one of ['all', 'only_tfidf', 'activation_only', 'baseline_only', 'no_attention', 'non_attention']."
     )
 
 
@@ -893,6 +994,22 @@ FEATURE_SPACES = filter_feature_spaces_for_mode(
     _discovered_feature_spaces,
     mode=FEATURE_SPACE_MODE,
 )
+USES_TFIDF_BASELINES = any(
+    feature_space.baseline_variant == "tfidf"
+    for feature_space in FEATURE_SPACES.values()
+)
+USES_ATTENTION_FEATURES = any(feature_space.uses_attention for feature_space in FEATURE_SPACES.values())
+if USES_ATTENTION_FEATURES:
+    missing_feature_envs = [
+        env_name
+        for env_name, env_paths in DATASET_FILE_MAP.items()
+        if env_paths["feature_path"] is None
+    ]
+    if missing_feature_envs:
+        raise ValueError(
+            "The selected feature spaces require readable feature parquet files, but none were found for: "
+            + ", ".join(sorted(missing_feature_envs))
+        )
 optional_feature_space_availability_df["selected_by_mode"] = optional_feature_space_availability_df["feature_space"].astype(str).isin(
     set(FEATURE_SPACES.keys())
 )
@@ -943,6 +1060,7 @@ config_df = pd.concat(
         pd.DataFrame(
             [
                 {"setting": "structural_baseline_filename", "value": STRUCTURAL_BASELINE_FILENAME},
+                {"setting": "feature_filename_candidates", "value": ", ".join(FEATURE_FILENAME_CANDIDATES)},
                 {"setting": "tfidf_cache_dirname", "value": TFIDF_CACHE_DIRNAME},
                 {"setting": "tfidf_text_fields", "value": ", ".join(TFIDF_TEXT_FIELDS)},
                 {"setting": "feature_space_mode", "value": FEATURE_SPACE_MODE},
@@ -1216,7 +1334,7 @@ for env_name, env_paths in maybe_tqdm(
         metadata_df=activation_metadata_df,
     )
 
-    if env_paths["structural_baseline_path"].exists():
+    if USES_TFIDF_BASELINES and env_paths["structural_baseline_path"].exists():
         structural_metadata_df = load_structural_baseline_metadata(env_paths["structural_baseline_path"], env_name)
         structural_metadata_df["split"] = structural_metadata_df["example_id"].map(split_map).astype("string")
         unmatched_structural_examples = sorted(
@@ -1227,9 +1345,9 @@ for env_name, env_paths in maybe_tqdm(
         )
         if unmatched_structural_examples:
             print(
-                f"[warn] {env_name}: ignoring {len(unmatched_structural_examples)} structural-baseline example IDs "
+                f"[warn] {env_name}: ignoring {len(unmatched_structural_examples)} companion structural example IDs "
                 "absent from the feature split map. "
-                "This usually means those examples produced structural rows but no modeling rows "
+                "This usually means those examples produced TF-IDF companion rows but no modeling rows "
                 "in prefix_deception_features.parquet.tmp."
             )
         structural_metadata_by_env[env_name] = structural_metadata_df
@@ -1275,19 +1393,22 @@ for env_name, metadata_df in feature_metadata_by_env.items():
             how="left",
             validate="one_to_one",
         )
-        if aligned_key_df["structural_row_idx"].isna().any():
+        missing_structural_mask = aligned_key_df["structural_row_idx"].isna().to_numpy(dtype=bool, copy=False)
+        if missing_structural_mask.any():
             missing_key_df = aligned_key_df.loc[
-                aligned_key_df["structural_row_idx"].isna(),
+                missing_structural_mask,
                 ["example_id", "sentence_idx"],
             ].head(5)
-            raise ValueError(
-                f"{env_name} structural baseline rows are missing feature-aligned keys. "
+            print(
+                f"[warn] {env_name}: companion structural / TF-IDF rows are missing for "
+                f"{int(missing_structural_mask.sum())} modeling rows; zero-filling those baseline features. "
                 f"feature_rows={len(metadata_df)}, structural_rows={len(structural_metadata_df)}, "
-                f"missing_examples={aligned_key_df['structural_row_idx'].isna().sum()}, "
+                f"train_missing={int(np.count_nonzero(missing_structural_mask & train_mask))}, "
+                f"val_missing={int(np.count_nonzero(missing_structural_mask & val_mask))}, "
                 f"sample_missing={missing_key_df.to_dict(orient='records')}"
             )
         aligned_key_df = aligned_key_df.sort_values("feature_row_idx", kind="mergesort").reset_index(drop=True)
-        structural_row_idx = aligned_key_df["structural_row_idx"].to_numpy(dtype=np.int64, copy=False)
+        structural_row_idx = aligned_key_df["structural_row_idx"].fillna(-1).to_numpy(dtype=np.int64, copy=False)
         bundle["train_structural_row_idx"] = structural_row_idx[train_mask]
         bundle["val_structural_row_idx"] = structural_row_idx[val_mask]
 
@@ -2102,6 +2223,38 @@ def align_matrix_to_feature_order(
     )
 
 
+def gather_dense_rows_with_missing(matrix: np.ndarray, row_idx: np.ndarray) -> np.ndarray:
+    row_idx = np.asarray(row_idx, dtype=np.int64)
+    if row_idx.size == 0:
+        return np.zeros((0, int(matrix.shape[1])), dtype=np.float32)
+    out = np.zeros((row_idx.shape[0], int(matrix.shape[1])), dtype=np.float32)
+    valid_mask = row_idx >= 0
+    if valid_mask.any():
+        out[valid_mask] = np.asarray(matrix[row_idx[valid_mask]], dtype=np.float32)
+    return out
+
+
+def gather_sparse_rows_with_missing(matrix: sp.spmatrix, row_idx: np.ndarray) -> sp.csr_matrix:
+    row_idx = np.asarray(row_idx, dtype=np.int64)
+    matrix = matrix.tocsr().astype(np.float32)
+    if row_idx.size == 0:
+        return sp.csr_matrix((0, matrix.shape[1]), dtype=np.float32)
+
+    valid_positions = np.flatnonzero(row_idx >= 0)
+    if valid_positions.size == row_idx.size:
+        return matrix[row_idx].tocsr()
+    if valid_positions.size == 0:
+        return sp.csr_matrix((row_idx.size, matrix.shape[1]), dtype=np.float32)
+
+    valid_rows = matrix[row_idx[valid_positions]].tocoo()
+    remapped_row = valid_positions[valid_rows.row]
+    return sp.csr_matrix(
+        (valid_rows.data.astype(np.float32, copy=False), (remapped_row, valid_rows.col)),
+        shape=(row_idx.size, matrix.shape[1]),
+        dtype=np.float32,
+    )
+
+
 def choose_cross_env_tfidf_feature_names(feature_names_by_env: OrderedDict[str, list[str]]) -> tuple[list[str], str]:
     if not feature_names_by_env:
         return [], "empty"
@@ -2152,8 +2305,8 @@ def build_structural_matrix_bundle() -> BaselineMatrixBundle:
         raw_df = raw_df.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
         raw_matrix = raw_df.to_numpy(dtype=np.float32, copy=False)
         matrices_by_env[env_name] = {
-            "train": np.asarray(raw_matrix[split_bundle["train_structural_row_idx"]], dtype=np.float32),
-            "val": np.asarray(raw_matrix[split_bundle["val_structural_row_idx"]], dtype=np.float32),
+            "train": gather_dense_rows_with_missing(raw_matrix, split_bundle["train_structural_row_idx"]),
+            "val": gather_dense_rows_with_missing(raw_matrix, split_bundle["val_structural_row_idx"]),
         }
 
     return BaselineMatrixBundle(
@@ -2177,7 +2330,7 @@ def build_tfidf_matrix_bundle(*, text_field: str, space_name: str) -> BaselineMa
         meta = parse_tfidf_artifact_meta(artifact_paths["meta_path"])
         structural_metadata_df = structural_metadata_by_env.get(env_name)
         if structural_metadata_df is None:
-            raise FileNotFoundError(f"{env_name} is missing structural baseline metadata needed to align TF-IDF rows.")
+            raise FileNotFoundError(f"{env_name} is missing companion structural metadata needed to align TF-IDF rows.")
         structural_key_df = pd.read_parquet(
             env_paths["structural_baseline_path"],
             columns=["example_id", "sentence_idx"],
@@ -2216,8 +2369,8 @@ def build_tfidf_matrix_bundle(*, text_field: str, space_name: str) -> BaselineMa
         matrix = sp.load_npz(artifact_paths["matrix_path"]).tocsr().astype(np.float32)
         aligned_matrix = align_matrix_to_feature_order(matrix, env_feature_names, shared_feature_names)
         matrices_by_env[env_name] = {
-            "train": aligned_matrix[split_bundle["train_structural_row_idx"]].tocsr(),
-            "val": aligned_matrix[split_bundle["val_structural_row_idx"]].tocsr(),
+            "train": gather_sparse_rows_with_missing(aligned_matrix, split_bundle["train_structural_row_idx"]),
+            "val": gather_sparse_rows_with_missing(aligned_matrix, split_bundle["val_structural_row_idx"]),
         }
 
     return BaselineMatrixBundle(
