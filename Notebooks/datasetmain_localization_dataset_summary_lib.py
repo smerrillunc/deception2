@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import transformers
 from transformers import AutoTokenizer
 
 import datasetmain_commitment_juncture_prevalence_lib as cj
@@ -62,6 +63,12 @@ MODEL_TOKENIZER_CONFIGS: dict[str, dict[str, str]] = {
     },
 }
 
+MODEL_TYPE_TOKENIZER_CLASS_FALLBACKS: dict[str, str] = {
+    "llama": "LlamaTokenizerFast",
+    "qwen2": "Qwen2TokenizerFast",
+    "gpt_oss": "PreTrainedTokenizerFast",
+}
+
 _TOKENIZER_CACHE: dict[str, Any] = {}
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", flags=re.UNICODE)
 WORD_PATTERN = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", flags=re.UNICODE)
@@ -91,6 +98,53 @@ def resolve_tokenizer_name_or_path(
     return str(model_cfg['hf_repo'])
 
 
+def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _resolve_tokenizer_class_name(name_or_path: str) -> str | None:
+    path = Path(name_or_path)
+    if not path.exists() or not path.is_dir():
+        return None
+
+    tokenizer_cfg = _read_json_if_exists(path / "tokenizer_config.json") or {}
+    tokenizer_class_name = tokenizer_cfg.get("tokenizer_class")
+    if isinstance(tokenizer_class_name, str) and tokenizer_class_name.strip():
+        return tokenizer_class_name.strip()
+
+    model_cfg = _read_json_if_exists(path / "config.json") or {}
+    model_type = str(model_cfg.get("model_type") or "").strip()
+    if not model_type:
+        return None
+    return MODEL_TYPE_TOKENIZER_CLASS_FALLBACKS.get(model_type)
+
+
+def _load_tokenizer_from_declared_class(
+    name_or_path: str,
+    *,
+    trust_remote_code: bool = True,
+):
+    tokenizer_class_name = _resolve_tokenizer_class_name(name_or_path)
+    if tokenizer_class_name is None:
+        raise ValueError(f"Could not infer tokenizer class for {name_or_path!r}.")
+
+    tokenizer_cls = getattr(transformers, tokenizer_class_name, None)
+    if tokenizer_cls is None:
+        raise ValueError(
+            f"Tokenizer class {tokenizer_class_name!r} is not available in transformers "
+            f"{getattr(transformers, '__version__', 'unknown')}."
+        )
+    return tokenizer_cls.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
+
+
 def get_tokenizer(
     model_name: str,
     *,
@@ -101,7 +155,19 @@ def get_tokenizer(
         return _TOKENIZER_CACHE[cache_key]
 
     tokenizer_name_or_path = resolve_tokenizer_name_or_path(model_name, hf_cache_root=hf_cache_root)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
+    except Exception as auto_exc:
+        tokenizer_class_name = _resolve_tokenizer_class_name(tokenizer_name_or_path)
+        if tokenizer_class_name is None:
+            raise
+        try:
+            tokenizer = _load_tokenizer_from_declared_class(tokenizer_name_or_path, trust_remote_code=True)
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"Failed to load tokenizer for model {model_name!r} from {tokenizer_name_or_path!r} via "
+                f"AutoTokenizer ({auto_exc!r}), and direct fallback using {tokenizer_class_name!r} also failed."
+            ) from fallback_exc
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     _TOKENIZER_CACHE[cache_key] = tokenizer
