@@ -55,23 +55,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional comma-separated TF-IDF text fields to consider, e.g. last_sentence_text,prefix_text.",
     )
-    tfidf_mode_group = parser.add_mutually_exclusive_group()
-    tfidf_mode_group.add_argument(
+    parser.add_argument(
         "--only-tfidf",
-        dest="only_tfidf",
         action="store_true",
         help=(
             "Run only the discovered TF-IDF baseline feature spaces. "
-            "This is the default behavior."
+            "This is useful when the full attention/activation sweep already exists."
         ),
     )
-    tfidf_mode_group.add_argument(
-        "--all-feature-spaces",
-        dest="only_tfidf",
-        action="store_false",
-        help="Include the full attention/activation sweep instead of the TF-IDF-only default.",
-    )
-    parser.set_defaults(only_tfidf=True)
     parser.add_argument(
         "--model-family",
         default="logreg",
