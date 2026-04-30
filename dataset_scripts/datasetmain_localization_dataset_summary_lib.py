@@ -10,6 +10,16 @@ from typing import Any
 import pandas as pd
 from transformers import AutoTokenizer
 
+try:
+    from transformers import LlamaTokenizerFast
+except Exception:  # pragma: no cover - optional fallback import
+    LlamaTokenizerFast = None  # type: ignore[assignment]
+
+try:
+    from transformers import Qwen2TokenizerFast
+except Exception:  # pragma: no cover - optional fallback import
+    Qwen2TokenizerFast = None  # type: ignore[assignment]
+
 import datasetmain_commitment_juncture_prevalence_lib as cj
 
 try:
@@ -23,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DATASETMAIN_ROOT = cj.DATASETMAIN_ROOT
 DEFAULT_MAX_FILES_PER_BUNDLE: int | None = None
 DEFAULT_NUM_WORKERS = min(20, max(1, (os.cpu_count() or 1)))
-DEFAULT_TOKEN_COUNT_MODE = "regex"
+DEFAULT_TOKEN_COUNT_MODE = "generic"
 DEFAULT_SHOW_PROGRESS = False
 DEFAULT_PROGRESS_LEVEL = "bundle"
 HF_CACHE_ROOT = Path(
@@ -37,34 +47,42 @@ MODEL_TOKENIZER_CONFIGS: dict[str, dict[str, str]] = {
     'DeepSeek-R1-Distill-Qwen-7B': {
         'hf_repo': 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B',
         'hf_cache_dir': 'models--deepseek-ai--DeepSeek-R1-Distill-Qwen-7B',
+        'family': 'qwen2',
     },
     'Qwen-7B': {
         'hf_repo': 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B',
         'hf_cache_dir': 'models--deepseek-ai--DeepSeek-R1-Distill-Qwen-7B',
+        'family': 'qwen2',
     },
     'DeepSeek-R1-Distill-Qwen-14B': {
         'hf_repo': 'deepseek-ai/DeepSeek-R1-Distill-Qwen-14B',
         'hf_cache_dir': 'models--deepseek-ai--DeepSeek-R1-Distill-Qwen-14B',
+        'family': 'qwen2',
     },
     'Qwen-14B': {
         'hf_repo': 'deepseek-ai/DeepSeek-R1-Distill-Qwen-14B',
         'hf_cache_dir': 'models--deepseek-ai--DeepSeek-R1-Distill-Qwen-14B',
+        'family': 'qwen2',
     },
     'DeepSeek-R1-Distill-Llama-8B': {
         'hf_repo': 'deepseek-ai/DeepSeek-R1-Distill-Llama-8B',
         'hf_cache_dir': 'models--deepseek-ai--DeepSeek-R1-Distill-Llama-8B',
+        'family': 'llama',
     },
     'Llama-8B': {
         'hf_repo': 'deepseek-ai/DeepSeek-R1-Distill-Llama-8B',
         'hf_cache_dir': 'models--deepseek-ai--DeepSeek-R1-Distill-Llama-8B',
+        'family': 'llama',
     },
     'gpt-oss-20b': {
         'hf_repo': 'openai/gpt-oss-20b',
         'hf_cache_dir': 'models--openai--gpt-oss-20b',
+        'family': 'generic',
     },
     'GPT-OSS-20B': {
         'hf_repo': 'openai/gpt-oss-20b',
         'hf_cache_dir': 'models--openai--gpt-oss-20b',
+        'family': 'generic',
     },
 }
 
@@ -72,6 +90,14 @@ _TOKENIZER_CACHE: dict[str, Any] = {}
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", flags=re.UNICODE)
 WORD_PATTERN = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", flags=re.UNICODE)
 SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+", flags=re.UNICODE)
+
+
+class _RegexTokenizer:
+    pad_token_id = 0
+    eos_token = None
+
+    def count_tokens(self, text: Any) -> int:
+        return len(TOKEN_PATTERN.findall(str(text or '')))
 
 
 def latest_snapshot_path(root: Path) -> Path | None:
@@ -82,15 +108,30 @@ def latest_snapshot_path(root: Path) -> Path | None:
     return snapshots[-1] if snapshots else None
 
 
+def resolve_model_tokenizer_config(model_name: str) -> dict[str, str] | None:
+    candidate_keys = [
+        str(model_name).strip(),
+        cj.canonical_model_display(model_name),
+    ]
+    seen: set[str] = set()
+    for candidate_key in candidate_keys:
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        model_cfg = MODEL_TOKENIZER_CONFIGS.get(candidate_key)
+        if model_cfg is not None:
+            return model_cfg
+    return None
+
+
 def resolve_tokenizer_name_or_path(
     model_name: str,
     *,
     hf_cache_root: Path | str = HF_CACHE_ROOT,
-) -> str:
-    model_key = str(model_name).strip()
-    if model_key not in MODEL_TOKENIZER_CONFIGS:
-        raise ValueError(f'Unsupported model_name={model_name!r}. Choose from {sorted(MODEL_TOKENIZER_CONFIGS)}.')
-    model_cfg = MODEL_TOKENIZER_CONFIGS[model_key]
+) -> str | None:
+    model_cfg = resolve_model_tokenizer_config(model_name)
+    if model_cfg is None:
+        return None
     cached_snapshot = latest_snapshot_path(Path(hf_cache_root).expanduser().resolve() / model_cfg['hf_cache_dir'])
     if cached_snapshot is not None:
         return str(cached_snapshot)
@@ -107,8 +148,36 @@ def get_tokenizer(
         return _TOKENIZER_CACHE[cache_key]
 
     tokenizer_name_or_path = resolve_tokenizer_name_or_path(model_name, hf_cache_root=hf_cache_root)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+    model_cfg = resolve_model_tokenizer_config(model_name)
+    if tokenizer_name_or_path is None or model_cfg is None:
+        tokenizer = _RegexTokenizer()
+        _TOKENIZER_CACHE[cache_key] = tokenizer
+        return tokenizer
+
+    load_attempts = [
+        lambda: AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            trust_remote_code=True,
+            local_files_only=True,
+        ),
+    ]
+    family = str(model_cfg.get('family') or '').strip().lower()
+    if family == 'llama' and LlamaTokenizerFast is not None:
+        load_attempts.append(lambda: LlamaTokenizerFast.from_pretrained(tokenizer_name_or_path, local_files_only=True))
+    if family == 'qwen2' and Qwen2TokenizerFast is not None:
+        load_attempts.append(lambda: Qwen2TokenizerFast.from_pretrained(tokenizer_name_or_path, local_files_only=True))
+
+    tokenizer = None
+    for load_attempt in load_attempts:
+        try:
+            tokenizer = load_attempt()
+            break
+        except Exception:
+            continue
+    if tokenizer is None:
+        tokenizer = _RegexTokenizer()
+
+    if getattr(tokenizer, 'pad_token_id', None) is None and getattr(tokenizer, 'eos_token', None) is not None:
         tokenizer.pad_token = tokenizer.eos_token
     _TOKENIZER_CACHE[cache_key] = tokenizer
     return tokenizer
@@ -123,15 +192,17 @@ def count_text_tokens(
 ) -> int:
     text_value = str(text or '')
     mode = str(token_count_mode).strip().lower()
-    if mode == 'regex':
+    if mode in {'regex', 'generic'}:
         return len(TOKEN_PATTERN.findall(text_value))
     if mode == 'hf':
         if model_name is None:
             raise ValueError('model_name is required when token_count_mode="hf".')
         tokenizer = get_tokenizer(model_name, hf_cache_root=hf_cache_root)
-        token_ids = tokenizer(text_value, add_special_tokens=False)['input_ids']
+        if hasattr(tokenizer, 'count_tokens'):
+            return int(tokenizer.count_tokens(text_value))
+        token_ids = tokenizer.encode(text_value, add_special_tokens=False)
         return len(token_ids)
-    raise ValueError(f'Unsupported token_count_mode={token_count_mode!r}. Choose from {{"regex", "hf"}}.')
+    raise ValueError(f'Unsupported token_count_mode={token_count_mode!r}. Choose from {{"regex", "generic", "hf"}}.')
 
 
 def count_text_words(text: Any) -> int:
@@ -144,6 +215,22 @@ def count_text_sentences(text: Any) -> int:
         return 0
     parts = [part.strip() for part in SENTENCE_SPLIT_PATTERN.split(cleaned) if part.strip()]
     return max(1, len(parts))
+
+
+def _is_incremental_extension_safe(previous_text: str, delta_text: str) -> bool:
+    if not previous_text or not delta_text:
+        return True
+    prev_char = previous_text[-1]
+    next_char = delta_text[0]
+    if prev_char.isspace() or next_char.isspace():
+        return True
+    if (prev_char.isalnum() or prev_char == '_') and (next_char.isalnum() or next_char == '_'):
+        return False
+    if prev_char.isalnum() and next_char in "-'":
+        return False
+    if prev_char in "-'" and next_char.isalnum():
+        return False
+    return True
 
 
 def _empty_bundle_summary(env_name: str, model_name: str, bundle_dir: Path) -> dict[str, Any]:
@@ -209,31 +296,47 @@ def summarize_localization_bundle(
         iterator = tqdm(paths, total=len(paths), desc=progress_desc or f'{cj.canonical_env_display(env_name)} | {cj.canonical_model_display(model_name)}', unit='file')
 
     for path in iterator:
-        payload = json.loads(path.read_text(encoding='utf-8'))
+        payload_bytes = path.read_bytes()
+        payload = json.loads(payload_bytes)
         history = payload.get('history') or []
         raw_text = str(payload.get('raw_text') or '')
 
         summary['file_count'] += 1
-        summary['file_size_bytes_total'] += path.stat().st_size
+        summary['file_size_bytes_total'] += len(payload_bytes)
         summary['reasoning_sentence_total'] += len(history)
-        summary['reasoning_token_total'] += count_text_tokens(
-            raw_text,
-            token_count_mode=token_count_mode,
-            model_name=model_name,
-            hf_cache_root=hf_cache_root,
-        )
-        summary['reasoning_word_total'] += count_text_words(raw_text)
+
+        last_prefix_text = ''
+        last_prefix_token_count = 0
+        last_prefix_word_count = 0
 
         for sentence_pos, row in enumerate(history, start=1):
             prefix_text = str(row.get('prefix_text') or '')
-            prompt_token_count = count_text_tokens(
-                prefix_text,
-                token_count_mode=token_count_mode,
-                model_name=model_name,
-                hf_cache_root=hf_cache_root,
-            )
-            prompt_word_count = count_text_words(prefix_text)
+            if prefix_text.startswith(last_prefix_text):
+                delta_text = prefix_text[len(last_prefix_text):]
+            else:
+                delta_text = ''
+
+            if delta_text and _is_incremental_extension_safe(last_prefix_text, delta_text):
+                prompt_token_count = last_prefix_token_count + count_text_tokens(
+                    delta_text,
+                    token_count_mode=token_count_mode,
+                    model_name=model_name,
+                    hf_cache_root=hf_cache_root,
+                )
+                prompt_word_count = last_prefix_word_count + count_text_words(delta_text)
+            else:
+                prompt_token_count = count_text_tokens(
+                    prefix_text,
+                    token_count_mode=token_count_mode,
+                    model_name=model_name,
+                    hf_cache_root=hf_cache_root,
+                )
+                prompt_word_count = count_text_words(prefix_text)
             prompt_sentence_count = sentence_pos
+
+            last_prefix_text = prefix_text
+            last_prefix_token_count = prompt_token_count
+            last_prefix_word_count = prompt_word_count
 
             summary['localized_prefix_total'] += 1
             summary['prompt_sentence_total_unique'] += prompt_sentence_count
@@ -257,6 +360,18 @@ def summarize_localization_bundle(
                     hf_cache_root=hf_cache_root,
                 )
                 summary['continuation_word_total'] += count_text_words(continuation_text)
+
+        if history and raw_text == last_prefix_text:
+            summary['reasoning_token_total'] += last_prefix_token_count
+            summary['reasoning_word_total'] += last_prefix_word_count
+        else:
+            summary['reasoning_token_total'] += count_text_tokens(
+                raw_text,
+                token_count_mode=token_count_mode,
+                model_name=model_name,
+                hf_cache_root=hf_cache_root,
+            )
+            summary['reasoning_word_total'] += count_text_words(raw_text)
 
     return summary
 

@@ -21,7 +21,7 @@ from dataset_scripts_common import (
 
 
 SCRIPT_NAME = Path(__file__).stem
-SUMMARY_CACHE_VERSION = "localization_dataset_summary_bundle_cache_v2"
+SUMMARY_CACHE_VERSION = "localization_dataset_summary_bundle_cache_v3"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--hf-cache-root", type=str, default=None)
     parser.add_argument("--max-files-per-bundle", type=int, default=None)
-    parser.add_argument("--token-count-mode", choices=["hf", "regex"], default="hf")
+    parser.add_argument("--token-count-mode", choices=["hf", "regex", "generic"], default="generic")
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--progress-level", choices=["bundle", "file"], default="file")
     parser.add_argument("--expected-files-per-bundle", type=int, default=5000)
