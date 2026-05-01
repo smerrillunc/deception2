@@ -1,0 +1,21 @@
+Model,Environment,Localization JSONs,Summarized Examples,Usable Examples,Unusable Examples
+GPT-OSS-20B,AdvisorAudit,5000,5000,5000,0
+GPT-OSS-20B,BS,5000,5000,5000,0
+GPT-OSS-20B,CarSales,5000,5000,5000,0
+GPT-OSS-20B,Gridworld,5000,5000,5000,0
+GPT-OSS-20B,Interview,5000,5000,5000,0
+Llama-8B,AdvisorAudit,5000,5000,5000,0
+Llama-8B,BS,5000,5000,5000,0
+Llama-8B,CarSales,5000,5000,5000,0
+Llama-8B,Gridworld,5000,5000,5000,0
+Llama-8B,Interview,5000,5000,5000,0
+Qwen-14B,AdvisorAudit,5000,5000,5000,0
+Qwen-14B,BS,5000,4999,4999,0
+Qwen-14B,CarSales,5000,5000,5000,0
+Qwen-14B,Gridworld,5000,4999,4999,0
+Qwen-14B,Interview,5000,5000,5000,0
+Qwen-7B,AdvisorAudit,5000,5000,5000,0
+Qwen-7B,BS,5000,5000,5000,0
+Qwen-7B,CarSales,5000,5000,5000,0
+Qwen-7B,Gridworld,5000,5000,5000,0
+Qwen-7B,Interview,5000,5000,5000,0

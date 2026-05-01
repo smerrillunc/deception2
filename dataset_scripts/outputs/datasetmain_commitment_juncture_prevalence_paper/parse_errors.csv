@@ -1,0 +1,3 @@
+env_name,env_display,model_name,model_display,path,error
+bs,BS,DeepSeek-R1-Distill-Qwen-14B,Qwen-14B,/work/users/s/m/smerrill/deception2/DatasetMain/bs/DeepSeek-R1-Distill-Qwen-14B/localization/sentence_localization_2026-02-10_gpu_6_game_133_turn_7_state_1317_sample_0.json,JSONDecodeError('Extra data: line 21817 column 2 (char 22046879)')
+gridworld,Gridworld,DeepSeek-R1-Distill-Qwen-14B,Qwen-14B,/work/users/s/m/smerrill/deception2/DatasetMain/gridworld/DeepSeek-R1-Distill-Qwen-14B/localization/sentence_localization_2026-02-25_game_188_turn_2_state_897_sample_0.json,JSONDecodeError('Unterminated string starting at: line 711 column 24 (char 751800)')

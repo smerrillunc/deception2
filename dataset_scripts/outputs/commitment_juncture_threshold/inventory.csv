@@ -1,0 +1,21 @@
+Model,Environment,Loaded From,Localization JSONs,Examples,Prefix Rows,Gap vs 5000,Near 5k
+GPT-OSS-20B,AdvisorAudit,localization_json,5000,5000,67384,0,True
+GPT-OSS-20B,BS,localization_json,5000,5000,73524,0,True
+GPT-OSS-20B,CarSales,localization_json,5000,5000,66850,0,True
+GPT-OSS-20B,Gridworld,localization_json,5000,5000,74228,0,True
+GPT-OSS-20B,Interview,localization_json,5000,5000,73075,0,True
+Llama-8B,AdvisorAudit,localization_json,5000,5000,76204,0,True
+Llama-8B,BS,localization_json,5000,5000,80844,0,True
+Llama-8B,CarSales,localization_json,5000,5000,72867,0,True
+Llama-8B,Gridworld,localization_json,5000,5000,75669,0,True
+Llama-8B,Interview,localization_json,5000,5000,67881,0,True
+Qwen-7B,AdvisorAudit,localization_json,5000,5000,75981,0,True
+Qwen-7B,BS,localization_json,5000,5000,77175,0,True
+Qwen-7B,CarSales,localization_json,5000,5000,67926,0,True
+Qwen-7B,Gridworld,localization_json,5000,5000,72423,0,True
+Qwen-7B,Interview,localization_json,5000,5000,71840,0,True
+Qwen-14B,AdvisorAudit,localization_json,5000,5000,72118,0,True
+Qwen-14B,BS,localization_json,5000,4999,76956,0,True
+Qwen-14B,CarSales,localization_json,5000,5000,67927,0,True
+Qwen-14B,Gridworld,localization_json,5000,4999,78638,0,True
+Qwen-14B,Interview,localization_json,5000,5000,68084,0,True

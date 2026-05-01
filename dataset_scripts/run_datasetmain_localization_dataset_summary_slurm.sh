@@ -22,6 +22,11 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 PROGRESS_LEVEL="${PROGRESS_LEVEL:-bundle}"
 FORCE_REBUILD_BUNDLE_SUMMARY="${FORCE_REBUILD_BUNDLE_SUMMARY:-0}"
 SHOW_PROGRESS="${SHOW_PROGRESS:-1}"
+ENV_NAME="${ENV_NAME:-}"
+MODEL_NAME="${MODEL_NAME:-}"
+COMBINE_SHARD_OUTPUT_ROOT="${COMBINE_SHARD_OUTPUT_ROOT:-}"
+LOAD_BUNDLE_SUMMARY_CACHE="${LOAD_BUNDLE_SUMMARY_CACHE:-1}"
+SAVE_BUNDLE_SUMMARY_CACHE="${SAVE_BUNDLE_SUMMARY_CACHE:-1}"
 
 module load anaconda
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -47,8 +52,32 @@ if [[ -n "$MAX_FILES_PER_BUNDLE" ]]; then
   CMD+=(--max-files-per-bundle "$MAX_FILES_PER_BUNDLE")
 fi
 
+if [[ -n "$ENV_NAME" ]]; then
+  CMD+=(--env-name "$ENV_NAME")
+fi
+
+if [[ -n "$MODEL_NAME" ]]; then
+  CMD+=(--model-name "$MODEL_NAME")
+fi
+
+if [[ -n "$COMBINE_SHARD_OUTPUT_ROOT" ]]; then
+  CMD+=(--combine-shard-output-root "$COMBINE_SHARD_OUTPUT_ROOT")
+fi
+
 if [[ "$FORCE_REBUILD_BUNDLE_SUMMARY" == "1" ]]; then
   CMD+=(--force-rebuild-bundle-summary)
+fi
+
+if [[ "$LOAD_BUNDLE_SUMMARY_CACHE" == "1" ]]; then
+  CMD+=(--load-bundle-summary-cache)
+else
+  CMD+=(--no-load-bundle-summary-cache)
+fi
+
+if [[ "$SAVE_BUNDLE_SUMMARY_CACHE" == "1" ]]; then
+  CMD+=(--save-bundle-summary-cache)
+else
+  CMD+=(--no-save-bundle-summary-cache)
 fi
 
 if [[ "$SHOW_PROGRESS" == "1" ]]; then

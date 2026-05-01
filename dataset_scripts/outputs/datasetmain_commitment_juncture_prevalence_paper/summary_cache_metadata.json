@@ -1,0 +1,6 @@
+{
+  "cache_version": "prevalence_example_cache_v2",
+  "dataset_root": "/work/users/s/m/smerrill/deception2/DatasetMain",
+  "delta_threshold": 0.3,
+  "max_json_files_per_bundle": null
+}

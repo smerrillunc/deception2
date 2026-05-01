@@ -1,0 +1,21 @@
+model_display,delta_bucket,Examples,Total directional examples,Share,Direction
+GPT-OSS-20B,0.1 - 0.2,10190,17264,0.5902455977757183,Truthful Commitment
+GPT-OSS-20B,0.2 - 0.3,3525,17264,0.20418211306765524,Truthful Commitment
+GPT-OSS-20B,0.3 - 0.4,1489,17264,0.08624884151992586,Truthful Commitment
+GPT-OSS-20B,0.4 - 0.5,776,17264,0.04494902687673772,Truthful Commitment
+GPT-OSS-20B,> 0.5,1284,17264,0.07437442075996292,Truthful Commitment
+Llama-8B,0.1 - 0.2,12050,16393,0.735069846885866,Truthful Commitment
+Llama-8B,0.2 - 0.3,2893,16393,0.17647776489965228,Truthful Commitment
+Llama-8B,0.3 - 0.4,871,16393,0.05313243457573354,Truthful Commitment
+Llama-8B,0.4 - 0.5,326,16393,0.019886536936497286,Truthful Commitment
+Llama-8B,> 0.5,253,16393,0.01543341670225096,Truthful Commitment
+Qwen-7B,0.1 - 0.2,13322,18362,0.7255200958501252,Truthful Commitment
+Qwen-7B,0.2 - 0.3,3383,18362,0.18423918963075916,Truthful Commitment
+Qwen-7B,0.3 - 0.4,1034,18362,0.05631194858947827,Truthful Commitment
+Qwen-7B,0.4 - 0.5,360,18362,0.019605707439276768,Truthful Commitment
+Qwen-7B,> 0.5,263,18362,0.014323058490360528,Truthful Commitment
+Qwen-14B,0.1 - 0.2,12555,18118,0.692957280052986,Truthful Commitment
+Qwen-14B,0.2 - 0.3,3481,18118,0.19212937410310188,Truthful Commitment
+Qwen-14B,0.3 - 0.4,1145,18118,0.06319682084115244,Truthful Commitment
+Qwen-14B,0.4 - 0.5,478,18118,0.026382602936306437,Truthful Commitment
+Qwen-14B,> 0.5,459,18118,0.02533392206645325,Truthful Commitment

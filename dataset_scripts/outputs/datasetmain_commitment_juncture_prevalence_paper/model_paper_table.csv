@@ -1,0 +1,5 @@
+Model,Deceptive Examples,Deceptive Commitment Fraction,Deceptive Commitment Location,Truthful Examples,Truthful Commitment Fraction,Truthful Commitment Location
+GPT-OSS-20B,12500,0.16008,"57.3% [56.1%, 58.6%]",12500,0.71008,"52.5% [51.9%, 53.1%]"
+Llama-8B,12500,0.40552,"58.4% [57.7%, 59.2%]",12500,0.34136,"66.8% [66.0%, 67.6%]"
+Qwen-7B,12508,0.5816277582347298,"66.5% [66.0%, 67.0%]",12492,0.21229586935638808,"67.0% [66.2%, 67.8%]"
+Qwen-14B,12499,0.26082086566925355,"65.7% [64.7%, 66.6%]",12499,0.3654692375390031,"65.9% [65.2%, 66.6%]"

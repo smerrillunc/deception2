@@ -1,0 +1,6 @@
+delta_bucket,Examples,Total directional examples,Share,Direction
+0.1 - 0.2,45851,66405,0.6904751148256908,Deceptive Commitment
+0.2 - 0.3,13396,66405,0.20173179730441984,Deceptive Commitment
+0.3 - 0.4,4441,66405,0.06687749416459604,Deceptive Commitment
+0.4 - 0.5,1553,66405,0.023386793163165425,Deceptive Commitment
+> 0.5,1164,66405,0.01752880054212785,Deceptive Commitment

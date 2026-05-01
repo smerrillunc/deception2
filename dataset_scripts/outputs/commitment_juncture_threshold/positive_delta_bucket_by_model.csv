@@ -1,0 +1,21 @@
+model_display,delta_bucket,Examples,Total directional examples,Share,Direction
+GPT-OSS-20B,0.1 - 0.2,10433,14653,0.7120043677062717,Deceptive Commitment
+GPT-OSS-20B,0.2 - 0.3,2840,14653,0.19381696580904934,Deceptive Commitment
+GPT-OSS-20B,0.3 - 0.4,876,14653,0.05978297959462226,Deceptive Commitment
+GPT-OSS-20B,0.4 - 0.5,317,14653,0.02163379512727769,Deceptive Commitment
+GPT-OSS-20B,> 0.5,187,14653,0.012761891762778954,Deceptive Commitment
+Llama-8B,0.1 - 0.2,10914,16189,0.6741614676632282,Deceptive Commitment
+Llama-8B,0.2 - 0.3,3289,16189,0.20316264129964792,Deceptive Commitment
+Llama-8B,0.3 - 0.4,1238,16189,0.0764716783000803,Deceptive Commitment
+Llama-8B,0.4 - 0.5,417,16189,0.02575823089752301,Deceptive Commitment
+Llama-8B,> 0.5,331,16189,0.020445981839520663,Deceptive Commitment
+Qwen-7B,0.1 - 0.2,12747,19029,0.6698723001734195,Deceptive Commitment
+Qwen-7B,0.2 - 0.3,3838,19029,0.2016921540806138,Deceptive Commitment
+Qwen-7B,0.3 - 0.4,1387,19029,0.07288874875190499,Deceptive Commitment
+Qwen-7B,0.4 - 0.5,547,19029,0.028745598822849334,Deceptive Commitment
+Qwen-7B,> 0.5,510,19029,0.02680119817121236,Deceptive Commitment
+Qwen-14B,0.1 - 0.2,11757,16534,0.7110801983790976,Deceptive Commitment
+Qwen-14B,0.2 - 0.3,3429,16534,0.20739083101487843,Deceptive Commitment
+Qwen-14B,0.3 - 0.4,940,16534,0.05685254626829563,Deceptive Commitment
+Qwen-14B,0.4 - 0.5,272,16534,0.016450949558485545,Deceptive Commitment
+Qwen-14B,> 0.5,136,16534,0.008225474779242773,Deceptive Commitment

@@ -67,7 +67,7 @@ def main() -> None:
 
     ensure_import_paths(repo_root, include_styles=True)
 
-    from neurips import COLORS, add_figure_note, style_axes, style_panel_title
+    from neurips import COLORS, style_axes, style_panel_title
     import datasetmain_commitment_juncture_prevalence_lib as cj
     import datasetmain_commitment_juncture_threshold_lib as cjt
 
@@ -335,35 +335,28 @@ def main() -> None:
         polarity: str,
         groupby_columns: list[str] | None = None,
     ) -> pd.DataFrame:
+        base_columns = list(groupby_columns or []) + [
+            "delta_bucket",
+            "Examples",
+            "Total directional examples",
+            "Share",
+            "Direction",
+        ]
         if pair_source_df.empty:
-            base_columns = list(groupby_columns or []) + [
-                "delta_bucket",
-                "Pairs",
-                "Total directional pairs",
-                "Share",
-                "Direction",
-            ]
             return pd.DataFrame(columns=base_columns)
 
         valid_df = pair_source_df.loc[pair_source_df["pair_is_valid"].fillna(False)].copy()
         polarity_key = str(polarity).strip().lower()
         if polarity_key == "positive":
             subset = valid_df.loc[valid_df["delta_deception_rate"].gt(0.1)].copy()
-            direction_label = "Toward deception"
+            direction_label = "Deceptive Commitment"
         elif polarity_key == "negative":
             subset = valid_df.loc[valid_df["delta_deception_rate"].lt(-0.1)].copy()
-            direction_label = "Toward truthfulness"
+            direction_label = "Truthful Commitment"
         else:
             raise ValueError(f"Unsupported polarity={polarity!r}")
 
         if subset.empty:
-            base_columns = list(groupby_columns or []) + [
-                "delta_bucket",
-                "Pairs",
-                "Total directional pairs",
-                "Share",
-                "Direction",
-            ]
             return pd.DataFrame(columns=base_columns)
 
         subset["delta_magnitude"] = subset["delta_deception_rate"].abs()
@@ -376,23 +369,28 @@ def main() -> None:
         )
 
         group_columns = list(groupby_columns or [])
+        example_sort_columns = [column for column in ["env_display", "model_display", "example_id", "trace_step"] if column in subset.columns]
+        example_subset = subset.sort_values(example_sort_columns, kind="mergesort").drop_duplicates(
+            cjt.EXAMPLE_KEY_COLUMNS,
+            keep="first",
+        )
         bucket_columns = group_columns + ["delta_bucket"]
         bucket_df = (
-            subset.groupby(bucket_columns, observed=True, as_index=False)
+            example_subset.groupby(bucket_columns, observed=True, as_index=False)
             .size()
-            .rename(columns={"size": "Pairs"})
+            .rename(columns={"size": "Examples"})
         )
         if group_columns:
             total_df = (
-                subset.groupby(group_columns, observed=True, as_index=False)
+                example_subset.groupby(group_columns, observed=True, as_index=False)
                 .size()
-                .rename(columns={"size": "Total directional pairs"})
+                .rename(columns={"size": "Total directional examples"})
             )
             bucket_df = bucket_df.merge(total_df, on=group_columns, how="left")
         else:
-            bucket_df["Total directional pairs"] = int(len(subset))
+            bucket_df["Total directional examples"] = int(len(example_subset))
 
-        bucket_df["Share"] = bucket_df["Pairs"] / bucket_df["Total directional pairs"]
+        bucket_df["Share"] = bucket_df["Examples"] / bucket_df["Total directional examples"]
         bucket_df["Direction"] = direction_label
         bucket_df["delta_bucket"] = pd.Categorical(
             bucket_df["delta_bucket"],
@@ -415,6 +413,10 @@ def main() -> None:
         )
         bucket_df["delta_bucket"] = bucket_df["delta_bucket"].astype(str)
         return bucket_df
+
+    def bucket_artifacts_have_example_counts(*bucket_tables: pd.DataFrame) -> bool:
+        required_columns = {"delta_bucket", "Examples", "Total directional examples", "Share", "Direction"}
+        return all(required_columns.issubset(set(table.columns)) for table in bucket_tables)
 
     def build_bucket_payload(pair_source_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         return {
@@ -451,28 +453,28 @@ def main() -> None:
         return f"{numeric:.0f}"
 
     def plot_bucket_histograms(positive_bucket_df: pd.DataFrame, negative_bucket_df: pd.DataFrame) -> plt.Figure:
-        fig, axes = plt.subplots(1, 2, figsize=(7.4, 3.8), sharey=True)
+        fig, axes = plt.subplots(1, 2, figsize=(8.4, 4.2), sharey=True)
         panel_specs = [
-            ("A. Toward deception", positive_bucket_df, hist_colors["positive"], "Valid pairs with Δ_k > 0.1"),
-            ("B. Toward truthfulness", negative_bucket_df, hist_colors["negative"], "Valid pairs with Δ_k < -0.1"),
+            ("A. Deceptive Commitment", positive_bucket_df, hist_colors["positive"]),
+            ("B. Truthful Commitment", negative_bucket_df, hist_colors["negative"]),
         ]
 
-        max_pairs = 0.0
-        for _, bucket_df, _, _ in panel_specs:
+        max_examples = 0.0
+        for _, bucket_df, _ in panel_specs:
             if not bucket_df.empty:
-                max_pairs = max(max_pairs, float(pd.to_numeric(bucket_df["Pairs"], errors="coerce").max()))
-        y_max = 1.22 * max(max_pairs, 1.0)
+                max_examples = max(max_examples, float(pd.to_numeric(bucket_df["Examples"], errors="coerce").max()))
+        y_max = 1.22 * max(max_examples, 1.0)
 
         for axis_index, (ax, panel_spec) in enumerate(zip(axes, panel_specs, strict=True)):
-            plot_title, plot_df_source, plot_color, plot_subtitle = panel_spec
+            plot_title, plot_df_source, plot_color = panel_spec
             plot_df = plot_df_source.copy()
             if plot_df.empty:
                 style_panel_title(ax, plot_title)
-                style_axes(ax, ylabel="Pairs" if axis_index == 0 else None, xlabel="|Δ_k| bucket", ylim=(0, 1), grid_axis="y")
+                style_axes(ax, ylabel="Examples" if axis_index == 0 else None, xlabel="|Δ_k| bucket", ylim=(0, 1), grid_axis="y")
                 ax.text(
                     0.5,
                     0.5,
-                    "No qualifying pairs",
+                    "No qualifying examples",
                     transform=ax.transAxes,
                     ha="center",
                     va="center",
@@ -482,13 +484,13 @@ def main() -> None:
 
             plot_df["delta_bucket"] = pd.Categorical(plot_df["delta_bucket"], categories=delta_bucket_labels, ordered=True)
             plot_df = plot_df.set_index("delta_bucket").reindex(delta_bucket_labels).reset_index()
-            plot_df["Pairs"] = pd.to_numeric(plot_df["Pairs"], errors="coerce").fillna(0.0)
+            plot_df["Examples"] = pd.to_numeric(plot_df["Examples"], errors="coerce").fillna(0.0)
             plot_df["Share"] = pd.to_numeric(plot_df["Share"], errors="coerce").fillna(0.0)
 
             x_positions = np.arange(len(delta_bucket_labels))
             bars = ax.bar(
                 x_positions,
-                plot_df["Pairs"],
+                plot_df["Examples"],
                 width=0.68,
                 color=plot_color,
                 edgecolor=COLORS["light_gray"],
@@ -496,20 +498,10 @@ def main() -> None:
                 zorder=3,
             )
             style_panel_title(ax, plot_title)
-            style_axes(ax, ylabel="Pairs" if axis_index == 0 else None, xlabel="|Δ_k| bucket", ylim=(0, y_max), grid_axis="y")
+            style_axes(ax, ylabel="Examples" if axis_index == 0 else None, xlabel="|Δ_k| bucket", ylim=(0, y_max), grid_axis="y")
             ax.set_xticks(x_positions)
-            ax.set_xticklabels(delta_bucket_labels)
-            ax.text(0.02, 0.98, plot_subtitle, transform=ax.transAxes, ha="left", va="top", fontsize=8.6, color=COLORS["muted_ink"])
-            ax.text(
-                0.98,
-                0.98,
-                f"n = {int(plot_df['Pairs'].sum()):,}",
-                transform=ax.transAxes,
-                ha="right",
-                va="top",
-                fontsize=8.6,
-                color=COLORS["muted_ink"],
-            )
+            ax.set_xticklabels(delta_bucket_labels, rotation=45, ha="right")
+            ax.margins(x=0.06)
 
             for bar, row in zip(bars, plot_df.itertuples(index=False), strict=False):
                 height = float(bar.get_height())
@@ -525,11 +517,7 @@ def main() -> None:
                     clip_on=False,
                 )
 
-        add_figure_note(
-            fig,
-            "Bars show counts of valid same-direction junctures in each |Δ_k| bucket; labels report count and within-direction share.",
-        )
-        fig.tight_layout(rect=(0, 0.08, 1, 1))
+        fig.tight_layout()
         return fig
 
     inventory_table_df = pd.DataFrame()
@@ -638,25 +626,37 @@ def main() -> None:
     negative_bucket_by_model_df = pd.DataFrame()
 
     if args.load_artifacts_if_available and artifact_group_exists(required_bucket_artifact_stems):
-        bucket_tables_loaded_from_artifacts = True
         positive_bucket_overall_df = load_artifact_table("positive_delta_bucket_overall")
         negative_bucket_overall_df = load_artifact_table("negative_delta_bucket_overall")
         positive_bucket_by_model_df = load_artifact_table("positive_delta_bucket_by_model")
         negative_bucket_by_model_df = load_artifact_table("negative_delta_bucket_by_model")
-        bucket_message = f"Loaded saved delta-bucket summaries from {output_dir}."
-    else:
+        if bucket_artifacts_have_example_counts(
+            positive_bucket_overall_df,
+            negative_bucket_overall_df,
+            positive_bucket_by_model_df,
+            negative_bucket_by_model_df,
+        ):
+            bucket_tables_loaded_from_artifacts = True
+            bucket_message = f"Loaded saved delta-bucket summaries from {output_dir}."
+        else:
+            bucket_message = f"Found stale pair-based delta-bucket summaries in {output_dir}. Rebuilding example-based summaries."
+
+    if not bucket_tables_loaded_from_artifacts:
         if pair_df.empty and pair_artifact_path.exists():
             valid_pair_df = pd.read_parquet(pair_artifact_path)
             pair_df = valid_pair_df.copy()
-            bucket_message = (
-                f"Loaded {pair_artifact_path.name} and rebuilt the delta-bucket summaries "
-                "without re-scanning raw JSON files."
-            )
+            if not bucket_message:
+                bucket_message = (
+                    f"Loaded {pair_artifact_path.name} and rebuilt the delta-bucket summaries "
+                    "without re-scanning raw JSON files."
+                )
         elif pair_df.empty:
             inventory_df, prefix_df, parse_error_df, pair_df, valid_pair_df = ensure_raw_threshold_inputs_loaded()
-            bucket_message = "Computed delta-bucket summaries from the raw localization JSON files because no cached bucket artifacts were present."
+            if not bucket_message:
+                bucket_message = "Computed delta-bucket summaries from the raw localization JSON files because no cached bucket artifacts were present."
         else:
-            bucket_message = "Reused in-memory pair_df to build the delta-bucket summaries."
+            if not bucket_message:
+                bucket_message = "Reused in-memory pair_df to build the delta-bucket summaries."
 
         bucket_payload = build_bucket_payload(pair_df)
         positive_bucket_overall_df = bucket_payload["positive_bucket_overall_df"]

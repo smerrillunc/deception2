@@ -1,0 +1,20 @@
+{
+  "bootstrap_num_resamples": 1000,
+  "completed_at_utc": "2026-04-30T03:15:21.480126+00:00",
+  "datasetmain_root": "/work/users/s/m/smerrill/deception2/DatasetMain",
+  "delta_threshold": 0.3,
+  "example_rows": 99998,
+  "force_rebuild_summaries": false,
+  "helper_module": "/work/users/s/m/smerrill/deception2/dataset_scripts/datasetmain_commitment_juncture_prevalence_lib.py",
+  "inventory_rows": 20,
+  "load_summary_cache": true,
+  "max_json_files_per_bundle": null,
+  "output_dir": "/work/users/s/m/smerrill/deception2/dataset_scripts/outputs/datasetmain_commitment_juncture_prevalence_paper",
+  "parse_error_rows": 2,
+  "progress_level": "bundle",
+  "repo_root": "/work/users/s/m/smerrill/deception2",
+  "save_summary_cache": true,
+  "script": "/work/users/s/m/smerrill/deception2/dataset_scripts/datasetmain_commitment_juncture_prevalence_paper.py",
+  "show_progress": true,
+  "summary_source": "raw_json"
+}
