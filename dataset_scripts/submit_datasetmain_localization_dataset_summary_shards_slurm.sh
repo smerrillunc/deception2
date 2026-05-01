@@ -3,7 +3,6 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-/work/users/s/m/smerrill/deception2}"
-SCRIPT_PATH="$PROJECT_ROOT/dataset_scripts/datasetmain_localization_dataset_summary.py"
 WORKER_SCRIPT="$PROJECT_ROOT/dataset_scripts/run_datasetmain_localization_dataset_summary_slurm.sh"
 DATASETMAIN_ROOT="${DATASETMAIN_ROOT:-$PROJECT_ROOT/DatasetMain}"
 BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-$PROJECT_ROOT/dataset_scripts/outputs/datasetmain_localization_dataset_summary_sharded}"
@@ -23,11 +22,28 @@ SUBMIT_COMBINE="${SUBMIT_COMBINE:-1}"
 
 mkdir -p "$SHARD_OUTPUT_ROOT" "$COMBINE_OUTPUT_DIR"
 
+if [[ ! -d "$DATASETMAIN_ROOT" ]]; then
+  echo "DatasetMain root does not exist: $DATASETMAIN_ROOT" >&2
+  exit 1
+fi
+
+slugify() {
+  local raw_slug="$1"
+  local slug
+  slug="$(printf '%s' "$raw_slug" | sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^[._-]+//; s/[._-]+$//')"
+  if [[ -z "$slug" ]]; then
+    slug="shard"
+  fi
+  printf '%s\n' "$slug"
+}
+
 mapfile -t SHARD_ROWS < <(
-  python "$SCRIPT_PATH" \
-    --repo-root "$PROJECT_ROOT" \
-    --datasetmain-root "$DATASETMAIN_ROOT" \
-    --list-shards
+  while IFS= read -r bundle_dir; do
+    env_name="$(basename "$(dirname "$bundle_dir")")"
+    model_name="$(basename "$bundle_dir")"
+    shard_slug="$(slugify "${env_name}__${model_name}")"
+    printf '%s\t%s\t%s\t%s\n' "$env_name" "$model_name" "$shard_slug" "$bundle_dir"
+  done < <(find "$DATASETMAIN_ROOT" -mindepth 2 -maxdepth 2 -type d | LC_ALL=C sort)
 )
 
 if [[ ${#SHARD_ROWS[@]} -eq 0 ]]; then
@@ -62,8 +78,8 @@ printf 'Submitted %d shard jobs.\n' "${#JOB_IDS[@]}"
 if [[ "$SUBMIT_COMBINE" != "1" ]]; then
   echo "Shard outputs will land under: $SHARD_OUTPUT_ROOT"
   echo "Combine later with:"
-  printf '  python %q --repo-root %q --datasetmain-root %q --output-dir %q --combine-shard-output-root %q\n' \
-    "$SCRIPT_PATH" "$PROJECT_ROOT" "$DATASETMAIN_ROOT" "$COMBINE_OUTPUT_DIR" "$SHARD_OUTPUT_ROOT"
+  printf '  sbatch --export=ALL,PROJECT_ROOT=%q,DATASETMAIN_ROOT=%q,OUTPUT_DIR=%q,HF_CACHE_ROOT=%q,CONDA_ENV=%q,TOKEN_COUNT_MODE=%q,NUM_WORKERS=1,PROGRESS_LEVEL=bundle,FORCE_REBUILD_BUNDLE_SUMMARY=0,SHOW_PROGRESS=0,COMBINE_SHARD_OUTPUT_ROOT=%q,LOAD_BUNDLE_SUMMARY_CACHE=0,SAVE_BUNDLE_SUMMARY_CACHE=0 %q\n' \
+    "$PROJECT_ROOT" "$DATASETMAIN_ROOT" "$COMBINE_OUTPUT_DIR" "$HF_CACHE_ROOT" "$CONDA_ENV" "$TOKEN_COUNT_MODE" "$SHARD_OUTPUT_ROOT" "$WORKER_SCRIPT"
   exit 0
 fi
 
