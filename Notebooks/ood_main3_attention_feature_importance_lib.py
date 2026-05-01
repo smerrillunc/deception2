@@ -59,12 +59,51 @@ GROUP_DISPLAY = {
     "concentration_transition": "Concentration transition",
 }
 ATTENTION_BLUE_SEQUENCE = [COLORS["blue"], "#5E83A5", "#86A6BF", "#B8C7E0"]
-GROUP_COLORS = {
-    "grounding": ATTENTION_BLUE_SEQUENCE[0],
-    "concentration": ATTENTION_BLUE_SEQUENCE[1],
-    "grounding_transition": ATTENTION_BLUE_SEQUENCE[2],
-    "concentration_transition": ATTENTION_BLUE_SEQUENCE[3],
+
+def normalize_feature_group(value: object) -> str:
+    key = _text_or_empty(value).strip().lower()
+    key = " ".join(key.replace("-", " ").replace("_", " ").split())
+    key = key.replace(" ", "_")
+
+    aliases = {
+        "grounding_transitions": "grounding_transition",
+        "concentration_transitions": "concentration_transition",
+    }
+    return aliases.get(key, key)
+
+
+GROUP_STYLES = {
+    "grounding": {
+        "facecolor": "#3B82C4",
+        "hatch": "",
+    },
+    "grounding_transition": {
+        "facecolor": "#3B82C4",
+        "hatch": "//",
+    },
+    "concentration": {
+        "facecolor": "#A8CFE8",
+        "hatch": "",
+    },
+    "concentration_transition": {
+        "facecolor": "#A8CFE8",
+        "hatch": "//",
+    },
 }
+
+GROUP_DISPLAY_CANONICAL = {
+    "grounding": "Grounding",
+    "concentration": "Concentration",
+    "grounding_transition": "Grounding transition",
+    "concentration_transition": "Concentration transition",
+}
+
+GROUP_ORDER_CANONICAL = [
+    "grounding",
+    "concentration",
+    "grounding_transition",
+    "concentration_transition",
+]
 ATTENTION_HEATMAP_CMAP = LinearSegmentedColormap.from_list(
     "attention_feature_blues",
     ["#F8FBFF", COLORS["light_gray"], ATTENTION_BLUE_SEQUENCE[2], ATTENTION_BLUE_SEQUENCE[0]],
@@ -74,8 +113,13 @@ BAND_ORDER = ["early", "mid", "late"]
 BAND_DISPLAY = {"early": "Early", "mid": "Mid", "late": "Late"}
 HEAD_SUMMARY_DISPLAY = {"mean": "Head Mean", "std": "Head Std", "max": "Head Max"}
 BAND_STAT_DISPLAY = {"mean": "Mean", "std": "Std", "min": "Min", "max": "Max"}
-PANEL_TITLE_FONTSIZE = 12.5
-PANEL_TITLE_PAD = 9
+MODEL_DISPLAY_OVERRIDES = {
+    "Llama-8B": "R1-Distill Llama-8B",
+    "Qwen-7B": "R1-Distill Qwen-7B",
+    "Qwen-14B": "R1-Distill Qwen-14B",
+}
+PANEL_TITLE_FONTSIZE = 11.5
+PANEL_TITLE_PAD = 8
 PAPER_METRIC_DISPLAY = {
     "current_vs_prev": "Local grounding",
     "current_vs_prior": "History grounding",
@@ -135,6 +179,12 @@ pd.options.display.max_columns = 200
 
 
 def _set_panel_title(ax: plt.Axes, title: str) -> None:
+    title = str(title or "").strip()
+    if " | " in title:
+        first, rest = title.split(" | ", 1)
+        title = f"{first}\n{textwrap.fill(rest, width=24)}"
+    else:
+        title = textwrap.fill(title, width=26)
     ax.set_title(
         title,
         loc="left",
@@ -168,6 +218,11 @@ def _text_or_empty(value: object) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def display_model_name(value: object) -> str:
+    model_name = _text_or_empty(value)
+    return MODEL_DISPLAY_OVERRIDES.get(model_name, model_name)
 
 
 def _first_present(values: pd.Series, default: object = pd.NA) -> object:
@@ -324,7 +379,7 @@ def compact_attention_space_label(value: object) -> str:
 
 
 def selection_heading_label(selection_row: pd.Series) -> str:
-    model_name = _text_or_empty(selection_row.get("Model"))
+    model_name = display_model_name(selection_row.get("Model"))
     suffix = compact_attention_space_label(selection_row.get("feature_space_title"))
     if model_name and suffix:
         return f"{model_name} | {suffix}"
@@ -592,6 +647,7 @@ def build_display_selection_table(selection_df: pd.DataFrame) -> pd.DataFrame:
     if selection_df.empty:
         return pd.DataFrame()
     out = selection_df.loc[:, ["Model", "mean_ood_auroc", "ood_auroc_se", "mean_validation_auroc", "validation_auroc_se", "training_splits", "selected_feature_count"]].copy()
+    out["Model"] = [display_model_name(value) for value in out["Model"]]
     out = out.rename(
         columns={
             "training_splits": "Training Splits",
@@ -751,6 +807,16 @@ def save_figure(fig: plt.Figure, export_root: Path, *, filename: str, export_fig
     return out_path
 
 
+def _panel_grid_shape(n_panels: int) -> tuple[int, int]:
+    if n_panels >= 4:
+        return int(math.ceil(n_panels / 2)), 2
+    return 1, max(1, int(n_panels))
+
+
+def _is_right_column(panel_index: int, ncols: int) -> bool:
+    return ncols > 1 and (panel_index % ncols) == (ncols - 1)
+
+
 def plot_top_features_across_models(
     payloads: list[dict[str, object]],
     *,
@@ -764,37 +830,83 @@ def plot_top_features_across_models(
         return None
 
     n_models = len(payloads)
-    figure_height = max(5.8, 0.48 * top_k + 2.0)
+    nrows, ncols = _panel_grid_shape(n_models)
+    per_row_height = max(4.8, 0.45 * top_k + 1.7)
+    figure_height = nrows * per_row_height + (1.0 if n_models >= 4 else 0.6)
 
     with plt.rc_context(PLOT_RC):
-        fig_width = max(FIGURE_SIZES["double"][0], 4.1 * n_models)
-        fig, axes = plt.subplots(1, n_models, figsize=(fig_width, figure_height), constrained_layout=True)
-        axes_array = np.atleast_1d(axes)
+        if n_models >= 4:
+            fig_width = max(FIGURE_SIZES["double_tall"][0], 10.8)
+        else:
+            fig_width = max(FIGURE_SIZES["double"][0], 5.0 * ncols + 1.0)
+
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(fig_width, figure_height),
+            squeeze=False,
+        )
+        axes_array = axes.reshape(-1)
 
         legend_handles: dict[str, Any] = {}
+
+        # Include error bars in x-axis scaling so whiskers do not get clipped.
         max_share = 0.0
         for payload in payloads:
             feature_summary_df = payload["feature_summary_df"]
             if feature_summary_df.empty:
                 continue
-            max_share = max(
-                max_share,
-                float(pd.to_numeric(feature_summary_df.head(top_k)["mean_importance_share"], errors="coerce").max()),
-            )
+
+            top_df = feature_summary_df.head(top_k)
+
+            means = pd.to_numeric(
+                top_df["mean_importance_share"],
+                errors="coerce",
+            ).fillna(0.0)
+
+            ses = pd.to_numeric(
+                top_df["se_importance_share"],
+                errors="coerce",
+            ).fillna(0.0)
+
+            max_share = max(max_share, float((means + ses).max()))
+
         max_share = max(max_share, 1e-4)
 
-        for ax, payload in zip(axes_array, payloads, strict=False):
+        for panel_index, (ax, payload) in enumerate(zip(axes_array, payloads, strict=False)):
             selection_row = payload["selection"]
             feature_summary_df = payload["feature_summary_df"].head(top_k).iloc[::-1].copy()
-            colors = [GROUP_COLORS.get(_text_or_empty(value), "#6b7280") for value in feature_summary_df["attention_feature_group"]]
+
+            group_keys = [
+                normalize_feature_group(value)
+                for value in feature_summary_df["attention_feature_group"]
+            ]
+
+            facecolors = [
+                GROUP_STYLES.get(key, {"facecolor": "#6b7280"})["facecolor"]
+                for key in group_keys
+            ]
+
+            hatches = [
+                GROUP_STYLES.get(key, {"hatch": ""})["hatch"]
+                for key in group_keys
+            ]
+
             y_positions = np.arange(len(feature_summary_df))
-            ax.barh(
+
+            bars = ax.barh(
                 y_positions,
-                100.0 * pd.to_numeric(feature_summary_df["mean_importance_share"], errors="coerce"),
-                xerr=100.0 * pd.to_numeric(feature_summary_df["se_importance_share"], errors="coerce").fillna(0.0),
-                color=colors,
-                edgecolor=COLORS["light_gray"],
-                linewidth=0.7,
+                100.0 * pd.to_numeric(
+                    feature_summary_df["mean_importance_share"],
+                    errors="coerce",
+                ),
+                xerr=100.0 * pd.to_numeric(
+                    feature_summary_df["se_importance_share"],
+                    errors="coerce",
+                ).fillna(0.0),
+                color=facecolors,
+                edgecolor="#334155",
+                linewidth=0.75,
                 alpha=0.96,
                 error_kw={
                     "ecolor": COLORS["ink"],
@@ -804,30 +916,93 @@ def plot_top_features_across_models(
                 },
                 zorder=3,
             )
-            ax.set_yticks(y_positions)
-            ax.set_yticklabels([compact_feature_label(row) for _, row in feature_summary_df.iterrows()], fontsize=8.8)
-            style_axes(ax, xlabel="Mean importance share (%)", grid_axis="x")
-            ax.set_xlim(0.0, 100.0 * max_share * 1.18)
-            _set_panel_title(ax, selection_heading_label(selection_row))
-            ax.tick_params(axis="y", length=0)
-            ax.tick_params(axis="x", labelsize=9)
-            for row in feature_summary_df.itertuples(index=False):
-                group_name = _text_or_empty(getattr(row, "attention_feature_group", ""))
-                if group_name not in legend_handles:
-                    legend_handles[group_name] = plt.Rectangle((0, 0), 1, 1, color=GROUP_COLORS.get(group_name, "#6b7280"))
 
-        legend_order = [group_name for group_name in GROUP_ORDER if group_name in legend_handles]
-        legend_labels = [GROUP_DISPLAY.get(name, name) for name in legend_order]
+            # Add hatching to transition analogs.
+            for bar, hatch in zip(bars.patches, hatches, strict=False):
+                bar.set_hatch(hatch)
+                bar.set_edgecolor("#334155")
+                bar.set_linewidth(0.75)
+
+            ax.set_yticks(y_positions)
+            ax.set_yticklabels(
+                [compact_feature_label(row) for _, row in feature_summary_df.iterrows()],
+                fontsize=8.8,
+            )
+
+            style_axes(ax, xlabel="Mean importance share (%)", grid_axis="x")
+            ax.set_xlim(0.0, 100.0 * max_share * 1.30)
+
+            _set_panel_title(ax, selection_heading_label(selection_row))
+
+            if _is_right_column(panel_index, ncols):
+                ax.yaxis.tick_right()
+                ax.tick_params(axis="y", labelright=True, labelleft=False, pad=6, length=0)
+                for label in ax.get_yticklabels():
+                    label.set_horizontalalignment("left")
+            else:
+                ax.tick_params(axis="y", labelright=False, labelleft=True, pad=4, length=0)
+
+            ax.tick_params(axis="x", labelsize=9)
+
+            for key in group_keys:
+                if key not in legend_handles:
+                    style = GROUP_STYLES.get(
+                        key,
+                        {
+                            "facecolor": "#6b7280",
+                            "hatch": "",
+                        },
+                    )
+                    legend_handles[key] = plt.Rectangle(
+                        (0, 0),
+                        1,
+                        1,
+                        facecolor=style["facecolor"],
+                        edgecolor="#334155",
+                        hatch=style["hatch"],
+                        linewidth=0.75,
+                    )
+
+        for ax in axes_array[n_models:]:
+            ax.axis("off")
+
+        legend_order = [
+            group_name
+            for group_name in GROUP_ORDER_CANONICAL
+            if group_name in legend_handles
+        ]
+
+        # Include any unexpected groups at the end rather than silently dropping them.
+        legend_order += [
+            group_name
+            for group_name in legend_handles
+            if group_name not in legend_order
+        ]
+
+        legend_labels = [
+            GROUP_DISPLAY_CANONICAL.get(group_name, group_name.replace("_", " ").title())
+            for group_name in legend_order
+        ]
+
         if legend_handles:
             fig.legend(
                 [legend_handles[name] for name in legend_order],
                 legend_labels,
                 ncol=min(4, len(legend_handles)),
                 loc="lower center",
-                bbox_to_anchor=(0.5, -0.08),
+                bbox_to_anchor=(0.5, 0.03 if n_models >= 4 else 0.02),
                 frameon=False,
                 fontsize=10,
             )
+
+        fig.subplots_adjust(
+            left=0.08,
+            right=0.96 if n_models >= 4 else 0.995,
+            bottom=0.11 if n_models >= 4 else (0.17 if legend_handles else 0.12),
+            top=0.92 if n_models >= 4 else 0.88,
+            wspace=0.1 if n_models >= 4 else 0.10,
+            hspace=0.30 if n_models >= 4 else 0.22,
+        )
 
         out_path = save_figure(
             fig,
@@ -835,10 +1010,10 @@ def plot_top_features_across_models(
             filename=f"{_slugify(scenario_heading)}__{target_name}__top_attention_features.png",
             export_figures=export_figures,
         )
+
         plt.show()
         plt.close(fig)
         return out_path
-
 
 def plot_group_band_heatmaps_across_models(
     payloads: list[dict[str, object]],
@@ -852,6 +1027,7 @@ def plot_group_band_heatmaps_across_models(
         return None
 
     n_models = len(payloads)
+    nrows, ncols = _panel_grid_shape(n_models)
     vmax = 0.0
     for payload in payloads:
         matrix_df = payload["group_band_df"]
@@ -861,11 +1037,16 @@ def plot_group_band_heatmaps_across_models(
     vmax = max(vmax, 1e-6)
 
     with plt.rc_context(PLOT_RC):
-        fig_width = max(FIGURE_SIZES["double_tall"][0], 3.7 * n_models)
-        fig, axes = plt.subplots(1, n_models, figsize=(fig_width, 4.8), constrained_layout=True)
-        axes_array = np.atleast_1d(axes)
+        if n_models >= 4:
+            fig_width = max(FIGURE_SIZES["double_tall"][0], 10.5)
+            figure_height = max(8.0, 3.8 * nrows + 0.7)
+        else:
+            fig_width = max(FIGURE_SIZES["double_tall"][0], 4.3 * ncols + 0.9)
+            figure_height = 4.9
+        fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, figure_height), squeeze=False)
+        axes_array = axes.reshape(-1)
         image = None
-        for ax, payload in zip(axes_array, payloads, strict=False):
+        for panel_index, (ax, payload) in enumerate(zip(axes_array, payloads, strict=False)):
             selection_row = payload["selection"]
             matrix_df = payload["group_band_df"].reindex(index=GROUP_ORDER, columns=BAND_ORDER).fillna(0.0)
             heat_values = 100.0 * matrix_df.to_numpy(dtype=float)
@@ -873,7 +1054,10 @@ def plot_group_band_heatmaps_across_models(
             ax.set_xticks(np.arange(len(BAND_ORDER)))
             ax.set_xticklabels([BAND_DISPLAY[band] for band in BAND_ORDER], fontsize=9)
             ax.set_yticks(np.arange(len(GROUP_ORDER)))
-            ax.set_yticklabels([GROUP_DISPLAY[group_name] for group_name in GROUP_ORDER], fontsize=9)
+            if _is_right_column(panel_index, ncols):
+                ax.set_yticklabels([])
+            else:
+                ax.set_yticklabels([GROUP_DISPLAY[group_name] for group_name in GROUP_ORDER], fontsize=9)
             _set_panel_title(ax, selection_heading_label(selection_row))
             label_threshold = 58.0 * vmax
             for row_idx in range(matrix_df.shape[0]):
@@ -882,16 +1066,29 @@ def plot_group_band_heatmaps_across_models(
                     text_color = "white" if value > label_threshold else COLORS["ink"]
                     ax.text(col_idx, row_idx, f"{value:.1f}%", ha="center", va="center", fontsize=8.6, color=text_color)
             ax.set_xlabel("Layer band", fontsize=10)
-            ax.set_ylabel("Attention family", fontsize=10)
+            ax.set_ylabel("Attention family", fontsize=10 if not _is_right_column(panel_index, ncols) else 0)
+            if _is_right_column(panel_index, ncols):
+                ax.set_ylabel("")
             ax.set_xticks(np.arange(-0.5, len(BAND_ORDER), 1), minor=True)
             ax.set_yticks(np.arange(-0.5, len(GROUP_ORDER), 1), minor=True)
             ax.grid(which="minor", color="white", linewidth=1.1)
             ax.tick_params(which="minor", bottom=False, left=False)
             ax.tick_params(axis="both", length=0)
+        for ax in axes_array[n_models:]:
+            ax.axis("off")
 
         if image is not None:
-            cbar = fig.colorbar(image, ax=axes_array.ravel().tolist(), fraction=0.035, pad=0.03, label="Mean importance share (%)")
+            cbar_ax = fig.add_axes([0.905, 0.16, 0.018, 0.68] if n_models >= 4 else [0.905, 0.18, 0.018, 0.64])
+            cbar = fig.colorbar(image, cax=cbar_ax, label="Mean importance share (%)")
             cbar.outline.set_visible(False)
+        fig.subplots_adjust(
+            left=0.06,
+            right=0.88,
+            bottom=0.10,
+            top=0.92 if n_models >= 4 else 0.88,
+            wspace=0.1 if n_models >= 4 else 0.1,
+            hspace=0.40 if n_models >= 4 else 0.25,
+        )
         out_path = save_figure(
             fig,
             export_root,
