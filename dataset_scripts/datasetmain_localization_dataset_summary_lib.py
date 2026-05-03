@@ -315,6 +315,68 @@ def count_text_sentences(text: Any) -> int:
     return max(1, len(parts))
 
 
+def _coerce_nonnegative_int(value: Any) -> int | None:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None
+    if coerced < 0:
+        return None
+    return coerced
+
+
+def _extract_reasoning_text(payload: dict[str, Any], history: list[Any]) -> str:
+    raw_text = str(payload.get("raw_text") or "").strip()
+    if raw_text:
+        return raw_text
+
+    longest_prefix_text = ""
+    for row in history:
+        row_dict = row if isinstance(row, dict) else {}
+        prefix_text = str(row_dict.get("prefix_text") or "")
+        if len(prefix_text) >= len(longest_prefix_text):
+            longest_prefix_text = prefix_text
+    return longest_prefix_text.strip()
+
+
+def _estimate_reasoning_sentence_total(*, reasoning_text: str, history: list[Any]) -> int:
+    if reasoning_text:
+        return count_text_sentences(reasoning_text)
+
+    max_sentence_idx: int | None = None
+    for row in history:
+        row_dict = row if isinstance(row, dict) else {}
+        sentence_idx = _coerce_nonnegative_int(
+            row_dict.get("sentence_idx_inclusive", row_dict.get("sentence_idx"))
+        )
+        if sentence_idx is None:
+            continue
+        if max_sentence_idx is None or sentence_idx > max_sentence_idx:
+            max_sentence_idx = sentence_idx
+
+    if max_sentence_idx is not None:
+        return max_sentence_idx + 1
+    return len(history)
+
+
+def _estimate_prefix_sentence_count(
+    row_dict: dict[str, Any],
+    *,
+    prefix_text: str,
+    localized_sentence_rank: int,
+) -> int:
+    sentence_idx = _coerce_nonnegative_int(
+        row_dict.get("sentence_idx_inclusive", row_dict.get("sentence_idx"))
+    )
+    if sentence_idx is not None:
+        return sentence_idx + 1
+
+    prefix_sentence_count = count_text_sentences(prefix_text)
+    if prefix_sentence_count > 0:
+        return prefix_sentence_count
+    return localized_sentence_rank
+
+
 def build_shard_slug(env_name: str, model_name: str) -> str:
     raw_slug = f"{env_name}__{model_name}"
     slug = SHARD_SLUG_PATTERN.sub("_", raw_slug).strip("._-")
@@ -398,6 +460,15 @@ def _extract_continuation_text(generation: dict[str, Any], *, prefix_text: str) 
     if prefix_text and full_generation_text.startswith(prefix_text):
         return full_generation_text[len(prefix_text):]
     return full_generation_text
+
+
+def _extract_full_generation_text(generation: dict[str, Any], *, prefix_text: str) -> str:
+    full_generation_text = str(generation.get("full_generation_text") or "")
+    if full_generation_text:
+        return full_generation_text
+
+    continuation_text = _extract_continuation_text(generation, prefix_text=prefix_text)
+    return f"{prefix_text}{continuation_text}"
 
 
 def _localization_paths_for_bundle(bundle_dir: Path, *, max_files: int | None) -> list[Path]:
@@ -573,12 +644,12 @@ def _summarize_localization_payload(
     history = payload.get("history") or []
     if not isinstance(history, list):
         history = []
-    raw_text = str(payload.get("raw_text") or "")
+    reasoning_text = _extract_reasoning_text(payload, history)
 
     file_stats = {
         "file_count": 1,
         "file_size_bytes_total": int(path.stat().st_size),
-        "reasoning_sentence_total": len(history),
+        "reasoning_sentence_total": 0,
         "reasoning_token_total": 0,
         "reasoning_word_total": 0,
         "localized_prefix_total": 0,
@@ -597,6 +668,7 @@ def _summarize_localization_payload(
     last_prefix_text = ""
     last_prefix_token_count = 0
     last_prefix_word_count = 0
+    full_generation_count = 0
 
     for sentence_pos, row in enumerate(history, start=1):
         row_dict = row if isinstance(row, dict) else {}
@@ -619,7 +691,11 @@ def _summarize_localization_payload(
                 hf_cache_root=hf_cache_root,
             )
             prompt_word_count = count_text_words(prefix_text)
-        prompt_sentence_count = sentence_pos
+        prompt_sentence_count = _estimate_prefix_sentence_count(
+            row_dict,
+            prefix_text=prefix_text,
+            localized_sentence_rank=sentence_pos,
+        )
 
         last_prefix_text = prefix_text
         last_prefix_token_count = prompt_token_count
@@ -642,6 +718,18 @@ def _summarize_localization_payload(
         for generation in generations:
             generation_dict = generation if isinstance(generation, dict) else {}
             continuation_text = _extract_continuation_text(generation_dict, prefix_text=prefix_text)
+            full_generation_text = _extract_full_generation_text(generation_dict, prefix_text=prefix_text)
+
+            file_stats["reasoning_sentence_total"] += count_text_sentences(full_generation_text)
+            file_stats["reasoning_token_total"] += count_text_tokens(
+                full_generation_text,
+                token_count_mode=token_count_mode,
+                model_name=model_name,
+                hf_cache_root=hf_cache_root,
+            )
+            file_stats["reasoning_word_total"] += count_text_words(full_generation_text)
+            full_generation_count += 1
+
             file_stats["continuation_sentence_total"] += count_text_sentences(continuation_text)
             file_stats["continuation_token_total"] += count_text_tokens(
                 continuation_text,
@@ -651,17 +739,22 @@ def _summarize_localization_payload(
             )
             file_stats["continuation_word_total"] += count_text_words(continuation_text)
 
-    if history and raw_text == last_prefix_text:
-        file_stats["reasoning_token_total"] = int(last_prefix_token_count)
-        file_stats["reasoning_word_total"] = int(last_prefix_word_count)
-    else:
-        file_stats["reasoning_token_total"] = count_text_tokens(
-            raw_text,
-            token_count_mode=token_count_mode,
-            model_name=model_name,
-            hf_cache_root=hf_cache_root,
+    if full_generation_count == 0:
+        file_stats["reasoning_sentence_total"] = _estimate_reasoning_sentence_total(
+            reasoning_text=reasoning_text,
+            history=history,
         )
-        file_stats["reasoning_word_total"] = count_text_words(raw_text)
+        if history and reasoning_text == last_prefix_text:
+            file_stats["reasoning_token_total"] = int(last_prefix_token_count)
+            file_stats["reasoning_word_total"] = int(last_prefix_word_count)
+        else:
+            file_stats["reasoning_token_total"] = count_text_tokens(
+                reasoning_text,
+                token_count_mode=token_count_mode,
+                model_name=model_name,
+                hf_cache_root=hf_cache_root,
+            )
+            file_stats["reasoning_word_total"] = count_text_words(reasoning_text)
 
     return file_stats
 
@@ -1153,9 +1246,9 @@ def make_total_summary_table(summary_df: pd.DataFrame) -> pd.DataFrame:
         ("Skipped broken localization JSON rate", float(totals["skipped_json_rate"])),
         ("Localized sentences", int(totals["localized_prefix_total"])),
         ("Continuations", int(totals["continuation_total"])),
-        ("Unique reasoning sentences", int(totals["reasoning_sentence_total"])),
-        ("Unique reasoning tokens", int(totals["reasoning_token_total"])),
-        ("Unique reasoning words", int(totals["reasoning_word_total"])),
+        ("Reasoning sentences across full generations", int(totals["reasoning_sentence_total"])),
+        ("Reasoning tokens across full generations", int(totals["reasoning_token_total"])),
+        ("Reasoning words across full generations", int(totals["reasoning_word_total"])),
         ("Unique localized-prefix tokens", int(totals["prompt_token_total_unique"])),
         ("Unique localized-prefix words", int(totals["prompt_word_total_unique"])),
         ("Expanded prompt sentences", int(totals["prompt_sentence_total_expanded"])),
@@ -1208,9 +1301,9 @@ def make_dataset_overview_table(summary_df: pd.DataFrame) -> pd.DataFrame:
         ("Skip rate (%)", float(totals["skipped_json_rate"]) * 100.0),
         ("Localized traces", int(totals["localized_prefix_total"])),
         ("Continuations", int(totals["continuation_total"])),
-        ("Unique reasoning sentences", int(totals["reasoning_sentence_total"])),
-        ("Unique reasoning tokens", int(totals["reasoning_token_total"])),
-        ("Unique reasoning words", int(totals["reasoning_word_total"])),
+        ("Reasoning sentences across full generations", int(totals["reasoning_sentence_total"])),
+        ("Reasoning tokens across full generations", int(totals["reasoning_token_total"])),
+        ("Reasoning words across full generations", int(totals["reasoning_word_total"])),
         ("Expanded dataset sentences", int(totals["expanded_dataset_sentence_total"])),
         ("Expanded dataset tokens", int(totals["expanded_dataset_token_total"])),
         ("Expanded dataset words", int(totals["expanded_dataset_word_total"])),

@@ -21,7 +21,7 @@ from dataset_scripts_common import (
 
 
 SCRIPT_NAME = Path(__file__).stem
-SUMMARY_CACHE_VERSION = "localization_dataset_summary_bundle_cache_v3"
+SUMMARY_CACHE_VERSION = "localization_dataset_summary_bundle_cache_v5"
 
 
 def build_parser() -> argparse.ArgumentParser:
