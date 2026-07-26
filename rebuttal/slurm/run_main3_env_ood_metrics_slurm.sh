@@ -50,9 +50,23 @@ FORCE_REBUILD_REDUCTIONS="${FORCE_REBUILD_REDUCTIONS:-0}"
 DISABLE_TQDM="${DISABLE_TQDM:-1}"
 EXCLUDE_MULTILINE_SENTENCES="${EXCLUDE_MULTILINE_SENTENCES:-0}"
 BUILD_NOTEBOOK="${BUILD_NOTEBOOK:-1}"
+CONDA_ENV="${CONDA_ENV:-deception}"
 
-PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 USE_UV_RUN="${USE_UV_RUN:-0}"
+
+if [[ "$USE_UV_RUN" != "1" && -z "$PYTHON_BIN" ]]; then
+  module load anaconda
+  # shellcheck disable=SC1091
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate "$CONDA_ENV"
+  PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+fi
+
+if [[ "$USE_UV_RUN" != "1" && ! -x "$PYTHON_BIN" ]]; then
+  echo "PYTHON_BIN is not executable: $PYTHON_BIN" >&2
+  exit 1
+fi
 
 cmd=()
 if [[ "$USE_UV_RUN" == "1" ]]; then
@@ -119,11 +133,17 @@ echo "SCENARIOS: $SCENARIOS"
 echo "FEATURE_SPACES: $FEATURE_SPACES"
 echo "FEATURE_SIZES: $FEATURE_SIZES"
 echo "MODEL_FAMILY: $MODEL_FAMILY"
+echo "CONDA_ENV: $CONDA_ENV"
+echo "PYTHON_BIN: ${PYTHON_BIN:-uv run python}"
 echo "XGB_N_ESTIMATORS: $XGB_N_ESTIMATORS"
 echo "XGB_EVAL_METRIC: $XGB_EVAL_METRIC"
 echo "XGB_EARLY_STOPPING_ROUNDS: $XGB_EARLY_STOPPING_ROUNDS"
 echo "Activation alignment: $ACTIVATION_ALIGNMENT_MODE"
 echo "Python entrypoint: ${cmd[*]}"
+
+if [[ "$USE_UV_RUN" != "1" ]]; then
+  "$PYTHON_BIN" -c "import sys; print('python=', sys.executable)"
+fi
 
 "${cmd[@]}"
 

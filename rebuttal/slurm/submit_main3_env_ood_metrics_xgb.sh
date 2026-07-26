@@ -16,6 +16,7 @@ SCENARIOS="${SCENARIOS:-holdout_env_ood}"
 FEATURE_SPACES="${FEATURE_SPACES:-baseline_tfidf_last_sentence_text,baseline_tfidf_prefix_text,attention_only,attention_grounding_only,attention_concentration_only,attention_grounding_transition_only,attention_concentration_transition_only,activation_pca_final,activation_pca_delta_last2,activation_pca_delta_prev4mean,attention_plus_activation_pca_final,attention_plus_activation_pca_delta_last2,attention_plus_activation_pca_delta_prev4mean,baseline_raw_final}"
 FEATURE_SIZES="${FEATURE_SIZES:-128}"
 MODEL_FAMILY="${MODEL_FAMILY:-xgb}"
+CONDA_ENV="${CONDA_ENV:-deception}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-4}"
 MEMORY="${MEMORY:-100g}"
 TIME_LIMIT="${TIME_LIMIT:-0-16:00:00}"
@@ -53,6 +54,7 @@ echo "Scenarios: $SCENARIOS"
 echo "Feature spaces: $FEATURE_SPACES"
 echo "Feature sizes: $FEATURE_SIZES"
 echo "Model family: $MODEL_FAMILY"
+echo "Conda env: $CONDA_ENV"
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf 'DRY RUN:'
@@ -61,6 +63,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     DATASET_ROOT="$DATASET_ROOT" \
     OUTPUT_ROOT="$OUTPUT_ROOT" \
     LOG_ROOT="$LOG_ROOT" \
+    CONDA_ENV="$CONDA_ENV" \
     MODEL_PRESET="$MODEL_PRESET" \
     SCENARIOS="$SCENARIOS" \
     FEATURE_SPACES="$FEATURE_SPACES" \
@@ -77,6 +80,7 @@ job_id="$({
     DATASET_ROOT="$DATASET_ROOT" \
     OUTPUT_ROOT="$OUTPUT_ROOT" \
     LOG_ROOT="$LOG_ROOT" \
+    CONDA_ENV="$CONDA_ENV" \
     MODEL_PRESET="$MODEL_PRESET" \
     SCENARIOS="$SCENARIOS" \
     FEATURE_SPACES="$FEATURE_SPACES" \

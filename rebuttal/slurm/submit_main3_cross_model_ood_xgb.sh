@@ -15,6 +15,7 @@ MODEL_PRESETS="${MODEL_PRESETS:-gptoss20b,llama8b,qwen7b,qwen14b}"
 FEATURE_SPACES="${FEATURE_SPACES:-baseline_tfidf_last_sentence_text,baseline_tfidf_prefix_text,attention_only,activation_pca_final,attention_plus_activation_pca_final,baseline_raw_final}"
 FEATURE_SIZES="${FEATURE_SIZES:-128}"
 MODEL_FAMILY="${MODEL_FAMILY:-xgb}"
+CONDA_ENV="${CONDA_ENV:-deception}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-4}"
 MEMORY="${MEMORY:-100g}"
 TIME_LIMIT="${TIME_LIMIT:-0-16:00:00}"
@@ -51,6 +52,7 @@ echo "Model presets: $MODEL_PRESETS"
 echo "Feature spaces: $FEATURE_SPACES"
 echo "Feature sizes: $FEATURE_SIZES"
 echo "Model family: $MODEL_FAMILY"
+echo "Conda env: $CONDA_ENV"
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf 'DRY RUN:'
@@ -59,6 +61,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     DATASET_ROOT="$DATASET_ROOT" \
     OUTPUT_ROOT="$OUTPUT_ROOT" \
     LOG_ROOT="$LOG_ROOT" \
+    CONDA_ENV="$CONDA_ENV" \
     MODEL_PRESETS="$MODEL_PRESETS" \
     FEATURE_SPACES="$FEATURE_SPACES" \
     FEATURE_SIZES="$FEATURE_SIZES" \
@@ -74,6 +77,7 @@ job_id="$({
     DATASET_ROOT="$DATASET_ROOT" \
     OUTPUT_ROOT="$OUTPUT_ROOT" \
     LOG_ROOT="$LOG_ROOT" \
+    CONDA_ENV="$CONDA_ENV" \
     MODEL_PRESETS="$MODEL_PRESETS" \
     FEATURE_SPACES="$FEATURE_SPACES" \
     FEATURE_SIZES="$FEATURE_SIZES" \
