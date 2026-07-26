@@ -18,6 +18,7 @@ DATASET_ROOT="${DATASET_ROOT:-$PROJECT_ROOT/DatasetMain}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/rebuttal/results/OOD_Modeling_main3_env_ood_metrics_qwen14b_xgb_pca_128}"
 MODEL_PRESET="${MODEL_PRESET:-qwen14b}"
 SCENARIOS="${SCENARIOS:-holdout_env_ood}"
+TRAIN_ENV_LABELS="${TRAIN_ENV_LABELS:-}"
 FEATURE_SPACES="${FEATURE_SPACES:-baseline_tfidf_last_sentence_text,baseline_tfidf_prefix_text,attention_only,attention_grounding_only,attention_concentration_only,attention_grounding_transition_only,attention_concentration_transition_only,activation_pca_final,activation_pca_delta_last2,activation_pca_delta_prev4mean,attention_plus_activation_pca_final,attention_plus_activation_pca_delta_last2,attention_plus_activation_pca_delta_prev4mean,baseline_raw_final}"
 FEATURE_SIZES="${FEATURE_SIZES:-128}"
 MODEL_FAMILY="${MODEL_FAMILY:-xgb}"
@@ -110,6 +111,10 @@ cmd+=(
   --top-features-to-show "$TOP_FEATURES_TO_SHOW"
 )
 
+if [[ -n "$TRAIN_ENV_LABELS" ]]; then
+  cmd+=(--train-env-labels "$TRAIN_ENV_LABELS")
+fi
+
 if [[ "$FORCE_REBUILD_REDUCTIONS" == "1" ]]; then
   cmd+=(--force-rebuild-reductions)
 fi
@@ -130,6 +135,7 @@ echo "DATASET_ROOT: $DATASET_ROOT"
 echo "OUTPUT_ROOT: $OUTPUT_ROOT"
 echo "MODEL_PRESET: $MODEL_PRESET"
 echo "SCENARIOS: $SCENARIOS"
+echo "TRAIN_ENV_LABELS: $TRAIN_ENV_LABELS"
 echo "FEATURE_SPACES: $FEATURE_SPACES"
 echo "FEATURE_SIZES: $FEATURE_SIZES"
 echo "MODEL_FAMILY: $MODEL_FAMILY"

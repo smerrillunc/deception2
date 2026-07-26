@@ -5,6 +5,7 @@ import argparse
 import gc
 import json
 import math
+import pickle
 import re
 import sys
 import warnings
@@ -1819,6 +1820,7 @@ def summarize_train_models(metrics_df: pd.DataFrame) -> pd.DataFrame:
                 "decision_threshold": float(meta["decision_threshold"]),
                 "selected_features_path": str(meta["selected_features_path"]),
                 "coefficients_path": str(meta.get("coefficients_path", "")),
+                "model_artifact_path": str(meta.get("model_artifact_path", "")),
             }
         )
     if not summary_rows:
@@ -2003,6 +2005,7 @@ def build_best_family_models(
                 "alignment_detail": str(best.get("alignment_detail", "")),
                 "selected_features_path": str(best["selected_features_path"]),
                 "coefficients_path": str(best["coefficients_path"]),
+                "model_artifact_path": str(best.get("model_artifact_path", "")),
             }
         )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -2182,6 +2185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=str, default=str(DEFAULT_DATASET_ROOT))
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_RESULTS_ROOT))
     parser.add_argument("--model-presets", type=str, default=",".join(DEFAULT_MODEL_PRESETS))
+    parser.add_argument("--train-model-presets", type=str, default="")
     parser.add_argument("--feature-spaces", type=str, default=",".join(DEFAULT_FEATURE_SPACES))
     parser.add_argument("--feature-sizes", type=str, default=",".join(str(value) for value in DEFAULT_FEATURE_SIZES))
     parser.add_argument("--model-family", type=str, default="xgb")
@@ -2222,6 +2226,7 @@ def main() -> None:
     output_root = ensure_dir(args.output_root)
     cache_dir = ensure_dir(output_root / "cache")
     model_keys = [normalize_model_key(value) for value in parse_csv_list(args.model_presets)]
+    selected_train_model_keys = [normalize_model_key(value) for value in parse_csv_list(args.train_model_presets)]
     feature_space_names = parse_csv_list(args.feature_spaces)
     feature_sizes = parse_int_csv(args.feature_sizes)
     fixed_recall_levels = parse_float_csv(args.fixed_recall_levels)
@@ -2295,6 +2300,7 @@ def main() -> None:
             {"setting": "output_root", "value": str(output_root)},
             {"setting": "model_family", "value": model_family},
             {"setting": "model_keys", "value": ", ".join(model_keys)},
+            {"setting": "train_model_presets_filter", "value": ", ".join(selected_train_model_keys)},
             {"setting": "model_display_order", "value": ", ".join(MODEL_ORDER)},
             {"setting": "feature_spaces", "value": ", ".join(selected_feature_spaces.keys())},
             {"setting": "feature_sizes", "value": ", ".join(str(value) for value in feature_sizes)},
@@ -2492,14 +2498,33 @@ def main() -> None:
         ]
         for model_key in model_keys
     }
-    selected_models_in_order = [model_display_by_key[model_key] for model_key in model_keys]
+    all_models_in_order = [model_display_by_key[model_key] for model_key in model_keys]
+    if len(all_models_in_order) < 2:
+        raise ValueError("Cross-model OOD requires at least two model presets.")
+    if selected_train_model_keys:
+        missing_train_model_keys = [model_key for model_key in selected_train_model_keys if model_key not in set(model_keys)]
+        if missing_train_model_keys:
+            raise ValueError(
+                "Requested train model presets were not included in --model-presets: "
+                + ", ".join(missing_train_model_keys)
+            )
+        selected_train_model_key_set = set(selected_train_model_keys)
+        selected_train_models_in_order = [
+            model_display_by_key[model_key]
+            for model_key in model_keys
+            if model_key in selected_train_model_key_set
+        ]
+    else:
+        selected_train_models_in_order = list(all_models_in_order)
+    if not selected_train_models_in_order:
+        raise ValueError("No train models remain after applying --train-model-presets.")
 
     attention_rankings_by_source_target: dict[tuple[str, str], pd.DataFrame] = {}
     attention_pools_by_source_target: dict[tuple[str, str], tuple[list[str], str]] = {}
     attention_matrix_cache_by_source_target: dict[tuple[str, str], dict[str, dict[str, np.ndarray]]] = {}
     if uses_attention:
         rankings_dir = ensure_dir(output_root / "rankings")
-        for source_model in selected_models_in_order:
+        for source_model in selected_train_models_in_order:
             env_frames = OrderedDict(
                 (env_name, attention_frames_by_bundle[f"{env_name}__{source_model}"])
                 for env_name in ENV_SPECS
@@ -2544,9 +2569,14 @@ def main() -> None:
 
     for target_name in maybe_tqdm(list(TARGET_SPECS.keys()), desc="Targets", total=len(TARGET_SPECS), disable=args.disable_tqdm):
         target_title = str(TARGET_SPECS[target_name]["title"])
-        for source_model in maybe_tqdm(selected_models_in_order, desc=f"Source models:{target_name}", total=len(selected_models_in_order), disable=args.disable_tqdm):
+        for source_model in maybe_tqdm(
+            selected_train_models_in_order,
+            desc=f"Source models:{target_name}",
+            total=len(selected_train_models_in_order),
+            disable=args.disable_tqdm,
+        ):
             source_bundle_keys = bundle_keys_by_model[source_model]
-            ood_models = [model_name for model_name in selected_models_in_order if model_name != source_model]
+            ood_models = [model_name for model_name in all_models_in_order if model_name != source_model]
             attention_cache = attention_matrix_cache_by_source_target.get((source_model, target_name))
             attention_pool_features, attention_selection_mode = attention_pools_by_source_target.get((source_model, target_name), ([], ""))
             for feature_space_name, feature_space in maybe_tqdm(selected_feature_spaces.items(), desc=f"Spaces:{source_model}:{target_name}", total=len(selected_feature_spaces), disable=args.disable_tqdm):
@@ -2748,6 +2778,7 @@ def main() -> None:
 
                     selected_path = selection_dir / f"{slugify(source_model)}__selected_features.csv"
                     coefficients_path = selection_dir / f"{slugify(source_model)}__coefficients.csv"
+                    model_artifact_path = selection_dir / f"{slugify(source_model)}__model.pkl"
                     selection_summary_path = selection_dir / f"{slugify(source_model)}__selection_summary.csv"
                     transfer_metrics_path = selection_dir / f"{slugify(source_model)}__transfer_metrics.csv"
                     selected_df = pd.DataFrame({"feature": current_feature_names, "selected_rank": np.arange(1, len(current_feature_names) + 1, dtype=int)})
@@ -2768,6 +2799,26 @@ def main() -> None:
                     coefficient_df["alignment_detail"] = "; ".join(alignment_detail_parts)
                     coefficient_df.to_csv(coefficients_path, index=False)
                     all_coefficient_frames.append(coefficient_df)
+
+                    with model_artifact_path.open("wb") as f:
+                        pickle.dump(
+                            {
+                                "estimator": best_model.estimator,
+                                "decision_threshold": float(best_model.decision_threshold),
+                                "candidate_key": best_model.candidate_key,
+                                "candidate_label": best_model.candidate_label,
+                                "candidate_params": dict(best_model.candidate_params),
+                                "feature_names": list(current_feature_names),
+                                "target_name": target_name,
+                                "feature_space": feature_space_name,
+                                "feature_size_label": size_label,
+                                "train_model": source_model,
+                                "source_models": source_model,
+                                "ood_models": list(ood_models),
+                            },
+                            f,
+                            protocol=pickle.HIGHEST_PROTOCOL,
+                        )
 
                     selection_summary_row = {
                         "scenario_name": SCENARIO_NAME,
@@ -2804,6 +2855,7 @@ def main() -> None:
                         "oracle_mean_ood_pr_auc_selected": float(best_oracle_metrics["oracle_mean_ood_pr_auc"]),
                         "selected_features_path": str(selected_path),
                         "coefficients_path": str(coefficients_path),
+                        "model_artifact_path": str(model_artifact_path),
                         "selection_summary_path": str(selection_summary_path),
                         "transfer_metrics_path": str(transfer_metrics_path),
                         **best_model.validation_metrics,
@@ -2870,6 +2922,7 @@ def main() -> None:
                                     "model_selection_objective": args.model_selection_objective,
                                     "selected_features_path": str(selected_path),
                                     "coefficients_path": str(coefficients_path),
+                                    "model_artifact_path": str(model_artifact_path),
                                     "transfer_metrics_path": str(transfer_metrics_path),
                                     "average_precision": float(metric_row["pr_auc"]) if pd.isna(metric_row.get("average_precision", pd.NA)) else metric_row["average_precision"],
                                 }

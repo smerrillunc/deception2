@@ -5,6 +5,7 @@ import argparse
 import gc
 import json
 import math
+import pickle
 import re
 import sys
 import warnings
@@ -2166,6 +2167,7 @@ def summarize_train_env_models(metrics_df: pd.DataFrame) -> pd.DataFrame:
                 "decision_threshold": float(meta["decision_threshold"]),
                 "selected_features_path": str(meta["selected_features_path"]),
                 "coefficients_path": str(meta.get("coefficients_path", "")),
+                "model_artifact_path": str(meta.get("model_artifact_path", "")),
             }
         )
     if not summary_rows:
@@ -2411,6 +2413,7 @@ def build_best_family_models_env(
                 "alignment_detail": str(best.get("alignment_detail", "")),
                 "selected_features_path": str(best["selected_features_path"]),
                 "coefficients_path": str(best["coefficients_path"]),
+                "model_artifact_path": str(best.get("model_artifact_path", "")),
             }
         )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -3186,6 +3189,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_RESULTS_ROOT))
     parser.add_argument("--model-preset", type=str, default=DEFAULT_MODEL_PRESET)
     parser.add_argument("--scenarios", type=str, default=",".join(DEFAULT_SCENARIOS))
+    parser.add_argument("--train-env-labels", type=str, default="")
     parser.add_argument("--feature-spaces", type=str, default=",".join(DEFAULT_FEATURE_SPACES))
     parser.add_argument("--feature-sizes", type=str, default=",".join(str(value) for value in DEFAULT_FEATURE_SIZES))
     parser.add_argument("--model-family", type=str, default="xgb")
@@ -3231,6 +3235,7 @@ def main() -> None:
     selected_scenarios = list(dict.fromkeys(selected_scenarios))
     if not selected_scenarios:
         raise ValueError("At least one scenario must be provided via --scenarios.")
+    selected_train_env_labels = parse_csv_list(args.train_env_labels)
     feature_space_names = parse_csv_list(args.feature_spaces)
     feature_sizes = parse_int_csv(args.feature_sizes)
     fixed_recall_levels = parse_float_csv(args.fixed_recall_levels)
@@ -3305,6 +3310,7 @@ def main() -> None:
             {"setting": "model_display", "value": str(model_spec["display"])},
             {"setting": "model_dirname", "value": str(model_spec["dirname"])},
             {"setting": "scenarios", "value": ", ".join(selected_scenarios)},
+            {"setting": "train_env_labels_filter", "value": ", ".join(selected_train_env_labels)},
             {"setting": "env_order", "value": ", ".join(ENV_ORDER)},
             {"setting": "feature_spaces", "value": ", ".join(selected_feature_spaces.keys())},
             {"setting": "feature_sizes", "value": ", ".join(str(value) for value in feature_sizes)},
@@ -3565,6 +3571,26 @@ def main() -> None:
                 attention_matrix_cache_by_target_subset[(target_name, subset_key)] = cache
 
     experiment_run_specs, train_axis_labels_by_scenario = build_experiment_run_specs(selected_scenarios)
+    if selected_train_env_labels:
+        selected_train_env_labels_set = set(selected_train_env_labels)
+        experiment_run_specs = [
+            run_spec
+            for run_spec in experiment_run_specs
+            if run_spec.train_env_label in selected_train_env_labels_set
+        ]
+        train_axis_labels_by_scenario = {
+            scenario_name: [
+                train_env_label
+                for train_env_label in labels
+                if train_env_label in selected_train_env_labels_set
+            ]
+            for scenario_name, labels in train_axis_labels_by_scenario.items()
+        }
+    if not experiment_run_specs:
+        raise ValueError(
+            "No experiment run specs remain after filtering. "
+            f"scenarios={selected_scenarios}, train_env_labels={selected_train_env_labels}"
+        )
 
     all_transfer_rows: list[dict[str, Any]] = []
     all_model_selection_rows: list[dict[str, Any]] = []
@@ -3859,6 +3885,7 @@ def main() -> None:
 
                     selected_path = selection_dir / f"{slugify(run_spec.train_env_label)}__selected_features.csv"
                     coefficients_path = selection_dir / f"{slugify(run_spec.train_env_label)}__coefficients.csv"
+                    model_artifact_path = selection_dir / f"{slugify(run_spec.train_env_label)}__model.pkl"
                     selection_summary_path = selection_dir / f"{slugify(run_spec.train_env_label)}__selection_summary.csv"
                     transfer_metrics_path = selection_dir / f"{slugify(run_spec.train_env_label)}__transfer_metrics.csv"
                     selected_df = pd.DataFrame(
@@ -3917,6 +3944,26 @@ def main() -> None:
                     coefficient_df.to_csv(coefficients_path, index=False)
                     all_coefficient_frames.append(coefficient_df)
 
+                    with model_artifact_path.open("wb") as f:
+                        pickle.dump(
+                            {
+                                "estimator": best_model.estimator,
+                                "decision_threshold": float(best_model.decision_threshold),
+                                "candidate_key": best_model.candidate_key,
+                                "candidate_label": best_model.candidate_label,
+                                "candidate_params": dict(best_model.candidate_params),
+                                "feature_names": list(current_feature_names),
+                                "target_name": target_name,
+                                "feature_space": feature_space_name,
+                                "feature_size_label": size_label,
+                                "train_env": run_spec.train_env_label,
+                                "source_envs": run_spec.source_envs,
+                                "heldout_env": run_spec.heldout_env,
+                            },
+                            f,
+                            protocol=pickle.HIGHEST_PROTOCOL,
+                        )
+
                     selection_summary_row = {
                         "scenario_name": run_spec.scenario_name,
                         "scenario_title": run_spec.scenario_title,
@@ -3953,6 +4000,7 @@ def main() -> None:
                         "oracle_min_ood_auroc_selected": float(best_oracle_metrics["oracle_min_ood_auroc"]),
                         "oracle_std_ood_auroc_selected": float(best_oracle_metrics["oracle_std_ood_auroc"]),
                         "oracle_mean_ood_pr_auc_selected": float(best_oracle_metrics["oracle_mean_ood_pr_auc"]),
+                        "model_artifact_path": str(model_artifact_path),
                         "selected_features_path": str(selected_path),
                         "coefficients_path": str(coefficients_path),
                         "selection_summary_path": str(selection_summary_path),
@@ -4019,6 +4067,7 @@ def main() -> None:
                                     "xgb_best_iteration": pd.NA if best_model.xgb_best_iteration is None else int(best_model.xgb_best_iteration),
                                     "xgb_best_score": pd.NA if best_model.xgb_best_score is None else float(best_model.xgb_best_score),
                                     "model_selection_objective": args.model_selection_objective,
+                                    "model_artifact_path": str(model_artifact_path),
                                     "selected_features_path": str(selected_path),
                                     "coefficients_path": str(coefficients_path),
                                     "transfer_metrics_path": str(transfer_metrics_path),

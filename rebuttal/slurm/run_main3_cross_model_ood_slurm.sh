@@ -17,6 +17,7 @@ NOTEBOOK_OUTPUT="${NOTEBOOK_OUTPUT:-$PROJECT_ROOT/rebuttal/notebooks/main3_cross
 DATASET_ROOT="${DATASET_ROOT:-$PROJECT_ROOT/DatasetMain}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/rebuttal/results/OOD_Modeling_main3_cross_model_ood_xgb_pca_128}"
 MODEL_PRESETS="${MODEL_PRESETS:-gptoss20b,llama8b,qwen7b,qwen14b}"
+TRAIN_MODEL_PRESETS="${TRAIN_MODEL_PRESETS:-}"
 FEATURE_SPACES="${FEATURE_SPACES:-baseline_tfidf_last_sentence_text,baseline_tfidf_prefix_text,attention_only,activation_pca_final,attention_plus_activation_pca_final,baseline_raw_final}"
 FEATURE_SIZES="${FEATURE_SIZES:-128}"
 MODEL_FAMILY="${MODEL_FAMILY:-xgb}"
@@ -108,6 +109,10 @@ cmd+=(
   --top-features-to-show "$TOP_FEATURES_TO_SHOW"
 )
 
+if [[ -n "$TRAIN_MODEL_PRESETS" ]]; then
+  cmd+=(--train-model-presets "$TRAIN_MODEL_PRESETS")
+fi
+
 if [[ "$FORCE_REBUILD_REDUCTIONS" == "1" ]]; then
   cmd+=(--force-rebuild-reductions)
 fi
@@ -127,6 +132,7 @@ echo "NOTEBOOK_OUTPUT: $NOTEBOOK_OUTPUT"
 echo "DATASET_ROOT: $DATASET_ROOT"
 echo "OUTPUT_ROOT: $OUTPUT_ROOT"
 echo "MODEL_PRESETS: $MODEL_PRESETS"
+echo "TRAIN_MODEL_PRESETS: $TRAIN_MODEL_PRESETS"
 echo "FEATURE_SPACES: $FEATURE_SPACES"
 echo "FEATURE_SIZES: $FEATURE_SIZES"
 echo "MODEL_FAMILY: $MODEL_FAMILY"
