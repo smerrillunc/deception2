@@ -124,6 +124,22 @@ def main() -> None:
                     return pd.DataFrame()
 
 
+            def ordered_commitment_threshold_rate_columns(df: pd.DataFrame, metric: str) -> list[str]:
+                prefix = f"commitment_sentence_{metric}_rate_tau_"
+                ordered: list[tuple[float, str]] = []
+                for column in df.columns:
+                    if not str(column).startswith(prefix):
+                        continue
+                    suffix = str(column)[len(prefix):]
+                    try:
+                        tau = float(suffix.replace("neg_", "-").replace("_", "."))
+                    except ValueError:
+                        continue
+                    ordered.append((tau, str(column)))
+                ordered.sort(key=lambda item: item[0])
+                return [column for _, column in ordered]
+
+
             def refresh_analysis() -> subprocess.CompletedProcess:
                 cmd = [
                     sys.executable,
@@ -202,6 +218,7 @@ def main() -> None:
             {
                 "multi_peak_definition": completion_summary.get("multi_peak_definition", {}),
                 "commitment_metric_note": completion_summary.get("commitment_metric_note", ""),
+                "commitment_delta_thresholds": completion_summary.get("commitment_delta_thresholds", []),
                 "peak_metric_note": completion_summary.get("peak_metric_note", ""),
                 "gradual_definition": completion_summary.get("gradual_definition", {}),
                 "shape_thresholds": completion_summary.get("shape_thresholds", {}),
@@ -222,15 +239,15 @@ def main() -> None:
         ),
         code(
             """
+            exact_tau_columns = ordered_commitment_threshold_rate_columns(adaptive_overall_df, "exact")
+            within_one_tau_columns = ordered_commitment_threshold_rate_columns(adaptive_overall_df, "within_one")
             commitment_columns = [
                 column
                 for column in [
                     "num_examples",
-                    "commitment_sentence_exact_rate",
-                    "commitment_sentence_within_one_rate",
+                    *exact_tau_columns,
+                    *within_one_tau_columns,
                     "commitment_text_normalized_match_rate",
-                    "boundary_exact_rate",
-                    "boundary_within_one_rate",
                 ]
                 if column in adaptive_overall_df.columns
             ]
@@ -248,13 +265,15 @@ def main() -> None:
         ),
         code(
             """
+            exact_tau_columns = ordered_commitment_threshold_rate_columns(adaptive_model_df, "exact")
+            within_one_tau_columns = ordered_commitment_threshold_rate_columns(adaptive_model_df, "within_one")
             model_commitment_columns = [
                 column
                 for column in [
                     "model_display",
                     "num_examples",
-                    "commitment_sentence_exact_rate",
-                    "commitment_sentence_within_one_rate",
+                    *exact_tau_columns,
+                    *within_one_tau_columns,
                     "commitment_text_normalized_match_rate",
                 ]
                 if column in adaptive_model_df.columns
@@ -327,14 +346,16 @@ def main() -> None:
         ),
         code(
             """
+            exact_tau_columns = ordered_commitment_threshold_rate_columns(adaptive_bundle_df, "exact")
+            within_one_tau_columns = ordered_commitment_threshold_rate_columns(adaptive_bundle_df, "within_one")
             bundle_commitment_columns = [
                 column
                 for column in [
                     "env_display",
                     "model_display",
                     "num_examples",
-                    "commitment_sentence_exact_rate",
-                    "commitment_sentence_within_one_rate",
+                    *exact_tau_columns,
+                    *within_one_tau_columns,
                     "commitment_text_normalized_match_rate",
                 ]
                 if column in adaptive_bundle_df.columns

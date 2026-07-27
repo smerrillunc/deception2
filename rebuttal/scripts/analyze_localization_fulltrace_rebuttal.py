@@ -35,7 +35,8 @@ from localization_fulltrace_rebuttal_lib import (
 
 BUNDLE_GROUP_COLUMNS = ["env_name", "env_display", "model_bundle_name", "model_display"]
 MODEL_GROUP_COLUMNS = ["model_bundle_name", "model_display", "model_id"]
-SUMMARY_METRIC_COLUMNS = [
+DEFAULT_COMMITMENT_DELTA_THRESHOLDS = (0.3, 0.4, 0.5)
+BASE_SUMMARY_METRIC_COLUMNS = [
     "num_examples",
     "deceptive_examples",
     "truthful_examples",
@@ -58,7 +59,7 @@ SUMMARY_METRIC_COLUMNS = [
     "prompt_match_rate",
     "raw_text_match_rate",
 ]
-PER_EXAMPLE_COLUMNS = [
+BASE_PER_EXAMPLE_COLUMNS = [
     "bundle_key",
     "env_name",
     "env_display",
@@ -135,7 +136,6 @@ SHAPE_PREVALENCE_COLUMNS = BUNDLE_GROUP_COLUMNS + [
     "total_examples",
     "fraction",
 ]
-CASE_STUDY_COLUMNS = PER_EXAMPLE_COLUMNS + ["case_category"]
 COMPLETION_COLUMNS = [
     "bundle_key",
     "env_name",
@@ -183,7 +183,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=DEFAULT_RUN_NAME)
     parser.add_argument("--results-root", type=str, default=str(DEFAULT_RESULTS_ROOT))
     parser.add_argument("--boundary-threshold", type=float, default=0.5)
-    parser.add_argument("--commitment-delta-threshold", type=float, default=0.3)
+    parser.add_argument("--commitment-delta-threshold", type=float, default=None)
+    parser.add_argument("--commitment-delta-thresholds", type=str, default=None)
     parser.add_argument("--peak-min-value", type=float, default=0.5)
     parser.add_argument("--peak-prominence", type=float, default=0.3)
     parser.add_argument("--min-peak-separation", type=int, default=2)
@@ -205,6 +206,68 @@ def shape_thresholds_from_args(args: argparse.Namespace) -> ShapeThresholds:
         gradual_step_threshold=float(args.gradual_step_threshold),
         gradual_jump_concentration_threshold=float(args.gradual_jump_concentration_threshold),
     )
+
+
+def parse_commitment_delta_thresholds(args: argparse.Namespace) -> list[float]:
+    raw_thresholds = str(args.commitment_delta_thresholds or "").strip()
+    if raw_thresholds:
+        thresholds = [float(piece.strip()) for piece in raw_thresholds.split(",") if piece.strip()]
+    elif args.commitment_delta_threshold is not None:
+        thresholds = [float(args.commitment_delta_threshold)]
+    else:
+        thresholds = [float(value) for value in DEFAULT_COMMITMENT_DELTA_THRESHOLDS]
+    ordered_unique: list[float] = []
+    seen: set[float] = set()
+    for value in thresholds:
+        rounded = float(value)
+        if rounded in seen:
+            continue
+        seen.add(rounded)
+        ordered_unique.append(rounded)
+    if not ordered_unique:
+        raise ValueError("At least one commitment delta threshold is required.")
+    return ordered_unique
+
+
+def threshold_slug(value: float) -> str:
+    text = f"{float(value):.3f}".rstrip("0").rstrip(".")
+    return text.replace("-", "neg_").replace(".", "_")
+
+
+def commitment_threshold_summary_columns(commitment_delta_thresholds: list[float]) -> list[str]:
+    columns: list[str] = []
+    for threshold in commitment_delta_thresholds:
+        slug = threshold_slug(threshold)
+        columns.append(f"commitment_sentence_exact_rate_tau_{slug}")
+        columns.append(f"commitment_sentence_within_one_rate_tau_{slug}")
+    return columns
+
+
+def commitment_threshold_per_example_columns(commitment_delta_thresholds: list[float]) -> list[str]:
+    columns: list[str] = []
+    for threshold in commitment_delta_thresholds:
+        slug = threshold_slug(threshold)
+        columns.append(f"commitment_sentence_exact_tau_{slug}")
+        columns.append(f"commitment_sentence_within_one_tau_{slug}")
+    return columns
+
+
+def summary_metric_columns(commitment_delta_thresholds: list[float]) -> list[str]:
+    return [
+        *BASE_SUMMARY_METRIC_COLUMNS,
+        *commitment_threshold_summary_columns(commitment_delta_thresholds),
+    ]
+
+
+def per_example_columns(commitment_delta_thresholds: list[float]) -> list[str]:
+    return [
+        *BASE_PER_EXAMPLE_COLUMNS,
+        *commitment_threshold_per_example_columns(commitment_delta_thresholds),
+    ]
+
+
+def case_study_columns(commitment_delta_thresholds: list[float]) -> list[str]:
+    return [*per_example_columns(commitment_delta_thresholds), "case_category"]
 
 
 def safe_mean(series: pd.Series) -> float:
@@ -446,7 +509,7 @@ def compare_records(
     adaptive_payload: dict[str, Any],
     thresholds: ShapeThresholds,
     min_valid: int,
-    commitment_delta_threshold: float,
+    commitment_delta_thresholds: list[float],
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     bundle_key = str(selection_row["bundle_key"])
     example_id = str(selection_row["example_id"])
@@ -516,30 +579,46 @@ def compare_records(
             and int(adaptive_left_end_idx) <= int(full_boundary_end_idx) <= int(adaptive_right_end_idx)
         )
 
-    full_commitment_end_idx = commitment_juncture_end_idx(
-        full_df,
-        deceptive=example_is_deceptive,
-        delta_threshold=commitment_delta_threshold,
-    )
-    adaptive_commitment_end_idx = commitment_juncture_end_idx(
-        adaptive_df,
-        deceptive=example_is_deceptive,
-        delta_threshold=commitment_delta_threshold,
-    )
-    if full_commitment_end_idx is None and adaptive_commitment_end_idx is None:
-        commitment_sentence_exact = 1.0
-        commitment_sentence_within_one = 1.0
-    elif full_commitment_end_idx is None or adaptive_commitment_end_idx is None:
-        commitment_sentence_exact = 0.0
-        commitment_sentence_within_one = 0.0
-    else:
-        commitment_sentence_exact = float(int(full_commitment_end_idx) == int(adaptive_commitment_end_idx))
-        commitment_sentence_within_one = float(
-            abs(int(full_commitment_end_idx) - int(adaptive_commitment_end_idx)) <= 1
+    commitment_threshold_metrics: dict[str, float] = {}
+    primary_full_commitment_end_idx: int | None = None
+    primary_adaptive_commitment_end_idx: int | None = None
+    primary_commitment_sentence_exact = math.nan
+    primary_commitment_sentence_within_one = math.nan
+    for threshold_idx, commitment_delta_threshold in enumerate(commitment_delta_thresholds):
+        full_commitment_end_idx = commitment_juncture_end_idx(
+            full_df,
+            deceptive=example_is_deceptive,
+            delta_threshold=commitment_delta_threshold,
         )
+        adaptive_commitment_end_idx = commitment_juncture_end_idx(
+            adaptive_df,
+            deceptive=example_is_deceptive,
+            delta_threshold=commitment_delta_threshold,
+        )
+        if full_commitment_end_idx is None and adaptive_commitment_end_idx is None:
+            commitment_sentence_exact = 1.0
+            commitment_sentence_within_one = 1.0
+        elif full_commitment_end_idx is None or adaptive_commitment_end_idx is None:
+            commitment_sentence_exact = 0.0
+            commitment_sentence_within_one = 0.0
+        else:
+            commitment_sentence_exact = float(int(full_commitment_end_idx) == int(adaptive_commitment_end_idx))
+            commitment_sentence_within_one = float(
+                abs(int(full_commitment_end_idx) - int(adaptive_commitment_end_idx)) <= 1
+            )
+        slug = threshold_slug(commitment_delta_threshold)
+        commitment_threshold_metrics[f"commitment_sentence_exact_tau_{slug}"] = float(commitment_sentence_exact)
+        commitment_threshold_metrics[f"commitment_sentence_within_one_tau_{slug}"] = float(
+            commitment_sentence_within_one
+        )
+        if threshold_idx == 0:
+            primary_full_commitment_end_idx = full_commitment_end_idx
+            primary_adaptive_commitment_end_idx = adaptive_commitment_end_idx
+            primary_commitment_sentence_exact = float(commitment_sentence_exact)
+            primary_commitment_sentence_within_one = float(commitment_sentence_within_one)
 
-    full_commitment_sentence_text = sentence_text_for_end_idx(full_df, full_commitment_end_idx)
-    adaptive_commitment_sentence_text = sentence_text_for_end_idx(adaptive_df, adaptive_commitment_end_idx)
+    full_commitment_sentence_text = sentence_text_for_end_idx(full_df, primary_full_commitment_end_idx)
+    adaptive_commitment_sentence_text = sentence_text_for_end_idx(adaptive_df, primary_adaptive_commitment_end_idx)
     if full_commitment_sentence_text or adaptive_commitment_sentence_text:
         commitment_text_raw_match = float(full_commitment_sentence_text == adaptive_commitment_sentence_text)
         commitment_text_normalized_match = float(
@@ -572,15 +651,15 @@ def compare_records(
         "adaptive_left_sentence_end_idx": adaptive_left_end_idx if adaptive_left_end_idx is not None else math.nan,
         "adaptive_right_sentence_end_idx": adaptive_right_end_idx if adaptive_right_end_idx is not None else math.nan,
         "full_commitment_sentence_end_idx": (
-            int(full_commitment_end_idx) if full_commitment_end_idx is not None else math.nan
+            int(primary_full_commitment_end_idx) if primary_full_commitment_end_idx is not None else math.nan
         ),
         "adaptive_commitment_sentence_end_idx": (
-            int(adaptive_commitment_end_idx) if adaptive_commitment_end_idx is not None else math.nan
+            int(primary_adaptive_commitment_end_idx) if primary_adaptive_commitment_end_idx is not None else math.nan
         ),
         "full_commitment_sentence_text": full_commitment_sentence_text,
         "adaptive_commitment_sentence_text": adaptive_commitment_sentence_text,
-        "commitment_sentence_exact": float(commitment_sentence_exact),
-        "commitment_sentence_within_one": float(commitment_sentence_within_one),
+        "commitment_sentence_exact": float(primary_commitment_sentence_exact),
+        "commitment_sentence_within_one": float(primary_commitment_sentence_within_one),
         "commitment_text_raw_match": float(commitment_text_raw_match) if not math.isnan(commitment_text_raw_match) else math.nan,
         "commitment_text_normalized_match": (
             float(commitment_text_normalized_match)
@@ -599,6 +678,7 @@ def compare_records(
         "adaptive_exact_peak_probe_recall": float(np.mean(exact_peak_hits)) if exact_peak_hits else math.nan,
         "adaptive_within_one_peak_probe_recall": float(np.mean(within_one_peak_hits)) if within_one_peak_hits else math.nan,
         "adaptive_all_peaks_covered_within_one": float(all(bool(value) for value in within_one_peak_hits)) if within_one_peak_hits else math.nan,
+        **commitment_threshold_metrics,
         **peak_metrics,
     }
 
@@ -612,7 +692,12 @@ def compare_records(
     return metrics_row, curve_points
 
 
-def grouped_summary(df: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
+def grouped_summary(
+    df: pd.DataFrame,
+    group_columns: list[str],
+    *,
+    commitment_delta_thresholds: list[float],
+) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     agg_kwargs = dict(
@@ -638,6 +723,16 @@ def grouped_summary(df: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
         prompt_match_rate=("prompt_match", safe_mean),
         raw_text_match_rate=("raw_text_match", safe_mean),
     )
+    for commitment_delta_threshold in commitment_delta_thresholds:
+        slug = threshold_slug(commitment_delta_threshold)
+        agg_kwargs[f"commitment_sentence_exact_rate_tau_{slug}"] = (
+            f"commitment_sentence_exact_tau_{slug}",
+            safe_mean,
+        )
+        agg_kwargs[f"commitment_sentence_within_one_rate_tau_{slug}"] = (
+            f"commitment_sentence_within_one_tau_{slug}",
+            safe_mean,
+        )
     if not group_columns:
         row = {
             "num_examples": int(df["example_id"].count()),
@@ -662,6 +757,14 @@ def grouped_summary(df: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
             "prompt_match_rate": safe_mean(df["prompt_match"]),
             "raw_text_match_rate": safe_mean(df["raw_text_match"]),
         }
+        for commitment_delta_threshold in commitment_delta_thresholds:
+            slug = threshold_slug(commitment_delta_threshold)
+            row[f"commitment_sentence_exact_rate_tau_{slug}"] = safe_mean(
+                df[f"commitment_sentence_exact_tau_{slug}"]
+            )
+            row[f"commitment_sentence_within_one_rate_tau_{slug}"] = safe_mean(
+                df[f"commitment_sentence_within_one_tau_{slug}"]
+            )
         return pd.DataFrame([row])
     grouped = (
         df.groupby(group_columns, as_index=False)
@@ -880,6 +983,7 @@ def build_summary_markdown(
     completion_summary: dict[str, Any],
     overall_summary_df: pd.DataFrame,
     case_studies_df: pd.DataFrame,
+    commitment_delta_thresholds: list[float],
 ) -> str:
     lines = [
         "# Localization Dataset-Adaptive-vs-Full Summary",
@@ -891,6 +995,17 @@ def build_summary_markdown(
     ]
     if not overall_summary_df.empty:
         row = overall_summary_df.iloc[0]
+        threshold_lines: list[str] = []
+        for commitment_delta_threshold in commitment_delta_thresholds:
+            slug = threshold_slug(commitment_delta_threshold)
+            threshold_lines.append(
+                f"- Commitment exact @ tau={commitment_delta_threshold:.1f}: "
+                f"{float(row[f'commitment_sentence_exact_rate_tau_{slug}']):.3f}"
+            )
+            threshold_lines.append(
+                f"- Commitment within-one @ tau={commitment_delta_threshold:.1f}: "
+                f"{float(row[f'commitment_sentence_within_one_rate_tau_{slug}']):.3f}"
+            )
         lines.extend(
             [
                 "",
@@ -899,6 +1014,7 @@ def build_summary_markdown(
                 f"- Commitment sentence exact: {float(row['commitment_sentence_exact_rate']):.3f}",
                 f"- Commitment sentence within-one: {float(row['commitment_sentence_within_one_rate']):.3f}",
                 f"- Commitment sentence text match: {float(row['commitment_text_normalized_match_rate']):.3f}",
+                *threshold_lines,
                 f"- Any full-peak probed within-one: {float(row['adaptive_any_peak_probe_within_one_rate']):.3f}",
                 f"- Adaptive argmax peak within-one: {float(row['peak_within_one_rate']):.3f}",
                 f"- Multi-peak trace fraction: {float(row['multi_peak_fraction']):.3f}",
@@ -944,6 +1060,10 @@ def completion_summary_by_model(bundle_completion_df: pd.DataFrame) -> pd.DataFr
 def main() -> None:
     args = parse_args()
     thresholds = shape_thresholds_from_args(args)
+    commitment_delta_thresholds = parse_commitment_delta_thresholds(args)
+    summary_metric_column_names = summary_metric_columns(commitment_delta_thresholds)
+    per_example_column_names = per_example_columns(commitment_delta_thresholds)
+    case_study_column_names = case_study_columns(commitment_delta_thresholds)
     run_root_path = run_root(args.run_name, results_root=args.results_root)
     analysis_root = run_root_path / "analysis"
     figures_root = analysis_root / "figures"
@@ -1006,7 +1126,7 @@ def main() -> None:
                 adaptive_payload=adaptive_payload,
                 thresholds=thresholds,
                 min_valid=int(config.get("localization_args", {}).get("min_valid", 3)),
-                commitment_delta_threshold=float(args.commitment_delta_threshold),
+                commitment_delta_thresholds=commitment_delta_thresholds,
             )
             metrics_row["adaptive_output_relpath"] = adaptive_relpath
             metrics_row["full_output_relpath"] = relpath_from_repo(full_path)
@@ -1049,11 +1169,13 @@ def main() -> None:
         "commitment_metric_note": (
             "The commitment sentence matches the DatasetMain commitment-juncture analysis: "
             "for deceptive examples, it is the first sentence where the deception-rate delta "
-            f"exceeds +{float(args.commitment_delta_threshold):.3f}; for truthful examples, "
-            "it is the first sentence where the delta goes below the negative of that threshold. "
-            "The adaptive and exhaustive commitment metrics both use this same delta-based rule "
-            "on their respective traces, with an additional normalized text-match check."
+            "exceeds the positive threshold; for truthful examples, it is the first sentence "
+            "where the delta goes below the negative threshold. The adaptive and exhaustive "
+            "commitment metrics both use this same delta-based rule on their respective traces, "
+            "with an additional normalized text-match check."
         ),
+        "commitment_delta_thresholds": [float(value) for value in commitment_delta_thresholds],
+        "primary_commitment_delta_threshold": float(commitment_delta_thresholds[0]),
         "peak_metric_note": (
             "peak_within_one uses the adaptive probe with the highest sampled deception rate "
             "and compares it to the exhaustive argmax. adaptive_any_peak_probe_within_one "
@@ -1070,7 +1192,7 @@ def main() -> None:
         "analysis_completed_at": pd.Timestamp.utcnow().isoformat(),
     }
 
-    metrics_df = pd.DataFrame(per_example_rows, columns=PER_EXAMPLE_COLUMNS)
+    metrics_df = pd.DataFrame(per_example_rows, columns=per_example_column_names)
     curve_points_df = (
         pd.concat(curve_frames, ignore_index=True, sort=False)
         if curve_frames
@@ -1084,27 +1206,39 @@ def main() -> None:
     )
     bundle_completion_df = ensure_columns(bundle_completion_df, COMPLETION_COLUMNS)
     model_completion_df = completion_summary_by_model(bundle_completion_df)
-    bundle_summary_df = grouped_summary(metrics_df, ["env_name", "env_display", "model_bundle_name", "model_display"])
-    bundle_summary_df = ensure_columns(bundle_summary_df, BUNDLE_GROUP_COLUMNS + SUMMARY_METRIC_COLUMNS)
-    model_summary_df = grouped_summary(metrics_df, MODEL_GROUP_COLUMNS)
-    model_summary_df = ensure_columns(model_summary_df, MODEL_GROUP_COLUMNS + SUMMARY_METRIC_COLUMNS)
-    overall_summary_df = grouped_summary(metrics_df, [])
-    overall_summary_df = ensure_columns(overall_summary_df, SUMMARY_METRIC_COLUMNS)
+    bundle_summary_df = grouped_summary(
+        metrics_df,
+        ["env_name", "env_display", "model_bundle_name", "model_display"],
+        commitment_delta_thresholds=commitment_delta_thresholds,
+    )
+    bundle_summary_df = ensure_columns(bundle_summary_df, BUNDLE_GROUP_COLUMNS + summary_metric_column_names)
+    model_summary_df = grouped_summary(
+        metrics_df,
+        MODEL_GROUP_COLUMNS,
+        commitment_delta_thresholds=commitment_delta_thresholds,
+    )
+    model_summary_df = ensure_columns(model_summary_df, MODEL_GROUP_COLUMNS + summary_metric_column_names)
+    overall_summary_df = grouped_summary(
+        metrics_df,
+        [],
+        commitment_delta_thresholds=commitment_delta_thresholds,
+    )
+    overall_summary_df = ensure_columns(overall_summary_df, summary_metric_column_names)
     if not overall_summary_df.empty:
         overall_summary_df.insert(0, "summary_scope", "overall")
     else:
-        overall_summary_df = pd.DataFrame(columns=["summary_scope", *SUMMARY_METRIC_COLUMNS])
+        overall_summary_df = pd.DataFrame(columns=["summary_scope", *summary_metric_column_names])
     shape_df = shape_prevalence_table(metrics_df, ["env_name", "env_display", "model_bundle_name", "model_display"])
     shape_df = ensure_columns(shape_df, SHAPE_PREVALENCE_COLUMNS)
     model_shape_df = shape_prevalence_table(metrics_df, MODEL_GROUP_COLUMNS)
     model_shape_df = ensure_columns(model_shape_df, MODEL_GROUP_COLUMNS + ["trace_shape_label", "num_examples", "total_examples", "fraction"])
     case_studies_df = pick_case_studies(metrics_df)
-    case_studies_df = ensure_columns(case_studies_df, CASE_STUDY_COLUMNS)
+    case_studies_df = ensure_columns(case_studies_df, case_study_column_names)
 
     write_json(analysis_root / "completion_summary.json", completion_summary)
     write_csv(analysis_root / "bundle_completion_summary.csv", bundle_completion_rows)
     model_completion_df.to_csv(analysis_root / "model_completion_summary.csv", index=False)
-    write_csv(analysis_root / "per_example_metrics.csv", per_example_rows, fieldnames=PER_EXAMPLE_COLUMNS)
+    write_csv(analysis_root / "per_example_metrics.csv", per_example_rows, fieldnames=per_example_column_names)
     curve_points_df.to_csv(analysis_root / "curve_points.csv", index=False)
     bundle_summary_df.to_csv(analysis_root / "adaptive_vs_full_summary_by_bundle.csv", index=False)
     model_summary_df.to_csv(analysis_root / "adaptive_vs_full_summary_by_model.csv", index=False)
@@ -1124,6 +1258,7 @@ def main() -> None:
         completion_summary=completion_summary,
         overall_summary_df=overall_summary_df,
         case_studies_df=case_studies_df,
+        commitment_delta_thresholds=commitment_delta_thresholds,
     )
     (analysis_root / "summary.md").write_text(summary_md, encoding="utf-8")
 
