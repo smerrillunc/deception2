@@ -6,6 +6,7 @@ import gzip
 import json
 import math
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -39,12 +40,18 @@ SUMMARY_METRIC_COLUMNS = [
     "deceptive_examples",
     "truthful_examples",
     "mean_adaptive_probe_fraction",
+    "commitment_sentence_exact_rate",
+    "commitment_sentence_within_one_rate",
+    "commitment_text_normalized_match_rate",
     "boundary_exact_rate",
     "boundary_within_one_rate",
     "bracket_contains_boundary_rate",
     "peak_exact_rate",
     "peak_within_one_rate",
+    "adaptive_any_peak_probe_exact_rate",
+    "adaptive_any_peak_probe_within_one_rate",
     "mean_peak_probe_recall_within_one",
+    "adaptive_all_peaks_covered_within_one_rate",
     "multi_peak_fraction",
     "gradual_fraction",
     "sharp_or_other_fraction",
@@ -69,6 +76,14 @@ PER_EXAMPLE_COLUMNS = [
     "full_boundary_sentence_end_idx",
     "adaptive_left_sentence_end_idx",
     "adaptive_right_sentence_end_idx",
+    "full_commitment_sentence_end_idx",
+    "adaptive_commitment_sentence_end_idx",
+    "full_commitment_sentence_text",
+    "adaptive_commitment_sentence_text",
+    "commitment_sentence_exact",
+    "commitment_sentence_within_one",
+    "commitment_text_raw_match",
+    "commitment_text_normalized_match",
     "boundary_exact",
     "boundary_within_one",
     "adaptive_bracket_contains_full_boundary",
@@ -76,6 +91,8 @@ PER_EXAMPLE_COLUMNS = [
     "adaptive_peak_sentence_idx",
     "peak_exact",
     "peak_within_one",
+    "adaptive_any_peak_probe_exact",
+    "adaptive_any_peak_probe_within_one",
     "adaptive_exact_peak_probe_recall",
     "adaptive_within_one_peak_probe_recall",
     "adaptive_all_peaks_covered_within_one",
@@ -166,6 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=DEFAULT_RUN_NAME)
     parser.add_argument("--results-root", type=str, default=str(DEFAULT_RESULTS_ROOT))
     parser.add_argument("--boundary-threshold", type=float, default=0.5)
+    parser.add_argument("--commitment-delta-threshold", type=float, default=0.3)
     parser.add_argument("--peak-min-value", type=float, default=0.5)
     parser.add_argument("--peak-prominence", type=float, default=0.3)
     parser.add_argument("--min-peak-separation", type=int, default=2)
@@ -201,6 +219,11 @@ def safe_sum(series: pd.Series) -> float:
     if values.empty:
         return 0.0
     return float(values.sum())
+
+
+def normalize_sentence_for_compare(text: str) -> str:
+    lowered = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    return lowered.strip(" .!?\"'")
 
 
 def read_localization_payload(path: Path) -> dict[str, Any]:
@@ -341,6 +364,38 @@ def earliest_boundary_end_idx(
     return None
 
 
+def sentence_text_for_end_idx(frame: pd.DataFrame, sentence_end_idx: int | None) -> str:
+    if sentence_end_idx is None or frame.empty or "sentence_end_idx" not in frame.columns:
+        return ""
+    end_idx_series = pd.to_numeric(frame["sentence_end_idx"], errors="coerce")
+    matches = frame.loc[end_idx_series.eq(int(sentence_end_idx)), "sentence_text"]
+    if matches.empty:
+        return ""
+    return str(matches.iloc[0] or "")
+
+
+def commitment_juncture_end_idx(
+    frame: pd.DataFrame,
+    *,
+    deceptive: bool,
+    delta_threshold: float,
+) -> int | None:
+    if frame.empty or len(frame) < 2:
+        return None
+    ordered = frame.sort_values("sentence_idx").reset_index(drop=True)
+    previous_rate: float | None = None
+    for row in ordered.itertuples(index=False):
+        current_rate = pd.to_numeric(pd.Series([getattr(row, "deception_rate", math.nan)]), errors="coerce").iloc[0]
+        if pd.notna(previous_rate) and pd.notna(current_rate):
+            delta = float(current_rate) - float(previous_rate)
+            if deceptive and delta > float(delta_threshold):
+                return int(getattr(row, "sentence_end_idx"))
+            if (not deceptive) and delta < -float(delta_threshold):
+                return int(getattr(row, "sentence_end_idx"))
+        previous_rate = float(current_rate) if pd.notna(current_rate) else None
+    return None
+
+
 def full_history_frame(payload: dict[str, Any], *, bundle_key: str, example_id: str) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for entry in payload.get("history", []) or []:
@@ -391,6 +446,7 @@ def compare_records(
     adaptive_payload: dict[str, Any],
     thresholds: ShapeThresholds,
     min_valid: int,
+    commitment_delta_threshold: float,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     bundle_key = str(selection_row["bundle_key"])
     example_id = str(selection_row["example_id"])
@@ -401,6 +457,7 @@ def compare_records(
 
     full_df["is_probed_by_adaptive"] = full_df["sentence_idx"].isin(set(adaptive_df["sentence_idx"].astype(int)))
     adaptive_df["is_probed_by_adaptive"] = True
+    example_is_deceptive = bool(selection_row["deceptive"])
 
     full_values = full_df["deception_rate"].to_numpy(dtype=np.float64, copy=False)
     full_end_indices = full_df["sentence_end_idx"].to_numpy(dtype=np.int64, copy=False)
@@ -416,7 +473,6 @@ def compare_records(
     adaptive_values = adaptive_df["deception_rate"].to_numpy(dtype=np.float64, copy=False)
     adaptive_peak_sentence_idx = int(adaptive_df.loc[adaptive_df["deception_rate"].astype(float).idxmax(), "sentence_idx"])
     adaptive_probed_sentence_idx = sorted(set(int(value) for value in adaptive_df["sentence_idx"].tolist()))
-
     peak_metrics = shape_metrics(full_values, thresholds=thresholds)
     full_peak_sentence_idx = int(peak_metrics["full_peak_sentence_idx"]) if not math.isnan(float(peak_metrics["full_peak_sentence_idx"])) else None
 
@@ -460,6 +516,40 @@ def compare_records(
             and int(adaptive_left_end_idx) <= int(full_boundary_end_idx) <= int(adaptive_right_end_idx)
         )
 
+    full_commitment_end_idx = commitment_juncture_end_idx(
+        full_df,
+        deceptive=example_is_deceptive,
+        delta_threshold=commitment_delta_threshold,
+    )
+    adaptive_commitment_end_idx = commitment_juncture_end_idx(
+        adaptive_df,
+        deceptive=example_is_deceptive,
+        delta_threshold=commitment_delta_threshold,
+    )
+    if full_commitment_end_idx is None and adaptive_commitment_end_idx is None:
+        commitment_sentence_exact = 1.0
+        commitment_sentence_within_one = 1.0
+    elif full_commitment_end_idx is None or adaptive_commitment_end_idx is None:
+        commitment_sentence_exact = 0.0
+        commitment_sentence_within_one = 0.0
+    else:
+        commitment_sentence_exact = float(int(full_commitment_end_idx) == int(adaptive_commitment_end_idx))
+        commitment_sentence_within_one = float(
+            abs(int(full_commitment_end_idx) - int(adaptive_commitment_end_idx)) <= 1
+        )
+
+    full_commitment_sentence_text = sentence_text_for_end_idx(full_df, full_commitment_end_idx)
+    adaptive_commitment_sentence_text = sentence_text_for_end_idx(adaptive_df, adaptive_commitment_end_idx)
+    if full_commitment_sentence_text or adaptive_commitment_sentence_text:
+        commitment_text_raw_match = float(full_commitment_sentence_text == adaptive_commitment_sentence_text)
+        commitment_text_normalized_match = float(
+            normalize_sentence_for_compare(full_commitment_sentence_text)
+            == normalize_sentence_for_compare(adaptive_commitment_sentence_text)
+        )
+    else:
+        commitment_text_raw_match = math.nan
+        commitment_text_normalized_match = math.nan
+
     prompt_match = str(full_payload.get("prompt") or "") == str(adaptive_payload.get("prompt") or "")
     raw_text_match = str(full_payload.get("raw_text") or "") == str(adaptive_payload.get("raw_text") or "")
 
@@ -481,6 +571,22 @@ def compare_records(
         "full_boundary_sentence_end_idx": full_boundary_end_idx if full_boundary_end_idx is not None else math.nan,
         "adaptive_left_sentence_end_idx": adaptive_left_end_idx if adaptive_left_end_idx is not None else math.nan,
         "adaptive_right_sentence_end_idx": adaptive_right_end_idx if adaptive_right_end_idx is not None else math.nan,
+        "full_commitment_sentence_end_idx": (
+            int(full_commitment_end_idx) if full_commitment_end_idx is not None else math.nan
+        ),
+        "adaptive_commitment_sentence_end_idx": (
+            int(adaptive_commitment_end_idx) if adaptive_commitment_end_idx is not None else math.nan
+        ),
+        "full_commitment_sentence_text": full_commitment_sentence_text,
+        "adaptive_commitment_sentence_text": adaptive_commitment_sentence_text,
+        "commitment_sentence_exact": float(commitment_sentence_exact),
+        "commitment_sentence_within_one": float(commitment_sentence_within_one),
+        "commitment_text_raw_match": float(commitment_text_raw_match) if not math.isnan(commitment_text_raw_match) else math.nan,
+        "commitment_text_normalized_match": (
+            float(commitment_text_normalized_match)
+            if not math.isnan(commitment_text_normalized_match)
+            else math.nan
+        ),
         "boundary_exact": float(boundary_exact),
         "boundary_within_one": float(boundary_within_one),
         "adaptive_bracket_contains_full_boundary": float(bracket_contains_boundary),
@@ -488,6 +594,8 @@ def compare_records(
         "adaptive_peak_sentence_idx": int(adaptive_peak_sentence_idx),
         "peak_exact": float(full_peak_sentence_idx is not None and int(adaptive_peak_sentence_idx) == int(full_peak_sentence_idx)),
         "peak_within_one": float(full_peak_sentence_idx is not None and abs(int(adaptive_peak_sentence_idx) - int(full_peak_sentence_idx)) <= 1),
+        "adaptive_any_peak_probe_exact": float(any(bool(value) for value in exact_peak_hits)) if exact_peak_hits else math.nan,
+        "adaptive_any_peak_probe_within_one": float(any(bool(value) for value in within_one_peak_hits)) if within_one_peak_hits else math.nan,
         "adaptive_exact_peak_probe_recall": float(np.mean(exact_peak_hits)) if exact_peak_hits else math.nan,
         "adaptive_within_one_peak_probe_recall": float(np.mean(within_one_peak_hits)) if within_one_peak_hits else math.nan,
         "adaptive_all_peaks_covered_within_one": float(all(bool(value) for value in within_one_peak_hits)) if within_one_peak_hits else math.nan,
@@ -512,12 +620,18 @@ def grouped_summary(df: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
         deceptive_examples=("deceptive", lambda values: int(np.sum(values))),
         truthful_examples=("deceptive", lambda values: int(len(values) - np.sum(values))),
         mean_adaptive_probe_fraction=("adaptive_probe_fraction", safe_mean),
+        commitment_sentence_exact_rate=("commitment_sentence_exact", safe_mean),
+        commitment_sentence_within_one_rate=("commitment_sentence_within_one", safe_mean),
+        commitment_text_normalized_match_rate=("commitment_text_normalized_match", safe_mean),
         boundary_exact_rate=("boundary_exact", safe_mean),
         boundary_within_one_rate=("boundary_within_one", safe_mean),
         bracket_contains_boundary_rate=("adaptive_bracket_contains_full_boundary", safe_mean),
         peak_exact_rate=("peak_exact", safe_mean),
         peak_within_one_rate=("peak_within_one", safe_mean),
+        adaptive_any_peak_probe_exact_rate=("adaptive_any_peak_probe_exact", safe_mean),
+        adaptive_any_peak_probe_within_one_rate=("adaptive_any_peak_probe_within_one", safe_mean),
         mean_peak_probe_recall_within_one=("adaptive_within_one_peak_probe_recall", safe_mean),
+        adaptive_all_peaks_covered_within_one_rate=("adaptive_all_peaks_covered_within_one", safe_mean),
         multi_peak_fraction=("is_multi_peak", safe_mean),
         gradual_fraction=("is_gradual", safe_mean),
         sharp_or_other_fraction=("trace_shape_label", lambda values: float(np.mean(pd.Series(values).astype(str).eq("sharp_or_other")))),
@@ -530,12 +644,18 @@ def grouped_summary(df: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
             "deceptive_examples": int(np.sum(df["deceptive"])),
             "truthful_examples": int(len(df) - np.sum(df["deceptive"])),
             "mean_adaptive_probe_fraction": safe_mean(df["adaptive_probe_fraction"]),
+            "commitment_sentence_exact_rate": safe_mean(df["commitment_sentence_exact"]),
+            "commitment_sentence_within_one_rate": safe_mean(df["commitment_sentence_within_one"]),
+            "commitment_text_normalized_match_rate": safe_mean(df["commitment_text_normalized_match"]),
             "boundary_exact_rate": safe_mean(df["boundary_exact"]),
             "boundary_within_one_rate": safe_mean(df["boundary_within_one"]),
             "bracket_contains_boundary_rate": safe_mean(df["adaptive_bracket_contains_full_boundary"]),
             "peak_exact_rate": safe_mean(df["peak_exact"]),
             "peak_within_one_rate": safe_mean(df["peak_within_one"]),
+            "adaptive_any_peak_probe_exact_rate": safe_mean(df["adaptive_any_peak_probe_exact"]),
+            "adaptive_any_peak_probe_within_one_rate": safe_mean(df["adaptive_any_peak_probe_within_one"]),
             "mean_peak_probe_recall_within_one": safe_mean(df["adaptive_within_one_peak_probe_recall"]),
+            "adaptive_all_peaks_covered_within_one_rate": safe_mean(df["adaptive_all_peaks_covered_within_one"]),
             "multi_peak_fraction": safe_mean(df["is_multi_peak"]),
             "gradual_fraction": safe_mean(df["is_gradual"]),
             "sharp_or_other_fraction": float(np.mean(df["trace_shape_label"].astype(str).eq("sharp_or_other"))),
@@ -596,8 +716,20 @@ def plot_bundle_agreement(bundle_summary_df: pd.DataFrame, out_path: Path) -> No
     x = np.arange(len(plot_df))
     width = 0.32
     fig, ax = plt.subplots(figsize=(14.5, 5.5), constrained_layout=True)
-    ax.bar(x - width / 2.0, plot_df["peak_within_one_rate"], width=width, label="Peak within one", color="#3D6E70")
-    ax.bar(x + width / 2.0, plot_df["boundary_within_one_rate"], width=width, label="Boundary within one", color="#C9774D")
+    ax.bar(
+        x - width / 2.0,
+        plot_df["adaptive_any_peak_probe_within_one_rate"],
+        width=width,
+        label="Any peak probed within one",
+        color="#3D6E70",
+    )
+    ax.bar(
+        x + width / 2.0,
+        plot_df["commitment_sentence_exact_rate"],
+        width=width,
+        label="Commitment exact",
+        color="#C9774D",
+    )
     ax.set_xticks(x)
     ax.set_xticklabels(plot_df["bundle_label"], rotation=60)
     ax.set_ylim(0.0, 1.02)
@@ -671,8 +803,14 @@ def pick_case_studies(metrics_df: pd.DataFrame) -> pd.DataFrame:
 
     disagreement_cases = (
         metrics_df.sort_values(
-            ["boundary_abs_error", "peak_within_one", "adaptive_probe_fraction", "example_id"],
-            ascending=[False, True, True, True],
+            [
+                "boundary_abs_error",
+                "adaptive_any_peak_probe_within_one",
+                "peak_within_one",
+                "adaptive_probe_fraction",
+                "example_id",
+            ],
+            ascending=[False, True, True, True, True],
         )
         .head(2)
     )
@@ -758,8 +896,11 @@ def build_summary_markdown(
                 "",
                 "## Overall",
                 f"- Mean adaptive probe fraction: {float(row['mean_adaptive_probe_fraction']):.3f}",
-                f"- Peak within-one agreement: {float(row['peak_within_one_rate']):.3f}",
-                f"- Boundary within-one agreement: {float(row['boundary_within_one_rate']):.3f}",
+                f"- Commitment sentence exact: {float(row['commitment_sentence_exact_rate']):.3f}",
+                f"- Commitment sentence within-one: {float(row['commitment_sentence_within_one_rate']):.3f}",
+                f"- Commitment sentence text match: {float(row['commitment_text_normalized_match_rate']):.3f}",
+                f"- Any full-peak probed within-one: {float(row['adaptive_any_peak_probe_within_one_rate']):.3f}",
+                f"- Adaptive argmax peak within-one: {float(row['peak_within_one_rate']):.3f}",
                 f"- Multi-peak trace fraction: {float(row['multi_peak_fraction']):.3f}",
                 f"- Gradual trace fraction: {float(row['gradual_fraction']):.3f}",
             ]
@@ -865,6 +1006,7 @@ def main() -> None:
                 adaptive_payload=adaptive_payload,
                 thresholds=thresholds,
                 min_valid=int(config.get("localization_args", {}).get("min_valid", 3)),
+                commitment_delta_threshold=float(args.commitment_delta_threshold),
             )
             metrics_row["adaptive_output_relpath"] = adaptive_relpath
             metrics_row["full_output_relpath"] = relpath_from_repo(full_path)
@@ -904,6 +1046,19 @@ def main() -> None:
             "peak_prominence": float(thresholds.peak_prominence),
             "min_peak_separation": int(thresholds.min_peak_separation),
         },
+        "commitment_metric_note": (
+            "The commitment sentence matches the DatasetMain commitment-juncture analysis: "
+            "for deceptive examples, it is the first sentence where the deception-rate delta "
+            f"exceeds +{float(args.commitment_delta_threshold):.3f}; for truthful examples, "
+            "it is the first sentence where the delta goes below the negative of that threshold. "
+            "The adaptive and exhaustive commitment metrics both use this same delta-based rule "
+            "on their respective traces, with an additional normalized text-match check."
+        ),
+        "peak_metric_note": (
+            "peak_within_one uses the adaptive probe with the highest sampled deception rate "
+            "and compares it to the exhaustive argmax. adaptive_any_peak_probe_within_one "
+            "instead asks whether adaptive probed within one sentence of any exhaustive prominent peak."
+        ),
         "gradual_definition": {
             "rule": "Not multi-peak, with sustained rise and no single dominant jump.",
             "gradual_total_rise_threshold": float(thresholds.gradual_total_rise_threshold),

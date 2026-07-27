@@ -201,6 +201,8 @@ def main() -> None:
             """
             {
                 "multi_peak_definition": completion_summary.get("multi_peak_definition", {}),
+                "commitment_metric_note": completion_summary.get("commitment_metric_note", ""),
+                "peak_metric_note": completion_summary.get("peak_metric_note", ""),
                 "gradual_definition": completion_summary.get("gradual_definition", {}),
                 "shape_thresholds": completion_summary.get("shape_thresholds", {}),
             }
@@ -218,6 +220,26 @@ def main() -> None:
             adaptive_overall_df
             """
         ),
+        code(
+            """
+            commitment_columns = [
+                column
+                for column in [
+                    "num_examples",
+                    "commitment_sentence_exact_rate",
+                    "commitment_sentence_within_one_rate",
+                    "commitment_text_normalized_match_rate",
+                    "boundary_exact_rate",
+                    "boundary_within_one_rate",
+                ]
+                if column in adaptive_overall_df.columns
+            ]
+            if commitment_columns:
+                adaptive_overall_df.loc[:, commitment_columns]
+            else:
+                print("No commitment-agreement columns available yet.")
+            """
+        ),
         md("## Model Summary"),
         code(
             """
@@ -226,14 +248,65 @@ def main() -> None:
         ),
         code(
             """
+            model_commitment_columns = [
+                column
+                for column in [
+                    "model_display",
+                    "num_examples",
+                    "commitment_sentence_exact_rate",
+                    "commitment_sentence_within_one_rate",
+                    "commitment_text_normalized_match_rate",
+                ]
+                if column in adaptive_model_df.columns
+            ]
+            if model_commitment_columns:
+                adaptive_model_df.loc[:, model_commitment_columns]
+            else:
+                print("No model-level commitment-agreement columns available yet.")
+            """
+        ),
+        code(
+            """
             if not adaptive_model_df.empty:
                 plot_df = adaptive_model_df.copy()
                 plot_df["model_label"] = plot_df["model_display"].astype(str)
+                peak_column = (
+                    "adaptive_any_peak_probe_within_one_rate"
+                    if "adaptive_any_peak_probe_within_one_rate" in plot_df.columns
+                    else "peak_within_one_rate"
+                )
+                peak_label = (
+                    "Any peak probed within one"
+                    if peak_column == "adaptive_any_peak_probe_within_one_rate"
+                    else "Peak within one"
+                )
+                commitment_column = (
+                    "commitment_sentence_exact_rate"
+                    if "commitment_sentence_exact_rate" in plot_df.columns
+                    else "commitment_sentence_within_one_rate"
+                )
+                commitment_label = (
+                    "Commitment exact"
+                    if commitment_column == "commitment_sentence_exact_rate"
+                    else "Commitment within one"
+                )
                 x = np.arange(len(plot_df))
                 width = 0.32
                 fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
-                ax.bar(x - width / 2.0, plot_df["peak_within_one_rate"], width=width, label="Peak within one", color="#3D6E70")
-                ax.bar(x + width / 2.0, plot_df["boundary_within_one_rate"], width=width, label="Boundary within one", color="#C9774D")
+                ax.bar(
+                    x - width / 2.0,
+                    plot_df[peak_column],
+                    width=width,
+                    label=peak_label,
+                    color="#3D6E70",
+                )
+                ax.bar(
+                    x + width / 2.0,
+                    plot_df[commitment_column],
+                    width=width,
+                    label=commitment_label,
+                    color="#C9774D",
+                )
                 ax.set_xticks(x)
                 ax.set_xticklabels(plot_df["model_label"], rotation=20)
                 ax.set_ylim(0.0, 1.02)
@@ -254,14 +327,66 @@ def main() -> None:
         ),
         code(
             """
+            bundle_commitment_columns = [
+                column
+                for column in [
+                    "env_display",
+                    "model_display",
+                    "num_examples",
+                    "commitment_sentence_exact_rate",
+                    "commitment_sentence_within_one_rate",
+                    "commitment_text_normalized_match_rate",
+                ]
+                if column in adaptive_bundle_df.columns
+            ]
+            if bundle_commitment_columns:
+                adaptive_bundle_df.loc[:, bundle_commitment_columns]
+            else:
+                print("No bundle-level commitment-agreement columns available yet.")
+            """
+        ),
+        code(
+            """
             if not adaptive_bundle_df.empty:
                 plot_df = adaptive_bundle_df.copy()
                 plot_df["bundle_label"] = plot_df["env_display"].astype(str) + "\\n" + plot_df["model_display"].astype(str)
+                peak_column = (
+                    "adaptive_any_peak_probe_within_one_rate"
+                    if "adaptive_any_peak_probe_within_one_rate" in plot_df.columns
+                    else "peak_within_one_rate"
+                )
+                peak_label = (
+                    "Any peak probed within one"
+                    if peak_column == "adaptive_any_peak_probe_within_one_rate"
+                    else "Peak within one"
+                )
+                commitment_column = (
+                    "commitment_sentence_exact_rate"
+                    if "commitment_sentence_exact_rate" in plot_df.columns
+                    else "commitment_sentence_within_one_rate"
+                )
+                commitment_label = (
+                    "Commitment exact"
+                    if commitment_column == "commitment_sentence_exact_rate"
+                    else "Commitment within one"
+                )
                 x = np.arange(len(plot_df))
                 width = 0.32
                 fig, ax = plt.subplots(figsize=(14.5, 5.4), constrained_layout=True)
-                ax.bar(x - width / 2.0, plot_df["peak_within_one_rate"], width=width, label="Peak within one", color="#3D6E70")
-                ax.bar(x + width / 2.0, plot_df["boundary_within_one_rate"], width=width, label="Boundary within one", color="#C9774D")
+                ax.bar(
+                    x - width / 2.0,
+                    plot_df[peak_column],
+                    width=width,
+                    label=peak_label,
+                    color="#3D6E70",
+                )
+                ax.bar(
+                    x + width / 2.0,
+                    plot_df[commitment_column],
+                    width=width,
+                    label=commitment_label,
+                    color="#C9774D",
+                )
                 ax.set_xticks(x)
                 ax.set_xticklabels(plot_df["bundle_label"], rotation=60)
                 ax.set_ylim(0.0, 1.02)
