@@ -336,10 +336,12 @@ def main() -> None:
                     ax.grid(True, axis="y", alpha=0.25)
                     ax.legend()
                     plt.show()
-                    format_summary_table(
-                        plot_df,
-                        keep_columns=["model_display", "num_examples", *exact_tau_columns],
-                        percent_columns=exact_tau_columns,
+                    display(
+                        format_summary_table(
+                            plot_df,
+                            keep_columns=["model_display", "num_examples", *exact_tau_columns],
+                            percent_columns=exact_tau_columns,
+                        )
                     )
             else:
                 print("No paired adaptive/full results available yet.")
@@ -423,10 +425,12 @@ def main() -> None:
                 ax.grid(True, axis="y", alpha=0.25)
                 ax.legend()
                 plt.show()
-                format_summary_table(
-                    plot_df,
-                    keep_columns=["env_display", "model_display", "num_examples", peak_column, commitment_column],
-                    percent_columns=[peak_column, commitment_column],
+                display(
+                    format_summary_table(
+                        plot_df,
+                        keep_columns=["env_display", "model_display", "num_examples", peak_column, commitment_column],
+                        percent_columns=[peak_column, commitment_column],
+                    )
                 )
             else:
                 print("No paired adaptive/full results available yet.")
@@ -484,10 +488,12 @@ def main() -> None:
                 ax.grid(True, axis="y", alpha=0.25)
                 ax.legend()
                 plt.show()
-                format_summary_table(
-                    pivot,
-                    keep_columns=["model_display", *categories],
-                    percent_columns=[category for category in categories if category in pivot.columns],
+                display(
+                    format_summary_table(
+                        pivot,
+                        keep_columns=["model_display", *categories],
+                        percent_columns=[category for category in categories if category in pivot.columns],
+                    )
                 )
             else:
                 print("No exhaustive trace-shape outputs available yet.")
@@ -530,10 +536,12 @@ def main() -> None:
                 ax.grid(True, axis="y", alpha=0.25)
                 ax.legend()
                 plt.show()
-                format_summary_table(
-                    pivot,
-                    keep_columns=["env_display", "model_display", *categories],
-                    percent_columns=[category for category in categories if category in pivot.columns],
+                display(
+                    format_summary_table(
+                        pivot,
+                        keep_columns=["env_display", "model_display", *categories],
+                        percent_columns=[category for category in categories if category in pivot.columns],
+                    )
                 )
             else:
                 print("No exhaustive trace-shape outputs available yet.")
