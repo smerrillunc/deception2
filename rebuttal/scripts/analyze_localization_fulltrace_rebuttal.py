@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-root", type=str, default=str(DEFAULT_RESULTS_ROOT))
     parser.add_argument("--boundary-threshold", type=float, default=0.5)
     parser.add_argument("--peak-min-value", type=float, default=0.5)
-    parser.add_argument("--peak-prominence", type=float, default=0.15)
+    parser.add_argument("--peak-prominence", type=float, default=0.3)
     parser.add_argument("--min-peak-separation", type=int, default=2)
     parser.add_argument("--gradual-total-rise-threshold", type=float, default=0.3)
     parser.add_argument("--gradual-max-jump-threshold", type=float, default=0.25)
