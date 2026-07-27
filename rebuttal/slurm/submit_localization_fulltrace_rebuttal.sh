@@ -3,7 +3,6 @@ set -euo pipefail
 
 RUN_NAME="${1:-localization_fulltrace_vs_adaptive_rebuttal_v1}"
 MANIFEST_KIND="${2:-all}"   # all | adaptive | full
-SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-rc_amcavoy_pi}"
 PROJECT_ROOT="${PROJECT_ROOT:-/work/users/s/m/smerrill/deception2}"
 
 case "$MANIFEST_KIND" in
@@ -47,10 +46,9 @@ echo "Submitting $TASK_COUNT localization tasks"
 echo "Run root: $RUN_ROOT"
 echo "Manifest kind: $MANIFEST_KIND"
 echo "Manifest path: $MANIFEST_PATH"
-echo "Using account: $SBATCH_ACCOUNT"
+echo "Using default Slurm account/association"
 
 ARRAY_JOB_ID="$(sbatch \
-  --account "$SBATCH_ACCOUNT" \
   --job-name "$JOB_NAME" \
   --output "$LOG_DIR/${MANIFEST_KIND}_%A_%a.out" \
   --error "$LOG_DIR/${MANIFEST_KIND}_%A_%a.err" \
