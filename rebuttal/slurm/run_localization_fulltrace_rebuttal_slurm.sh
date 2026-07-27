@@ -44,11 +44,17 @@ module load anaconda
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
+# Longleaf's MKL defaults can conflict with libgomp-loaded deps inside the
+# localization subprocess. Force the GNU threading layer unless the user has
+# explicitly overridden it.
+export MKL_THREADING_LAYER="${MKL_THREADING_LAYER:-GNU}"
+
 echo "Project root: $PROJECT_ROOT"
 echo "Manifest kind: $MANIFEST_KIND"
 echo "Manifest path: $MANIFEST_PATH"
 echo "Task index: $TASK_INDEX"
 echo "Conda env: $CONDA_ENV"
+echo "MKL_THREADING_LAYER: $MKL_THREADING_LAYER"
 
 python "$TASK_RUNNER" \
   --manifest-path "$MANIFEST_PATH" \

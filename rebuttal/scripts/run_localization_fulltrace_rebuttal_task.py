@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -121,7 +122,9 @@ def main() -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(cmd, check=True)
+    child_env = os.environ.copy()
+    child_env.setdefault("MKL_THREADING_LAYER", "GNU")
+    subprocess.run(cmd, check=True, env=child_env)
 
 
 if __name__ == "__main__":
