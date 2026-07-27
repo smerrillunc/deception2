@@ -32,6 +32,93 @@ from localization_fulltrace_rebuttal_lib import (
     write_json,
 )
 
+BUNDLE_GROUP_COLUMNS = ["env_name", "env_display", "model_bundle_name", "model_display"]
+SUMMARY_METRIC_COLUMNS = [
+    "num_examples",
+    "deceptive_examples",
+    "truthful_examples",
+    "mean_adaptive_probe_fraction",
+    "boundary_exact_rate",
+    "boundary_within_one_rate",
+    "bracket_contains_boundary_rate",
+    "peak_exact_rate",
+    "peak_within_one_rate",
+    "mean_peak_probe_recall_within_one",
+    "multi_peak_fraction",
+    "gradual_fraction",
+    "sharp_or_other_fraction",
+    "prompt_match_rate",
+    "raw_text_match_rate",
+]
+PER_EXAMPLE_COLUMNS = [
+    "bundle_key",
+    "env_name",
+    "env_display",
+    "model_bundle_name",
+    "model_display",
+    "model_id",
+    "example_id",
+    "deceptive",
+    "label_name",
+    "sentence_count",
+    "prompt_match",
+    "raw_text_match",
+    "adaptive_probe_count",
+    "adaptive_probe_fraction",
+    "full_boundary_sentence_end_idx",
+    "adaptive_left_sentence_end_idx",
+    "adaptive_right_sentence_end_idx",
+    "boundary_exact",
+    "boundary_within_one",
+    "adaptive_bracket_contains_full_boundary",
+    "boundary_abs_error",
+    "adaptive_peak_sentence_idx",
+    "peak_exact",
+    "peak_within_one",
+    "adaptive_exact_peak_probe_recall",
+    "adaptive_within_one_peak_probe_recall",
+    "adaptive_all_peaks_covered_within_one",
+    "full_peak_sentence_idx",
+    "full_peak_deception_rate",
+    "full_prominent_peak_count",
+    "full_prominent_peak_sentence_indices",
+    "full_total_positive_rise",
+    "full_max_positive_jump",
+    "full_positive_jump_count",
+    "full_jump_concentration",
+    "trace_shape_label",
+    "is_multi_peak",
+    "is_gradual",
+    "adaptive_output_relpath",
+    "full_output_relpath",
+]
+CURVE_POINT_COLUMNS = [
+    "bundle_key",
+    "example_id",
+    "method",
+    "sentence_idx",
+    "sentence_number",
+    "sentence_end_idx",
+    "deception_rate",
+    "num_valid",
+    "num_truthful",
+    "sentence_text",
+    "is_probed_by_adaptive",
+    "env_name",
+    "model_bundle_name",
+    "label_name",
+    "full_boundary_sentence_end_idx",
+    "adaptive_right_sentence_end_idx",
+    "trace_shape_label",
+]
+SHAPE_PREVALENCE_COLUMNS = BUNDLE_GROUP_COLUMNS + [
+    "trace_shape_label",
+    "num_examples",
+    "total_examples",
+    "fraction",
+]
+CASE_STUDY_COLUMNS = PER_EXAMPLE_COLUMNS + ["case_category"]
+
 
 @dataclass(frozen=True)
 class ShapeThresholds:
@@ -662,6 +749,15 @@ def build_summary_markdown(
     return "\n".join(lines) + "\n"
 
 
+def ensure_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if df.empty and not list(df.columns):
+        return pd.DataFrame(columns=columns)
+    missing = [column for column in columns if column not in df.columns]
+    for column in missing:
+        df[column] = pd.NA
+    return df.loc[:, columns]
+
+
 def main() -> None:
     args = parse_args()
     thresholds = shape_thresholds_from_args(args)
@@ -762,23 +858,30 @@ def main() -> None:
         "analysis_completed_at": pd.Timestamp.utcnow().isoformat(),
     }
 
-    metrics_df = pd.DataFrame(per_example_rows)
+    metrics_df = pd.DataFrame(per_example_rows, columns=PER_EXAMPLE_COLUMNS)
     curve_points_df = (
         pd.concat(curve_frames, ignore_index=True, sort=False)
         if curve_frames
-        else pd.DataFrame()
+        else pd.DataFrame(columns=CURVE_POINT_COLUMNS)
     )
+    curve_points_df = ensure_columns(curve_points_df, CURVE_POINT_COLUMNS)
     bundle_completion_df = pd.DataFrame(bundle_completion_rows).sort_values(["env_display", "model_display"]).reset_index(drop=True)
     bundle_summary_df = grouped_summary(metrics_df, ["env_name", "env_display", "model_bundle_name", "model_display"])
+    bundle_summary_df = ensure_columns(bundle_summary_df, BUNDLE_GROUP_COLUMNS + SUMMARY_METRIC_COLUMNS)
     overall_summary_df = grouped_summary(metrics_df, [])
+    overall_summary_df = ensure_columns(overall_summary_df, SUMMARY_METRIC_COLUMNS)
     if not overall_summary_df.empty:
         overall_summary_df.insert(0, "summary_scope", "overall")
+    else:
+        overall_summary_df = pd.DataFrame(columns=["summary_scope", *SUMMARY_METRIC_COLUMNS])
     shape_df = shape_prevalence_table(metrics_df, ["env_name", "env_display", "model_bundle_name", "model_display"])
+    shape_df = ensure_columns(shape_df, SHAPE_PREVALENCE_COLUMNS)
     case_studies_df = pick_case_studies(metrics_df)
+    case_studies_df = ensure_columns(case_studies_df, CASE_STUDY_COLUMNS)
 
     write_json(analysis_root / "completion_summary.json", completion_summary)
     write_csv(analysis_root / "bundle_completion_summary.csv", bundle_completion_rows)
-    write_csv(analysis_root / "per_example_metrics.csv", per_example_rows)
+    write_csv(analysis_root / "per_example_metrics.csv", per_example_rows, fieldnames=PER_EXAMPLE_COLUMNS)
     curve_points_df.to_csv(analysis_root / "curve_points.csv", index=False)
     bundle_summary_df.to_csv(analysis_root / "adaptive_vs_full_summary_by_bundle.csv", index=False)
     overall_summary_df.to_csv(analysis_root / "adaptive_vs_full_summary_overall.csv", index=False)

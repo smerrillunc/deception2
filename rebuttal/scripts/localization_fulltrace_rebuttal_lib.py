@@ -117,19 +117,24 @@ def write_jsonl(path: Path | str, rows: Iterable[dict[str, Any]]) -> Path:
     return file_path
 
 
-def write_csv(path: Path | str, rows: Sequence[dict[str, Any]]) -> Path:
+def write_csv(
+    path: Path | str,
+    rows: Sequence[dict[str, Any]],
+    *,
+    fieldnames: Sequence[str] | None = None,
+) -> Path:
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames: list[str] = []
+    output_fieldnames: list[str] = [str(name) for name in (fieldnames or [])]
     for row in rows:
         for key in row.keys():
-            if key not in fieldnames:
-                fieldnames.append(str(key))
+            if key not in output_fieldnames:
+                output_fieldnames.append(str(key))
     with file_path.open("w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(fh, fieldnames=output_fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+            writer.writerow({key: row.get(key, "") for key in output_fieldnames})
     return file_path
 
 

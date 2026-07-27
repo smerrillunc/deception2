@@ -71,6 +71,7 @@ def main() -> None:
             import matplotlib.pyplot as plt
             import numpy as np
             import pandas as pd
+            from pandas.errors import EmptyDataError
             from IPython.display import Markdown, display
 
             NOTEBOOK_CWD = Path.cwd().resolve()
@@ -114,7 +115,12 @@ def main() -> None:
 
 
             def read_csv(path: Path) -> pd.DataFrame:
-                return pd.read_csv(path) if path.exists() else pd.DataFrame()
+                if not path.exists() or path.stat().st_size == 0:
+                    return pd.DataFrame()
+                try:
+                    return pd.read_csv(path)
+                except EmptyDataError:
+                    return pd.DataFrame()
 
 
             def refresh_analysis() -> subprocess.CompletedProcess:
@@ -144,6 +150,15 @@ def main() -> None:
             adaptive_overall_df = read_csv(ANALYSIS_ROOT / "adaptive_vs_full_summary_overall.csv")
             trace_shape_df = read_csv(ANALYSIS_ROOT / "trace_shape_prevalence_by_bundle.csv")
             case_studies_df = read_csv(ANALYSIS_ROOT / "case_studies.csv")
+            print(
+                "Analysis status:",
+                {
+                    "expected_examples": completion_summary.get("expected_examples"),
+                    "completed_dataset_adaptive_examples": completion_summary.get("completed_dataset_adaptive_examples"),
+                    "completed_full_examples": completion_summary.get("completed_full_examples"),
+                    "completed_paired_examples": completion_summary.get("completed_paired_examples"),
+                },
+            )
             """
         ),
         md("## Refresh Analysis"),
