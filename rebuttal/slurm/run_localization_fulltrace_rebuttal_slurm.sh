@@ -14,6 +14,8 @@ set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-/work/users/s/m/smerrill/deception2}"
 CONDA_ENV="${CONDA_ENV:-deception}"
+CONDA_ENV_PATH="${CONDA_ENV_PATH:-}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 RUN_NAME="${RUN_NAME:-localization_fulltrace_vs_adaptive_rebuttal_v1}"
 MANIFEST_KIND="${MANIFEST_KIND:-full}"   # full | all(alias of full)
 TASK_INDEX="${TASK_INDEX:-${SLURM_ARRAY_TASK_ID:-0}}"
@@ -40,9 +42,46 @@ if [[ ! -f "$MANIFEST_PATH" ]]; then
   exit 1
 fi
 
-module load anaconda
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$CONDA_ENV"
+resolve_python_bin() {
+  if [[ -n "${PYTHON_BIN:-}" && -x "${PYTHON_BIN:-}" ]]; then
+    printf '%s\n' "$PYTHON_BIN"
+    return
+  fi
+
+  if [[ -n "${CONDA_ENV_PATH:-}" && -x "${CONDA_ENV_PATH}/bin/python" ]]; then
+    printf '%s\n' "${CONDA_ENV_PATH}/bin/python"
+    return
+  fi
+
+  local candidates=(
+    "/work/users/s/m/smerrill/conda_envs/deception/bin/python"
+    "/playpen-ssd/smerrill/conda_envs/deception/bin/python"
+  )
+  local cand
+  for cand in "${candidates[@]}"; do
+    if [[ -x "$cand" ]]; then
+      printf '%s\n' "$cand"
+      return
+    fi
+  done
+
+  return 1
+}
+
+if ! PYTHON_BIN="$(resolve_python_bin)"; then
+  module load anaconda
+  # shellcheck disable=SC1091
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate "$CONDA_ENV"
+  PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+fi
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "PYTHON_BIN is not executable: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+export PYTHON_BIN
 
 # Longleaf's MKL defaults can conflict with libgomp-loaded deps inside the
 # localization subprocess. Force the GNU threading layer unless the user has
@@ -57,10 +96,14 @@ echo "Manifest kind: $MANIFEST_KIND"
 echo "Manifest path: $MANIFEST_PATH"
 echo "Task index: $TASK_INDEX"
 echo "Conda env: $CONDA_ENV"
+echo "Conda env path: ${CONDA_ENV_PATH:-<unset>}"
+echo "Python bin: $PYTHON_BIN"
 echo "MKL_THREADING_LAYER: $MKL_THREADING_LAYER"
 echo "VLLM_CONFIG_ROOT: $VLLM_CONFIG_ROOT"
 
-conda run -n "$CONDA_ENV" python "$TASK_RUNNER" \
+"$PYTHON_BIN" -c "import sys; print('python=', sys.executable)"
+
+"$PYTHON_BIN" "$TASK_RUNNER" \
   --manifest-path "$MANIFEST_PATH" \
   --task-index "$TASK_INDEX" \
   --project-root "$PROJECT_ROOT"

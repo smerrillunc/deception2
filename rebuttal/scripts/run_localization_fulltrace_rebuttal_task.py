@@ -44,7 +44,7 @@ def main() -> None:
     script_path = project_root / "src" / "sentence_localization_batch.py"
     if not args.dry_run and not script_path.exists():
         raise FileNotFoundError(f"Missing localization script: {script_path}")
-    conda_env = str(os.environ.get("CONDA_ENV") or "").strip()
+    python_bin = str(os.environ.get("PYTHON_BIN") or sys.executable).strip()
 
     examples_path = resolve_repo_path(str(row["examples_relpath"]), project_root=project_root)
     sentences_path = resolve_repo_path(str(row["sentences_relpath"]), project_root=project_root)
@@ -110,10 +110,7 @@ def main() -> None:
         "--flush_every",
         "1",
     ]
-    if conda_env:
-        cmd = ["conda", "run", "-n", conda_env, *inner_cmd]
-    else:
-        cmd = [sys.executable, *inner_cmd[1:]]
+    cmd = [python_bin, *inner_cmd[1:]]
 
     print(
         f"Running task {args.task_index}: "
