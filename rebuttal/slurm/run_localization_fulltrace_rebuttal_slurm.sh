@@ -48,6 +48,9 @@ conda activate "$CONDA_ENV"
 # localization subprocess. Force the GNU threading layer unless the user has
 # explicitly overridden it.
 export MKL_THREADING_LAYER="${MKL_THREADING_LAYER:-GNU}"
+export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
+export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-/tmp/vllm}"
+mkdir -p "$VLLM_CONFIG_ROOT"
 
 echo "Project root: $PROJECT_ROOT"
 echo "Manifest kind: $MANIFEST_KIND"
@@ -55,8 +58,9 @@ echo "Manifest path: $MANIFEST_PATH"
 echo "Task index: $TASK_INDEX"
 echo "Conda env: $CONDA_ENV"
 echo "MKL_THREADING_LAYER: $MKL_THREADING_LAYER"
+echo "VLLM_CONFIG_ROOT: $VLLM_CONFIG_ROOT"
 
-python "$TASK_RUNNER" \
+conda run -n "$CONDA_ENV" python "$TASK_RUNNER" \
   --manifest-path "$MANIFEST_PATH" \
   --task-index "$TASK_INDEX" \
   --project-root "$PROJECT_ROOT"

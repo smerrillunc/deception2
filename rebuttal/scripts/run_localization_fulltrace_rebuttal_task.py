@@ -44,14 +44,15 @@ def main() -> None:
     script_path = project_root / "src" / "sentence_localization_batch.py"
     if not args.dry_run and not script_path.exists():
         raise FileNotFoundError(f"Missing localization script: {script_path}")
+    conda_env = str(os.environ.get("CONDA_ENV") or "").strip()
 
     examples_path = resolve_repo_path(str(row["examples_relpath"]), project_root=project_root)
     sentences_path = resolve_repo_path(str(row["sentences_relpath"]), project_root=project_root)
     out_dir = resolve_repo_path(str(row["out_dir_relpath"]), project_root=project_root)
     jsonl_path = resolve_repo_path(str(row["jsonl_relpath"]), project_root=project_root)
 
-    cmd = [
-        sys.executable,
+    inner_cmd = [
+        "python",
         str(script_path),
         "--game",
         str(row["env_name"]),
@@ -109,6 +110,10 @@ def main() -> None:
         "--flush_every",
         "1",
     ]
+    if conda_env:
+        cmd = ["conda", "run", "-n", conda_env, *inner_cmd]
+    else:
+        cmd = [sys.executable, *inner_cmd[1:]]
 
     print(
         f"Running task {args.task_index}: "
@@ -124,6 +129,8 @@ def main() -> None:
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     child_env = os.environ.copy()
     child_env.setdefault("MKL_THREADING_LAYER", "GNU")
+    child_env.setdefault("VLLM_NO_USAGE_STATS", "1")
+    child_env.setdefault("VLLM_CONFIG_ROOT", "/tmp/vllm")
     subprocess.run(cmd, check=True, env=child_env)
 
 
