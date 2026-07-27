@@ -15,12 +15,11 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-/work/users/s/m/smerrill/deception2}"
 CONDA_ENV="${CONDA_ENV:-deception}"
 RUN_NAME="${RUN_NAME:-localization_fulltrace_vs_adaptive_rebuttal_v1}"
-MANIFEST_KIND="${MANIFEST_KIND:-all}"   # all | adaptive | full
+MANIFEST_KIND="${MANIFEST_KIND:-full}"   # full | all(alias of full)
 TASK_INDEX="${TASK_INDEX:-${SLURM_ARRAY_TASK_ID:-0}}"
 
 case "$MANIFEST_KIND" in
   all) MANIFEST_FILENAME="run_manifest.csv" ;;
-  adaptive) MANIFEST_FILENAME="run_manifest_adaptive.csv" ;;
   full) MANIFEST_FILENAME="run_manifest_full.csv" ;;
   *)
     echo "Unsupported MANIFEST_KIND: $MANIFEST_KIND" >&2

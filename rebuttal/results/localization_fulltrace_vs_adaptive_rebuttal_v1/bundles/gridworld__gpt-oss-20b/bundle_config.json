@@ -1,6 +1,6 @@
 {
   "bundle_key": "gridworld__gpt-oss-20b",
-  "created_at_utc": "2026-07-26T23:58:56.558305+00:00",
+  "created_at_utc": "2026-07-27T00:19:09.050781+00:00",
   "env_name": "gridworld",
   "model_bundle_name": "gpt-oss-20b",
   "model_id": "openai/gpt-oss-20b",

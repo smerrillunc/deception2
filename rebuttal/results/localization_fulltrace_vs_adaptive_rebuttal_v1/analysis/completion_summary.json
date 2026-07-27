@@ -1,9 +1,11 @@
 {
-  "analysis_completed_at": "2026-07-27T00:01:04.193819+00:00",
-  "completed_adaptive_examples": 0,
+  "adaptive_reference_source": "selected_examples.csv[source_localization_relpath]",
+  "analysis_completed_at": "2026-07-27T00:19:58.843889+00:00",
+  "completed_adaptive_examples": 200,
+  "completed_dataset_adaptive_examples": 200,
   "completed_full_examples": 0,
   "completed_paired_examples": 0,
-  "created_at_analysis": "2026-07-26T23:59:36.115076+00:00",
+  "created_at_analysis": "2026-07-27T00:19:46.206127+00:00",
   "expected_examples": 200,
   "run_name": "localization_fulltrace_vs_adaptive_rebuttal_v1"
 }

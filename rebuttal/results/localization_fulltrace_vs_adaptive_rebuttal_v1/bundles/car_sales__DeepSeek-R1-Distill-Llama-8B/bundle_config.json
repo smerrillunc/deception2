@@ -1,6 +1,6 @@
 {
   "bundle_key": "car_sales__DeepSeek-R1-Distill-Llama-8B",
-  "created_at_utc": "2026-07-26T23:58:00.858592+00:00",
+  "created_at_utc": "2026-07-27T00:18:14.972667+00:00",
   "env_name": "car_sales",
   "model_bundle_name": "DeepSeek-R1-Distill-Llama-8B",
   "model_id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",

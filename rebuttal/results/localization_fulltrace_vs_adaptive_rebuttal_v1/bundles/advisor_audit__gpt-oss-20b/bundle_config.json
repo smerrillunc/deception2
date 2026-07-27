@@ -1,6 +1,6 @@
 {
   "bundle_key": "advisor_audit__gpt-oss-20b",
-  "created_at_utc": "2026-07-26T23:57:09.682682+00:00",
+  "created_at_utc": "2026-07-27T00:17:23.827621+00:00",
   "env_name": "advisor_audit",
   "model_bundle_name": "gpt-oss-20b",
   "model_id": "openai/gpt-oss-20b",

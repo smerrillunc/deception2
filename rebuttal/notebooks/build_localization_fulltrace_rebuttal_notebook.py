@@ -18,7 +18,7 @@ DEFAULT_NOTEBOOK_PATH = NOTEBOOK_DIR / "localization_fulltrace_rebuttal_analysis
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build the localization full-vs-adaptive rebuttal notebook."
+        description="Build the localization dataset-adaptive-vs-full rebuttal notebook."
     )
     parser.add_argument("--run-name", type=str, default=DEFAULT_RUN_NAME)
     parser.add_argument("--results-root", type=str, default=str(DEFAULT_RESULTS_ROOT))
@@ -43,15 +43,16 @@ def main() -> None:
     nb["cells"] = [
         md(
             """
-            # Localization Full-vs-Adaptive Rebuttal Analysis
+            # Localization Dataset-Adaptive-vs-Full Rebuttal Analysis
 
             This notebook is for the small matched localization comparison:
 
             - 10 selected examples per model x environment bundle
-            - the same subset run twice, once with `adaptive` and once with `full`
+            - dataset adaptive localization used as the reference traces
+            - the same subset rerun only with exhaustive `full` localization
             - quantitative summaries of:
-              - adaptive probe coverage
-              - adaptive-vs-full peak and boundary agreement
+              - dataset-adaptive probe coverage
+              - dataset-adaptive-vs-full peak and boundary agreement
               - prevalence of gradual and multi-peak exhaustive traces
               - case-study curves
 
@@ -202,7 +203,7 @@ def main() -> None:
                 ax.set_xticklabels(plot_df["bundle_label"], rotation=60)
                 ax.set_ylim(0.0, 1.02)
                 ax.set_ylabel("Agreement rate")
-                ax.set_title("Adaptive vs exhaustive agreement by bundle")
+                ax.set_title("Dataset adaptive vs exhaustive agreement by bundle")
                 ax.grid(True, axis="y", alpha=0.25)
                 ax.legend()
                 plt.show()
@@ -286,14 +287,14 @@ def main() -> None:
                 metric = metrics_row.iloc[0]
                 fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
                 ax.plot(full_df["sentence_number"], full_df["deception_rate"], marker="o", linewidth=2.4, color="black", label="Full")
-                ax.scatter(adaptive_df["sentence_number"], adaptive_df["deception_rate"], s=70, color="#C05621", label="Adaptive probes", zorder=4)
+                ax.scatter(adaptive_df["sentence_number"], adaptive_df["deception_rate"], s=70, color="#C05621", label="Dataset adaptive probes", zorder=4)
 
                 peak_string = str(metric.get("full_prominent_peak_sentence_indices") or "")
                 for peak_text in [value for value in peak_string.split(",") if value.strip()]:
                     ax.axvline(int(peak_text), color="#3182CE", linewidth=1.1, alpha=0.35)
 
                 if pd.notna(metric.get("adaptive_right_sentence_end_idx")):
-                    ax.axvline(int(metric["adaptive_right_sentence_end_idx"]), color="#DD6B20", linestyle="--", linewidth=1.4, alpha=0.75, label="Adaptive right boundary")
+                    ax.axvline(int(metric["adaptive_right_sentence_end_idx"]), color="#DD6B20", linestyle="--", linewidth=1.4, alpha=0.75, label="Dataset adaptive right boundary")
                 if pd.notna(metric.get("full_boundary_sentence_end_idx")):
                     ax.axvline(int(metric["full_boundary_sentence_end_idx"]), color="#2F855A", linestyle=":", linewidth=1.6, alpha=0.85, label="Full boundary")
 

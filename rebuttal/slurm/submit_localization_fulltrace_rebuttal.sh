@@ -2,16 +2,15 @@
 set -euo pipefail
 
 RUN_NAME="${1:-localization_fulltrace_vs_adaptive_rebuttal_v1}"
-MANIFEST_KIND="${2:-all}"   # all | adaptive | full
+MANIFEST_KIND="${2:-full}"   # full | all(alias of full)
 PROJECT_ROOT="${PROJECT_ROOT:-/work/users/s/m/smerrill/deception2}"
 
 case "$MANIFEST_KIND" in
   all) MANIFEST_FILENAME="run_manifest.csv" ;;
-  adaptive) MANIFEST_FILENAME="run_manifest_adaptive.csv" ;;
   full) MANIFEST_FILENAME="run_manifest_full.csv" ;;
   *)
     echo "Unsupported manifest kind: $MANIFEST_KIND" >&2
-    echo "Expected one of: all, adaptive, full" >&2
+    echo "Expected one of: full, all" >&2
     exit 1
     ;;
 esac

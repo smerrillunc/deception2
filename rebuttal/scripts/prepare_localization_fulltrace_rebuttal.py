@@ -48,8 +48,8 @@ from sentence_pipeline import split_sentence_spans
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare a deterministic 10-example-per-bundle subset for adaptive-vs-full "
-            "sentence-localization rebuttal runs."
+            "Prepare a deterministic 10-example-per-bundle subset for comparing "
+            "dataset adaptive localization against new full-trace localization runs."
         )
     )
     parser.add_argument("--run-name", type=str, default=DEFAULT_RUN_NAME)
@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def remove_if_exists(path: Path | str) -> None:
+    file_path = Path(path)
+    if file_path.exists():
+        file_path.unlink()
 
 
 def compressed_bundle_specs(
@@ -528,48 +534,45 @@ def build_manifest_rows(
     gpu_memory_utilization: float,
     tensor_parallel_size: int,
 ) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
     bundle_key = bundle.bundle_key
-    for method_name in ("adaptive", "full"):
-        output_root = ensure_dir(
-            Path(results_root).expanduser().resolve() / run_name / "runs" / method_name / bundle_key
-        )
-        out_dir = ensure_dir(output_root / "localization")
-        jsonl_path = output_root / f"{method_name}.jsonl"
-        out.append(
-            {
-                "run_name": run_name,
-                "method": method_name,
-                "bundle_key": bundle_key,
-                "env_name": bundle.env_name,
-                "env_display": bundle.env_display,
-                "model_bundle_name": bundle.model_bundle_name,
-                "model_display": bundle.model_display,
-                "model_id": bundle.model_id,
-                "num_examples": int(len(selected_rows)),
-                "examples_relpath": bundle_paths["bundle_examples_relpath"],
-                "sentences_relpath": bundle_paths["bundle_sentences_relpath"],
-                "selected_examples_relpath": bundle_paths["bundle_selected_examples_relpath"],
-                "out_dir_relpath": relpath_from_repo(out_dir),
-                "jsonl_relpath": relpath_from_repo(jsonl_path),
-                "n_samples": int(n_samples),
-                "temperature": float(temperature),
-                "top_p": float(top_p),
-                "repetition_penalty": float(repetition_penalty),
-                "max_new_tokens": int(max_new_tokens),
-                "mode": str(mode),
-                "text_field": str(text_field),
-                "base_seed": int(base_seed),
-                "coarse_iters": int(coarse_iters),
-                "refinement_iters": int(refinement_iters),
-                "min_valid": int(min_valid),
-                "min_step_size": int(min_step_size),
-                "min_spacing": int(min_spacing),
-                "gpu_memory_utilization": float(gpu_memory_utilization),
-                "tensor_parallel_size": int(tensor_parallel_size),
-            }
-        )
-    return out
+    output_root = ensure_dir(
+        Path(results_root).expanduser().resolve() / run_name / "runs" / "full" / bundle_key
+    )
+    out_dir = ensure_dir(output_root / "localization")
+    jsonl_path = output_root / "full.jsonl"
+    return [
+        {
+            "run_name": run_name,
+            "method": "full",
+            "bundle_key": bundle_key,
+            "env_name": bundle.env_name,
+            "env_display": bundle.env_display,
+            "model_bundle_name": bundle.model_bundle_name,
+            "model_display": bundle.model_display,
+            "model_id": bundle.model_id,
+            "num_examples": int(len(selected_rows)),
+            "examples_relpath": bundle_paths["bundle_examples_relpath"],
+            "sentences_relpath": bundle_paths["bundle_sentences_relpath"],
+            "selected_examples_relpath": bundle_paths["bundle_selected_examples_relpath"],
+            "out_dir_relpath": relpath_from_repo(out_dir),
+            "jsonl_relpath": relpath_from_repo(jsonl_path),
+            "n_samples": int(n_samples),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "repetition_penalty": float(repetition_penalty),
+            "max_new_tokens": int(max_new_tokens),
+            "mode": str(mode),
+            "text_field": str(text_field),
+            "base_seed": int(base_seed),
+            "coarse_iters": int(coarse_iters),
+            "refinement_iters": int(refinement_iters),
+            "min_valid": int(min_valid),
+            "min_step_size": int(min_step_size),
+            "min_spacing": int(min_spacing),
+            "gpu_memory_utilization": float(gpu_memory_utilization),
+            "tensor_parallel_size": int(tensor_parallel_size),
+        }
+    ]
 
 
 def main() -> None:
@@ -683,14 +686,11 @@ def main() -> None:
             f"{summary['selected_truthful_examples']} truthful)."
         )
 
-    manifest_rows_full = [row for row in manifest_rows_all if str(row.get("method")) == "full"]
-    manifest_rows_adaptive = [row for row in manifest_rows_all if str(row.get("method")) == "adaptive"]
-
     write_csv(output_root / "selected_examples.csv", selection_rows_all)
     write_csv(output_root / "bundle_summary.csv", bundle_summary_rows)
     write_csv(output_root / "run_manifest.csv", manifest_rows_all)
-    write_csv(output_root / "run_manifest_full.csv", manifest_rows_full)
-    write_csv(output_root / "run_manifest_adaptive.csv", manifest_rows_adaptive)
+    write_csv(output_root / "run_manifest_full.csv", manifest_rows_all)
+    remove_if_exists(output_root / "run_manifest_adaptive.csv")
 
     config = {
         "run_name": args.run_name,
@@ -730,16 +730,17 @@ def main() -> None:
     readme_lines = [
         f"# {args.run_name}",
         "",
-        "Deterministic rebuttal subset for adaptive-vs-full sentence localization.",
+        "Deterministic rebuttal subset for comparing dataset adaptive localization",
+        "against newly run full-trace localization.",
         "",
         "Generated artifacts:",
         "- `selected_examples.csv`: one row per chosen example.",
         "- `bundle_summary.csv`: eligible vs selected counts per environment/model bundle.",
-        "- `run_manifest.csv`: all adaptive/full jobs.",
-        "- `run_manifest_full.csv`: full-only jobs.",
-        "- `run_manifest_adaptive.csv`: adaptive-only jobs.",
+        "- `run_manifest.csv`: full localization jobs to launch.",
+        "- `run_manifest_full.csv`: alias of `run_manifest.csv` for compatibility.",
         "- `bundles/<env>__<model>/examples.jsonl`: selected examples.",
         "- `bundles/<env>__<model>/sentences.jsonl`: matching sentence records.",
+        "- `selected_examples.csv[source_localization_relpath]`: dataset adaptive localization files used as the comparison baseline.",
         "",
         "Local refresh:",
         (
@@ -753,7 +754,6 @@ def main() -> None:
             "```bash\n"
             "cd /work/users/s/m/smerrill/deception2\n"
             f"python rebuttal/scripts/prepare_localization_fulltrace_rebuttal.py --run-name {args.run_name}\n"
-            f"bash rebuttal/slurm/submit_localization_fulltrace_rebuttal.sh {args.run_name} adaptive\n"
             f"bash rebuttal/slurm/submit_localization_fulltrace_rebuttal.sh {args.run_name} full\n"
             "```"
         ),
@@ -763,8 +763,7 @@ def main() -> None:
     print(f"Wrote run root: {output_root}")
     print(f"Selected examples: {len(selection_rows_all)}")
     print(f"Bundles: {len(bundle_summary_rows)}")
-    print(f"Adaptive tasks: {len(manifest_rows_adaptive)}")
-    print(f"Full tasks: {len(manifest_rows_full)}")
+    print(f"Full tasks: {len(manifest_rows_all)}")
 
 
 if __name__ == "__main__":

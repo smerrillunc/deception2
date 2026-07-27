@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 import os
@@ -89,6 +90,14 @@ def safe_sum(series: pd.Series) -> float:
     if values.empty:
         return 0.0
     return float(values.sum())
+
+
+def read_localization_payload(path: Path) -> dict[str, Any]:
+    file_path = Path(path)
+    if file_path.suffix == ".gz":
+        with gzip.open(file_path, "rt", encoding="utf-8") as fh:
+            return json.load(fh)
+    return json.loads(file_path.read_text(encoding="utf-8"))
 
 
 def local_peak_candidates(values: np.ndarray) -> list[int]:
@@ -459,8 +468,8 @@ def plot_bundle_probe_fraction(bundle_summary_df: pd.DataFrame, out_path: Path) 
         plot_df["mean_adaptive_probe_fraction"],
         color="#5B7C99",
     )
-    ax.set_ylabel("Mean adaptive probe fraction")
-    ax.set_title("Adaptive probe coverage relative to exhaustive localization")
+    ax.set_ylabel("Mean dataset-adaptive probe fraction")
+    ax.set_title("Dataset adaptive probe coverage relative to exhaustive localization")
     ax.set_ylim(0.0, 1.02)
     ax.tick_params(axis="x", rotation=60)
     ax.grid(True, axis="y", alpha=0.25)
@@ -482,7 +491,7 @@ def plot_bundle_agreement(bundle_summary_df: pd.DataFrame, out_path: Path) -> No
     ax.set_xticklabels(plot_df["bundle_label"], rotation=60)
     ax.set_ylim(0.0, 1.02)
     ax.set_ylabel("Agreement rate")
-    ax.set_title("Adaptive vs exhaustive agreement by bundle")
+    ax.set_title("Dataset adaptive vs exhaustive agreement by bundle")
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend()
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
@@ -588,7 +597,7 @@ def plot_case_study(example_metrics: dict[str, Any], curve_df: pd.DataFrame, out
 
     fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
     ax.plot(x_full, y_full, marker="o", linewidth=2.4, color="black", label="Full")
-    ax.scatter(x_adapt, y_adapt, s=70, color="#C05621", label="Adaptive probes", zorder=4)
+    ax.scatter(x_adapt, y_adapt, s=70, color="#C05621", label="Dataset adaptive probes", zorder=4)
 
     peak_string = str(example_metrics.get("full_prominent_peak_sentence_indices") or "")
     for peak_text in [value for value in peak_string.split(",") if value.strip()]:
@@ -597,7 +606,7 @@ def plot_case_study(example_metrics: dict[str, Any], curve_df: pd.DataFrame, out
 
     adaptive_right = example_metrics.get("adaptive_right_sentence_end_idx")
     if pd.notna(adaptive_right):
-        ax.axvline(int(adaptive_right), color="#DD6B20", linestyle="--", linewidth=1.4, alpha=0.75, label="Adaptive right boundary")
+        ax.axvline(int(adaptive_right), color="#DD6B20", linestyle="--", linewidth=1.4, alpha=0.75, label="Dataset adaptive right boundary")
 
     full_boundary = example_metrics.get("full_boundary_sentence_end_idx")
     if pd.notna(full_boundary):
@@ -624,10 +633,10 @@ def build_summary_markdown(
     case_studies_df: pd.DataFrame,
 ) -> str:
     lines = [
-        "# Localization Full-vs-Adaptive Summary",
+        "# Localization Dataset-Adaptive-vs-Full Summary",
         "",
         f"- Expected paired examples: {int(completion_summary['expected_examples'])}",
-        f"- Completed adaptive examples: {int(completion_summary['completed_adaptive_examples'])}",
+        f"- Completed dataset adaptive examples: {int(completion_summary['completed_dataset_adaptive_examples'])}",
         f"- Completed full examples: {int(completion_summary['completed_full_examples'])}",
         f"- Completed paired examples: {int(completion_summary['completed_paired_examples'])}",
     ]
@@ -665,51 +674,53 @@ def main() -> None:
     config = read_json(run_root_path / "config.json", default={}) or {}
     selected_examples_df = pd.read_csv(run_root_path / "selected_examples.csv")
     full_manifest_df = pd.read_csv(run_root_path / "run_manifest_full.csv")
-    adaptive_manifest_df = pd.read_csv(run_root_path / "run_manifest_adaptive.csv")
 
-    manifest_by_bundle_method = {}
-    for manifest_df in (full_manifest_df, adaptive_manifest_df):
-        for _, row in manifest_df.iterrows():
-            manifest_by_bundle_method[(str(row["bundle_key"]), str(row["method"]))] = row.to_dict()
+    full_manifest_by_bundle = {
+        str(row["bundle_key"]): row.to_dict()
+        for _, row in full_manifest_df.iterrows()
+    }
 
     bundle_completion_rows: list[dict[str, Any]] = []
     per_example_rows: list[dict[str, Any]] = []
     curve_frames: list[pd.DataFrame] = []
 
     expected_examples = int(len(selected_examples_df))
-    completed_adaptive_examples = 0
+    completed_dataset_adaptive_examples = 0
     completed_full_examples = 0
     completed_paired_examples = 0
 
     for bundle_key, bundle_df in selected_examples_df.groupby("bundle_key", sort=True):
         bundle_key = str(bundle_key)
-        adaptive_spec = manifest_by_bundle_method.get((bundle_key, "adaptive"))
-        full_spec = manifest_by_bundle_method.get((bundle_key, "full"))
-        if adaptive_spec is None or full_spec is None:
+        full_spec = full_manifest_by_bundle.get(bundle_key)
+        if full_spec is None:
             continue
 
-        adaptive_out_dir = resolve_repo_path(str(adaptive_spec["out_dir_relpath"]))
         full_out_dir = resolve_repo_path(str(full_spec["out_dir_relpath"]))
-        bundle_adaptive_completed = 0
+        bundle_dataset_adaptive_completed = 0
         bundle_full_completed = 0
         bundle_paired_completed = 0
 
         for _, selection_row in bundle_df.iterrows():
             selection = selection_row.to_dict()
             example_id = str(selection["example_id"])
-            adaptive_path = adaptive_out_dir / example_output_filename(example_id)
+            adaptive_relpath = str(selection.get("source_localization_relpath") or "").strip()
+            adaptive_path = (
+                resolve_repo_path(adaptive_relpath)
+                if adaptive_relpath
+                else None
+            )
             full_path = full_out_dir / example_output_filename(example_id)
-            adaptive_exists = adaptive_path.exists()
+            adaptive_exists = adaptive_path is not None and adaptive_path.exists()
             full_exists = full_path.exists()
-            bundle_adaptive_completed += int(adaptive_exists)
+            bundle_dataset_adaptive_completed += int(adaptive_exists)
             bundle_full_completed += int(full_exists)
-            completed_adaptive_examples += int(adaptive_exists)
+            completed_dataset_adaptive_examples += int(adaptive_exists)
             completed_full_examples += int(full_exists)
             if not adaptive_exists or not full_exists:
                 continue
 
-            adaptive_payload = json.loads(adaptive_path.read_text(encoding="utf-8"))
-            full_payload = json.loads(full_path.read_text(encoding="utf-8"))
+            adaptive_payload = read_localization_payload(adaptive_path)
+            full_payload = read_localization_payload(full_path)
             metrics_row, curve_df = compare_records(
                 selection_row=selection,
                 full_payload=full_payload,
@@ -717,7 +728,7 @@ def main() -> None:
                 thresholds=thresholds,
                 min_valid=int(config.get("localization_args", {}).get("min_valid", 3)),
             )
-            metrics_row["adaptive_output_relpath"] = relpath_from_repo(adaptive_path)
+            metrics_row["adaptive_output_relpath"] = adaptive_relpath
             metrics_row["full_output_relpath"] = relpath_from_repo(full_path)
             per_example_rows.append(metrics_row)
             curve_frames.append(curve_df)
@@ -732,7 +743,8 @@ def main() -> None:
                 "model_bundle_name": str(bundle_df["model_bundle_name"].iloc[0]),
                 "model_display": str(bundle_df["model_display"].iloc[0]),
                 "expected_examples": int(len(bundle_df)),
-                "completed_adaptive_examples": int(bundle_adaptive_completed),
+                "completed_dataset_adaptive_examples": int(bundle_dataset_adaptive_completed),
+                "completed_adaptive_examples": int(bundle_dataset_adaptive_completed),
                 "completed_full_examples": int(bundle_full_completed),
                 "completed_paired_examples": int(bundle_paired_completed),
             }
@@ -741,9 +753,11 @@ def main() -> None:
     completion_summary = {
         "run_name": args.run_name,
         "expected_examples": int(expected_examples),
-        "completed_adaptive_examples": int(completed_adaptive_examples),
+        "completed_dataset_adaptive_examples": int(completed_dataset_adaptive_examples),
+        "completed_adaptive_examples": int(completed_dataset_adaptive_examples),
         "completed_full_examples": int(completed_full_examples),
         "completed_paired_examples": int(completed_paired_examples),
+        "adaptive_reference_source": "selected_examples.csv[source_localization_relpath]",
         "created_at_analysis": config.get("created_at_utc", ""),
         "analysis_completed_at": pd.Timestamp.utcnow().isoformat(),
     }

@@ -1,7 +1,7 @@
 {
   "compressed_dataset_root": "/playpen-ssd/smerrill/deception2/DatasetMainCompressed",
   "compressed_dataset_root_relpath": "DatasetMainCompressed",
-  "created_at_utc": "2026-07-26T23:59:36.115076+00:00",
+  "created_at_utc": "2026-07-27T00:19:46.206127+00:00",
   "dataset_root": "/playpen-ssd/smerrill/deception2/DatasetMain",
   "dataset_root_relpath": "DatasetMain",
   "envs": [

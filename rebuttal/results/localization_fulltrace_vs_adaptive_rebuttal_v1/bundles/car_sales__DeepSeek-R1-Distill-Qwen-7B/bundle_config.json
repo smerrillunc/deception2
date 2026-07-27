@@ -1,6 +1,6 @@
 {
   "bundle_key": "car_sales__DeepSeek-R1-Distill-Qwen-7B",
-  "created_at_utc": "2026-07-26T23:58:14.323625+00:00",
+  "created_at_utc": "2026-07-27T00:18:28.403777+00:00",
   "env_name": "car_sales",
   "model_bundle_name": "DeepSeek-R1-Distill-Qwen-7B",
   "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
