@@ -123,6 +123,16 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     child_env = os.environ.copy()
+    env_root = Path(python_bin).expanduser().resolve().parent.parent
+    child_env.setdefault("CONDA_PREFIX", str(env_root))
+    env_lib_dir = env_root / "lib"
+    if env_lib_dir.is_dir():
+        ld_library_path = str(child_env.get("LD_LIBRARY_PATH") or "")
+        env_lib_dir_str = str(env_lib_dir)
+        if env_lib_dir_str not in ld_library_path.split(":"):
+            child_env["LD_LIBRARY_PATH"] = (
+                f"{env_lib_dir_str}:{ld_library_path}" if ld_library_path else env_lib_dir_str
+            )
     child_env.setdefault("MKL_THREADING_LAYER", "GNU")
     child_env.setdefault("VLLM_NO_USAGE_STATS", "1")
     child_env.setdefault("VLLM_CONFIG_ROOT", "/tmp/vllm")

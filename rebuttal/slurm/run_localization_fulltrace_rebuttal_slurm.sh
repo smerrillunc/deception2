@@ -68,6 +68,26 @@ resolve_python_bin() {
   return 1
 }
 
+prepend_unique_path() {
+  local value="$1"
+  local current="${2:-}"
+  if [[ -z "$value" ]]; then
+    printf '%s' "$current"
+    return
+  fi
+  case ":$current:" in
+    *":$value:"*)
+      printf '%s' "$current"
+      ;;
+    :)
+      printf '%s' "$value"
+      ;;
+    *)
+      printf '%s:%s' "$value" "$current"
+      ;;
+  esac
+}
+
 if ! PYTHON_BIN="$(resolve_python_bin)"; then
   module load anaconda
   # shellcheck disable=SC1091
@@ -81,7 +101,18 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+if [[ -z "${CONDA_ENV_PATH:-}" ]]; then
+  CONDA_ENV_PATH="$(cd "$(dirname "$PYTHON_BIN")/.." && pwd)"
+fi
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  export CONDA_PREFIX="$CONDA_ENV_PATH"
+fi
+if [[ -d "$CONDA_ENV_PATH/lib" ]]; then
+  export LD_LIBRARY_PATH="$(prepend_unique_path "$CONDA_ENV_PATH/lib" "${LD_LIBRARY_PATH:-}")"
+fi
+
 export PYTHON_BIN
+export CONDA_ENV_PATH
 
 # Longleaf's MKL defaults can conflict with libgomp-loaded deps inside the
 # localization subprocess. Force the GNU threading layer unless the user has
@@ -97,7 +128,9 @@ echo "Manifest path: $MANIFEST_PATH"
 echo "Task index: $TASK_INDEX"
 echo "Conda env: $CONDA_ENV"
 echo "Conda env path: ${CONDA_ENV_PATH:-<unset>}"
+echo "Conda prefix: ${CONDA_PREFIX:-<unset>}"
 echo "Python bin: $PYTHON_BIN"
+echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-<unset>}"
 echo "MKL_THREADING_LAYER: $MKL_THREADING_LAYER"
 echo "VLLM_CONFIG_ROOT: $VLLM_CONFIG_ROOT"
 
