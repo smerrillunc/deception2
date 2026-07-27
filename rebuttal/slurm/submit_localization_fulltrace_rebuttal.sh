@@ -32,7 +32,7 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-TASK_COUNT="$(python -c "import pandas as pd; import sys; df = pd.read_csv(sys.argv[1]); print(len(df))" "$MANIFEST_PATH")"
+TASK_COUNT="$(python -c "import csv, sys; print(sum(1 for _ in csv.DictReader(open(sys.argv[1], 'r', encoding='utf-8', newline=''))))" "$MANIFEST_PATH")"
 if ! [[ "$TASK_COUNT" =~ ^[0-9]+$ ]] || [[ "$TASK_COUNT" -lt 1 ]]; then
   echo "Manifest has no runnable tasks: $MANIFEST_PATH" >&2
   exit 1

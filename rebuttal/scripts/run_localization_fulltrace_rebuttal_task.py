@@ -7,9 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pandas as pd
-
-from localization_fulltrace_rebuttal_lib import REPO_ROOT, resolve_repo_path
+from localization_fulltrace_rebuttal_lib import REPO_ROOT, read_csv_rows, resolve_repo_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,15 +30,15 @@ def main() -> None:
     if not manifest_path.exists():
         raise FileNotFoundError(f"Missing manifest: {manifest_path}")
 
-    manifest_df = pd.read_csv(manifest_path)
-    if manifest_df.empty:
+    manifest_rows = read_csv_rows(manifest_path)
+    if not manifest_rows:
         raise ValueError(f"Manifest has no task rows: {manifest_path}")
-    if args.task_index < 0 or args.task_index >= len(manifest_df):
+    if args.task_index < 0 or args.task_index >= len(manifest_rows):
         raise IndexError(
-            f"--task-index {args.task_index} is outside [0, {len(manifest_df) - 1}]"
+            f"--task-index {args.task_index} is outside [0, {len(manifest_rows) - 1}]"
         )
 
-    row = manifest_df.iloc[int(args.task_index)].to_dict()
+    row = dict(manifest_rows[int(args.task_index)])
     script_path = project_root / "src" / "sentence_localization_batch.py"
     if not args.dry_run and not script_path.exists():
         raise FileNotFoundError(f"Missing localization script: {script_path}")

@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
-import pandas as pd
-
 
 THIS_FILE = Path(__file__).resolve()
 REBUTTAL_ROOT = THIS_FILE.parents[1]
@@ -122,11 +120,16 @@ def write_jsonl(path: Path | str, rows: Iterable[dict[str, Any]]) -> Path:
 def write_csv(path: Path | str, rows: Sequence[dict[str, Any]]) -> Path:
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        pd.DataFrame().to_csv(file_path, index=False)
-        return file_path
-    df = pd.DataFrame(rows)
-    df.to_csv(file_path, index=False)
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(str(key))
+    with file_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
     return file_path
 
 
