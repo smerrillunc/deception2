@@ -140,6 +140,22 @@ def main() -> None:
                 return [column for _, column in ordered]
 
 
+            def format_summary_table(
+                df: pd.DataFrame,
+                *,
+                keep_columns: list[str],
+                percent_columns: list[str] | None = None,
+            ) -> pd.DataFrame:
+                subset = df.loc[:, [column for column in keep_columns if column in df.columns]].copy()
+                for column in percent_columns or []:
+                    if column not in subset.columns:
+                        continue
+                    subset[column] = pd.to_numeric(subset[column], errors="coerce").map(
+                        lambda value: f"{value * 100.0:.2f}%" if pd.notna(value) else ""
+                    )
+                return subset
+
+
             def refresh_analysis() -> subprocess.CompletedProcess:
                 cmd = [
                     sys.executable,
@@ -289,51 +305,42 @@ def main() -> None:
             if not adaptive_model_df.empty:
                 plot_df = adaptive_model_df.copy()
                 plot_df["model_label"] = plot_df["model_display"].astype(str)
-                peak_column = (
-                    "adaptive_any_peak_probe_within_one_rate"
-                    if "adaptive_any_peak_probe_within_one_rate" in plot_df.columns
-                    else "peak_within_one_rate"
-                )
-                peak_label = (
-                    "Any peak probed within one"
-                    if peak_column == "adaptive_any_peak_probe_within_one_rate"
-                    else "Peak within one"
-                )
-                commitment_column = (
-                    "commitment_sentence_exact_rate"
-                    if "commitment_sentence_exact_rate" in plot_df.columns
-                    else "commitment_sentence_within_one_rate"
-                )
-                commitment_label = (
-                    "Commitment exact"
-                    if commitment_column == "commitment_sentence_exact_rate"
-                    else "Commitment within one"
-                )
-                x = np.arange(len(plot_df))
-                width = 0.32
-                fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
-                ax.bar(
-                    x - width / 2.0,
-                    plot_df[peak_column],
-                    width=width,
-                    label=peak_label,
-                    color="#3D6E70",
-                )
-                ax.bar(
-                    x + width / 2.0,
-                    plot_df[commitment_column],
-                    width=width,
-                    label=commitment_label,
-                    color="#C9774D",
-                )
-                ax.set_xticks(x)
-                ax.set_xticklabels(plot_df["model_label"], rotation=20)
-                ax.set_ylim(0.0, 1.02)
-                ax.set_ylabel("Agreement rate")
-                ax.set_title("Dataset adaptive vs exhaustive agreement by model")
-                ax.grid(True, axis="y", alpha=0.25)
-                ax.legend()
-                plt.show()
+                exact_tau_columns = ordered_commitment_threshold_rate_columns(plot_df, "exact")[:3]
+                if not exact_tau_columns:
+                    print("No commitment exact-rate threshold columns available yet.")
+                else:
+                    def tau_label(column: str) -> str:
+                        suffix = str(column).split("_tau_", 1)[1]
+                        tau = float(suffix.replace("neg_", "-").replace("_", "."))
+                        return f"Commitment exact @ tau={tau:.1f}"
+
+                    colors = ["#C9774D", "#A94E3D", "#7C2D12"]
+                    n_bars = len(exact_tau_columns)
+                    width = 0.22 if n_bars >= 3 else 0.28
+                    offsets = (np.arange(n_bars) - (n_bars - 1) / 2.0) * width
+                    x = np.arange(len(plot_df))
+                    fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
+                    for offset, column, color in zip(offsets, exact_tau_columns, colors, strict=False):
+                        ax.bar(
+                            x + offset,
+                            plot_df[column],
+                            width=width,
+                            label=tau_label(column),
+                            color=color,
+                        )
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(plot_df["model_label"], rotation=20)
+                    ax.set_ylim(0.0, 1.02)
+                    ax.set_ylabel("Agreement rate")
+                    ax.set_title("Exact commitment-sentence agreement by model")
+                    ax.grid(True, axis="y", alpha=0.25)
+                    ax.legend()
+                    plt.show()
+                    format_summary_table(
+                        plot_df,
+                        keep_columns=["model_display", "num_examples", *exact_tau_columns],
+                        percent_columns=exact_tau_columns,
+                    )
             else:
                 print("No paired adaptive/full results available yet.")
             """
@@ -416,6 +423,11 @@ def main() -> None:
                 ax.grid(True, axis="y", alpha=0.25)
                 ax.legend()
                 plt.show()
+                format_summary_table(
+                    plot_df,
+                    keep_columns=["env_display", "model_display", "num_examples", peak_column, commitment_column],
+                    percent_columns=[peak_column, commitment_column],
+                )
             else:
                 print("No paired adaptive/full results available yet.")
             """
@@ -450,6 +462,20 @@ def main() -> None:
                 for category in categories:
                     values = pivot[category].to_numpy(dtype=float) if category in pivot.columns else np.zeros(len(pivot), dtype=float)
                     ax.bar(model_labels, values, bottom=bottoms, color=colors[category], label=category.replace("_", " "))
+                    for idx, value in enumerate(values):
+                        if value <= 0.0:
+                            continue
+                        y = bottoms[idx] + (value / 2.0)
+                        label_color = "white" if value >= 0.08 else "black"
+                        ax.text(
+                            idx,
+                            y,
+                            f"{value * 100.0:.2f}%",
+                            ha="center",
+                            va="center",
+                            fontsize=8,
+                            color=label_color,
+                        )
                     bottoms += values
                 ax.set_ylabel("Fraction of exhaustive traces")
                 ax.set_ylim(0.0, 1.02)
@@ -458,6 +484,11 @@ def main() -> None:
                 ax.grid(True, axis="y", alpha=0.25)
                 ax.legend()
                 plt.show()
+                format_summary_table(
+                    pivot,
+                    keep_columns=["model_display", *categories],
+                    percent_columns=[category for category in categories if category in pivot.columns],
+                )
             else:
                 print("No exhaustive trace-shape outputs available yet.")
             """
@@ -499,6 +530,11 @@ def main() -> None:
                 ax.grid(True, axis="y", alpha=0.25)
                 ax.legend()
                 plt.show()
+                format_summary_table(
+                    pivot,
+                    keep_columns=["env_display", "model_display", *categories],
+                    percent_columns=[category for category in categories if category in pivot.columns],
+                )
             else:
                 print("No exhaustive trace-shape outputs available yet.")
             """
@@ -559,6 +595,40 @@ def main() -> None:
                 ax.grid(True, alpha=0.25)
                 ax.legend(loc="best")
                 plt.show()
+                display(
+                    format_summary_table(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "env_display": metric["env_display"],
+                                    "model_display": metric["model_display"],
+                                    "example_id": metric["example_id"],
+                                    "trace_shape_label": metric["trace_shape_label"],
+                                    "commitment_sentence_exact": metric.get("commitment_sentence_exact"),
+                                    "commitment_sentence_within_one": metric.get("commitment_sentence_within_one"),
+                                    "peak_within_one": metric.get("peak_within_one"),
+                                    "adaptive_probe_fraction": metric.get("adaptive_probe_fraction"),
+                                }
+                            ]
+                        ),
+                        keep_columns=[
+                            "env_display",
+                            "model_display",
+                            "example_id",
+                            "trace_shape_label",
+                            "commitment_sentence_exact",
+                            "commitment_sentence_within_one",
+                            "peak_within_one",
+                            "adaptive_probe_fraction",
+                        ],
+                        percent_columns=[
+                            "commitment_sentence_exact",
+                            "commitment_sentence_within_one",
+                            "peak_within_one",
+                            "adaptive_probe_fraction",
+                        ],
+                    )
+                )
 
 
             if not case_studies_df.empty:
