@@ -6,7 +6,7 @@ import gzip
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ from localization_fulltrace_rebuttal_lib import (
 )
 
 BUNDLE_GROUP_COLUMNS = ["env_name", "env_display", "model_bundle_name", "model_display"]
+MODEL_GROUP_COLUMNS = ["model_bundle_name", "model_display", "model_id"]
 SUMMARY_METRIC_COLUMNS = [
     "num_examples",
     "deceptive_examples",
@@ -118,6 +119,29 @@ SHAPE_PREVALENCE_COLUMNS = BUNDLE_GROUP_COLUMNS + [
     "fraction",
 ]
 CASE_STUDY_COLUMNS = PER_EXAMPLE_COLUMNS + ["case_category"]
+COMPLETION_COLUMNS = [
+    "bundle_key",
+    "env_name",
+    "env_display",
+    "model_bundle_name",
+    "model_display",
+    "model_id",
+    "expected_examples",
+    "completed_dataset_adaptive_examples",
+    "completed_adaptive_examples",
+    "completed_full_examples",
+    "completed_paired_examples",
+]
+MODEL_COMPLETION_COLUMNS = [
+    "model_bundle_name",
+    "model_display",
+    "model_id",
+    "expected_examples",
+    "completed_dataset_adaptive_examples",
+    "completed_adaptive_examples",
+    "completed_full_examples",
+    "completed_paired_examples",
+]
 
 
 @dataclass(frozen=True)
@@ -758,6 +782,24 @@ def ensure_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return df.loc[:, columns]
 
 
+def completion_summary_by_model(bundle_completion_df: pd.DataFrame) -> pd.DataFrame:
+    if bundle_completion_df.empty:
+        return pd.DataFrame(columns=MODEL_COMPLETION_COLUMNS)
+    model_df = (
+        bundle_completion_df.groupby(MODEL_GROUP_COLUMNS, as_index=False)
+        .agg(
+            expected_examples=("expected_examples", "sum"),
+            completed_dataset_adaptive_examples=("completed_dataset_adaptive_examples", "sum"),
+            completed_adaptive_examples=("completed_adaptive_examples", "sum"),
+            completed_full_examples=("completed_full_examples", "sum"),
+            completed_paired_examples=("completed_paired_examples", "sum"),
+        )
+        .sort_values(["model_display"])
+        .reset_index(drop=True)
+    )
+    return ensure_columns(model_df, MODEL_COMPLETION_COLUMNS)
+
+
 def main() -> None:
     args = parse_args()
     thresholds = shape_thresholds_from_args(args)
@@ -838,6 +880,7 @@ def main() -> None:
                 "env_display": str(bundle_df["env_display"].iloc[0]),
                 "model_bundle_name": str(bundle_df["model_bundle_name"].iloc[0]),
                 "model_display": str(bundle_df["model_display"].iloc[0]),
+                "model_id": str(bundle_df["model_id"].iloc[0]),
                 "expected_examples": int(len(bundle_df)),
                 "completed_dataset_adaptive_examples": int(bundle_dataset_adaptive_completed),
                 "completed_adaptive_examples": int(bundle_dataset_adaptive_completed),
@@ -854,6 +897,20 @@ def main() -> None:
         "completed_full_examples": int(completed_full_examples),
         "completed_paired_examples": int(completed_paired_examples),
         "adaptive_reference_source": "selected_examples.csv[source_localization_relpath]",
+        "shape_thresholds": asdict(thresholds),
+        "multi_peak_definition": {
+            "rule": "At least two prominent local peaks in the exhaustive deception-rate trace.",
+            "peak_min_value": float(thresholds.peak_min_value),
+            "peak_prominence": float(thresholds.peak_prominence),
+            "min_peak_separation": int(thresholds.min_peak_separation),
+        },
+        "gradual_definition": {
+            "rule": "Not multi-peak, with sustained rise and no single dominant jump.",
+            "gradual_total_rise_threshold": float(thresholds.gradual_total_rise_threshold),
+            "gradual_max_jump_threshold": float(thresholds.gradual_max_jump_threshold),
+            "gradual_step_threshold": float(thresholds.gradual_step_threshold),
+            "gradual_jump_concentration_threshold": float(thresholds.gradual_jump_concentration_threshold),
+        },
         "created_at_analysis": config.get("created_at_utc", ""),
         "analysis_completed_at": pd.Timestamp.utcnow().isoformat(),
     }
@@ -865,9 +922,17 @@ def main() -> None:
         else pd.DataFrame(columns=CURVE_POINT_COLUMNS)
     )
     curve_points_df = ensure_columns(curve_points_df, CURVE_POINT_COLUMNS)
-    bundle_completion_df = pd.DataFrame(bundle_completion_rows).sort_values(["env_display", "model_display"]).reset_index(drop=True)
+    bundle_completion_df = (
+        pd.DataFrame(bundle_completion_rows, columns=COMPLETION_COLUMNS)
+        .sort_values(["env_display", "model_display"])
+        .reset_index(drop=True)
+    )
+    bundle_completion_df = ensure_columns(bundle_completion_df, COMPLETION_COLUMNS)
+    model_completion_df = completion_summary_by_model(bundle_completion_df)
     bundle_summary_df = grouped_summary(metrics_df, ["env_name", "env_display", "model_bundle_name", "model_display"])
     bundle_summary_df = ensure_columns(bundle_summary_df, BUNDLE_GROUP_COLUMNS + SUMMARY_METRIC_COLUMNS)
+    model_summary_df = grouped_summary(metrics_df, MODEL_GROUP_COLUMNS)
+    model_summary_df = ensure_columns(model_summary_df, MODEL_GROUP_COLUMNS + SUMMARY_METRIC_COLUMNS)
     overall_summary_df = grouped_summary(metrics_df, [])
     overall_summary_df = ensure_columns(overall_summary_df, SUMMARY_METRIC_COLUMNS)
     if not overall_summary_df.empty:
@@ -876,16 +941,21 @@ def main() -> None:
         overall_summary_df = pd.DataFrame(columns=["summary_scope", *SUMMARY_METRIC_COLUMNS])
     shape_df = shape_prevalence_table(metrics_df, ["env_name", "env_display", "model_bundle_name", "model_display"])
     shape_df = ensure_columns(shape_df, SHAPE_PREVALENCE_COLUMNS)
+    model_shape_df = shape_prevalence_table(metrics_df, MODEL_GROUP_COLUMNS)
+    model_shape_df = ensure_columns(model_shape_df, MODEL_GROUP_COLUMNS + ["trace_shape_label", "num_examples", "total_examples", "fraction"])
     case_studies_df = pick_case_studies(metrics_df)
     case_studies_df = ensure_columns(case_studies_df, CASE_STUDY_COLUMNS)
 
     write_json(analysis_root / "completion_summary.json", completion_summary)
     write_csv(analysis_root / "bundle_completion_summary.csv", bundle_completion_rows)
+    model_completion_df.to_csv(analysis_root / "model_completion_summary.csv", index=False)
     write_csv(analysis_root / "per_example_metrics.csv", per_example_rows, fieldnames=PER_EXAMPLE_COLUMNS)
     curve_points_df.to_csv(analysis_root / "curve_points.csv", index=False)
     bundle_summary_df.to_csv(analysis_root / "adaptive_vs_full_summary_by_bundle.csv", index=False)
+    model_summary_df.to_csv(analysis_root / "adaptive_vs_full_summary_by_model.csv", index=False)
     overall_summary_df.to_csv(analysis_root / "adaptive_vs_full_summary_overall.csv", index=False)
     shape_df.to_csv(analysis_root / "trace_shape_prevalence_by_bundle.csv", index=False)
+    model_shape_df.to_csv(analysis_root / "trace_shape_prevalence_by_model.csv", index=False)
     case_studies_df.to_csv(analysis_root / "case_studies.csv", index=False)
 
     plot_bundle_probe_fraction(bundle_summary_df, figures_root / "adaptive_probe_fraction_by_bundle.png")

@@ -53,6 +53,7 @@ def main() -> None:
             - quantitative summaries of:
               - dataset-adaptive probe coverage
               - dataset-adaptive-vs-full peak and boundary agreement
+              - model-level summaries in addition to model x environment summaries
               - prevalence of gradual and multi-peak exhaustive traces
               - case-study curves
 
@@ -144,11 +145,14 @@ def main() -> None:
             selection_df = read_csv(RUN_ROOT / "selected_examples.csv")
             bundle_selection_df = read_csv(RUN_ROOT / "bundle_summary.csv")
             bundle_completion_df = read_csv(ANALYSIS_ROOT / "bundle_completion_summary.csv")
+            model_completion_df = read_csv(ANALYSIS_ROOT / "model_completion_summary.csv")
             per_example_df = read_csv(ANALYSIS_ROOT / "per_example_metrics.csv")
             curve_points_df = read_csv(ANALYSIS_ROOT / "curve_points.csv")
             adaptive_bundle_df = read_csv(ANALYSIS_ROOT / "adaptive_vs_full_summary_by_bundle.csv")
+            adaptive_model_df = read_csv(ANALYSIS_ROOT / "adaptive_vs_full_summary_by_model.csv")
             adaptive_overall_df = read_csv(ANALYSIS_ROOT / "adaptive_vs_full_summary_overall.csv")
             trace_shape_df = read_csv(ANALYSIS_ROOT / "trace_shape_prevalence_by_bundle.csv")
+            trace_shape_model_df = read_csv(ANALYSIS_ROOT / "trace_shape_prevalence_by_model.csv")
             case_studies_df = read_csv(ANALYSIS_ROOT / "case_studies.csv")
             print(
                 "Analysis status:",
@@ -192,10 +196,54 @@ def main() -> None:
             bundle_completion_df
             """
         ),
+        md("## Trace Definitions"),
+        code(
+            """
+            {
+                "multi_peak_definition": completion_summary.get("multi_peak_definition", {}),
+                "gradual_definition": completion_summary.get("gradual_definition", {}),
+                "shape_thresholds": completion_summary.get("shape_thresholds", {}),
+            }
+            """
+        ),
+        md("## Model Completion"),
+        code(
+            """
+            model_completion_df
+            """
+        ),
         md("## Overall Adaptive-vs-Full Summary"),
         code(
             """
             adaptive_overall_df
+            """
+        ),
+        md("## Model Summary"),
+        code(
+            """
+            adaptive_model_df
+            """
+        ),
+        code(
+            """
+            if not adaptive_model_df.empty:
+                plot_df = adaptive_model_df.copy()
+                plot_df["model_label"] = plot_df["model_display"].astype(str)
+                x = np.arange(len(plot_df))
+                width = 0.32
+                fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
+                ax.bar(x - width / 2.0, plot_df["peak_within_one_rate"], width=width, label="Peak within one", color="#3D6E70")
+                ax.bar(x + width / 2.0, plot_df["boundary_within_one_rate"], width=width, label="Boundary within one", color="#C9774D")
+                ax.set_xticks(x)
+                ax.set_xticklabels(plot_df["model_label"], rotation=20)
+                ax.set_ylim(0.0, 1.02)
+                ax.set_ylabel("Agreement rate")
+                ax.set_title("Dataset adaptive vs exhaustive agreement by model")
+                ax.grid(True, axis="y", alpha=0.25)
+                ax.legend()
+                plt.show()
+            else:
+                print("No paired adaptive/full results available yet.")
             """
         ),
         md("## Bundle Summary"),
@@ -227,6 +275,47 @@ def main() -> None:
             """
         ),
         md("## Trace Shapes"),
+        code(
+            """
+            trace_shape_model_df
+            """
+        ),
+        code(
+            """
+            if not trace_shape_model_df.empty:
+                pivot = (
+                    trace_shape_model_df.pivot_table(
+                        index=["model_display"],
+                        columns="trace_shape_label",
+                        values="fraction",
+                        fill_value=0.0,
+                    )
+                    .reset_index()
+                )
+                model_labels = pivot["model_display"].astype(str)
+                categories = ["multi_peak", "gradual", "sharp_or_other"]
+                colors = {
+                    "multi_peak": "#2B6CB0",
+                    "gradual": "#38A169",
+                    "sharp_or_other": "#D69E2E",
+                }
+                bottoms = np.zeros(len(pivot), dtype=float)
+                fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
+                for category in categories:
+                    values = pivot[category].to_numpy(dtype=float) if category in pivot.columns else np.zeros(len(pivot), dtype=float)
+                    ax.bar(model_labels, values, bottom=bottoms, color=colors[category], label=category.replace("_", " "))
+                    bottoms += values
+                ax.set_ylabel("Fraction of exhaustive traces")
+                ax.set_ylim(0.0, 1.02)
+                ax.set_title("Gradual and multi-peak trace prevalence by model")
+                ax.tick_params(axis="x", rotation=20)
+                ax.grid(True, axis="y", alpha=0.25)
+                ax.legend()
+                plt.show()
+            else:
+                print("No exhaustive trace-shape outputs available yet.")
+            """
+        ),
         code(
             """
             trace_shape_df
