@@ -1,0 +1,20 @@
+{
+  "bundle_key": "bs__DeepSeek-R1-Distill-Qwen-14B",
+  "created_at_utc": "2026-07-26T23:57:44.663879+00:00",
+  "env_name": "bs",
+  "model_bundle_name": "DeepSeek-R1-Distill-Qwen-14B",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-02-10/gpu_6/game_140/turn_8/state_1395/sample_0",
+    "2026-02-10/gpu_3/game_154/turn_10/state_1627/sample_0",
+    "2026-02-10/gpu_4/game_125/turn_0/state_1186/sample_0",
+    "2026-02-10/gpu_2/game_176/turn_15/state_1932/sample_0",
+    "2026-02-10/gpu_3/game_137/turn_12/state_1454/sample_0",
+    "2026-02-10/gpu_2/game_114/turn_7/state_1296/sample_0",
+    "2026-02-10/gpu_6/game_4/turn_7/state_41/sample_0",
+    "2026-02-10/gpu_5/game_44/turn_7/state_576/sample_0",
+    "2026-02-10/gpu_5/game_119/turn_7/state_1278/sample_0",
+    "2026-02-10/gpu_6/game_96/turn_5/state_950/sample_0"
+  ]
+}

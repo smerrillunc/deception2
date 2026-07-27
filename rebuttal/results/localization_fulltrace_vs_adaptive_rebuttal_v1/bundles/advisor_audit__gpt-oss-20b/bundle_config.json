@@ -1,0 +1,20 @@
+{
+  "bundle_key": "advisor_audit__gpt-oss-20b",
+  "created_at_utc": "2026-07-26T23:57:09.682682+00:00",
+  "env_name": "advisor_audit",
+  "model_bundle_name": "gpt-oss-20b",
+  "model_id": "openai/gpt-oss-20b",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-03-30_advisor_audit_seed_0/game_204/turn_5/state_1229/sample_22",
+    "2026-03-30_advisor_audit_seed_0/game_243/turn_5/state_1463/sample_9",
+    "2026-03-30_advisor_audit_seed_0/game_195/turn_2/state_1172/sample_12",
+    "2026-03-30_advisor_audit_seed_0/game_125/turn_4/state_754/sample_18",
+    "2026-03-30_advisor_audit_seed_0/game_105/turn_0/state_630/sample_10",
+    "2026-03-31_advisor_audit_seed_0/game_223/turn_0/state_1338/sample_5",
+    "2026-03-31_advisor_audit_seed_0/game_223/turn_2/state_1340/sample_2",
+    "2026-03-31_advisor_audit_seed_0/game_675/turn_3/state_4053/sample_5",
+    "2026-03-30_advisor_audit_seed_0/game_222/turn_5/state_1337/sample_11",
+    "2026-03-30_advisor_audit_seed_0/game_58/turn_0/state_348/sample_5"
+  ]
+}

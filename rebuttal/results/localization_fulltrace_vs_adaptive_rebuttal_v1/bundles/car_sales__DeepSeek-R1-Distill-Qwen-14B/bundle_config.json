@@ -1,0 +1,20 @@
+{
+  "bundle_key": "car_sales__DeepSeek-R1-Distill-Qwen-14B",
+  "created_at_utc": "2026-07-26T23:58:05.365368+00:00",
+  "env_name": "car_sales",
+  "model_bundle_name": "DeepSeek-R1-Distill-Qwen-14B",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-03-27/shard_05/game_377/turn_1/state_249/sample_17",
+    "2026-03-27/shard_01/game_307/turn_1/state_205/sample_24",
+    "2026-03-27/shard_03/game_303/turn_3/state_203/sample_15",
+    "2026-03-27/shard_04/game_472/turn_1/state_313/sample_13",
+    "2026-03-27/shard_04/game_280/turn_3/state_187/sample_6",
+    "2026-03-27/shard_05/game_101/turn_3/state_67/sample_7",
+    "2026-03-27/shard_02/game_86/turn_1/state_57/sample_15",
+    "2026-03-27/shard_03/game_423/turn_0/state_280/sample_14",
+    "2026-03-27/shard_04/game_304/turn_0/state_200/sample_19",
+    "2026-03-30_car_sales_seed_0/2026-03-30_car_sales_seed_0/game_15/turn_0/state_60/sample_19"
+  ]
+}

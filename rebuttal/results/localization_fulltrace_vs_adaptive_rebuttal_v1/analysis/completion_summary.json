@@ -1,0 +1,9 @@
+{
+  "analysis_completed_at": "2026-07-27T00:01:04.193819+00:00",
+  "completed_adaptive_examples": 0,
+  "completed_full_examples": 0,
+  "completed_paired_examples": 0,
+  "created_at_analysis": "2026-07-26T23:59:36.115076+00:00",
+  "expected_examples": 200,
+  "run_name": "localization_fulltrace_vs_adaptive_rebuttal_v1"
+}

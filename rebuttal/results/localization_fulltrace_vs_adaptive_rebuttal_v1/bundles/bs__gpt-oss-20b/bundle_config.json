@@ -1,0 +1,20 @@
+{
+  "bundle_key": "bs__gpt-oss-20b",
+  "created_at_utc": "2026-07-26T23:57:56.118227+00:00",
+  "env_name": "bs",
+  "model_bundle_name": "gpt-oss-20b",
+  "model_id": "openai/gpt-oss-20b",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-03-27_bs_seed_0/game_627/turn_0/state_1943/sample_13",
+    "2026-03-27_bs_seed_0/game_242/turn_0/state_812/sample_3",
+    "2026-03-27_bs_seed_0/game_25/turn_0/state_70/sample_10",
+    "2026-03-27_bs_seed_0/game_305/turn_3/state_1000/sample_16",
+    "2026-03-27_bs_seed_0/game_354/turn_5/state_1155/sample_8",
+    "2026-03-27_bs_seed_0/game_665/turn_1/state_2038/sample_1",
+    "2026-03-27_bs_seed_0/game_673/turn_0/state_2060/sample_19",
+    "2026-03-28_bs_seed_0/game_70/turn_6/state_179/sample_3",
+    "2026-03-27_bs_seed_0/game_51/turn_0/state_159/sample_8",
+    "2026-03-27_bs_seed_0/game_122/turn_0/state_417/sample_24"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "bundle_key": "interview__DeepSeek-R1-Distill-Qwen-7B",
+  "created_at_utc": "2026-07-26T23:59:30.901805+00:00",
+  "env_name": "interview",
+  "model_bundle_name": "DeepSeek-R1-Distill-Qwen-7B",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_03/conversation_ml_platform_engineer__00704/turn_0/state_24/sample_11",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_01/conversation_ml_platform_engineer__00783/turn_0/state_284/sample_2",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_01/conversation_product_analytics_manager__01601/turn_0/state_178/sample_6",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_03/conversation_applied_research_scientist__00617/turn_0/state_264/sample_1",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_00/conversation_applied_research_scientist__00837/turn_0/state_291/sample_12",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_01/conversation_ml_platform_engineer__00368/turn_0/state_55/sample_24",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_04/conversation_ml_platform_engineer__00931/turn_0/state_301/sample_6",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_02/conversation_product_analytics_manager__00728/turn_0/state_277/sample_13",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_05/conversation_applied_research_scientist__00526/turn_0/state_65/sample_0",
+    "deception_miner/deepseek-ai_DeepSeek-R1-Distill-Qwen-7B/2026-03-26/shard_02/conversation_product_analytics_manager__00169/turn_0/state_25/sample_3"
+  ]
+}

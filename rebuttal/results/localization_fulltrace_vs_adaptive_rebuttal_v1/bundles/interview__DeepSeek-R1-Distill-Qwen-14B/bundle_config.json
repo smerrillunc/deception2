@@ -1,0 +1,20 @@
+{
+  "bundle_key": "interview__DeepSeek-R1-Distill-Qwen-14B",
+  "created_at_utc": "2026-07-26T23:59:19.763747+00:00",
+  "env_name": "interview",
+  "model_bundle_name": "DeepSeek-R1-Distill-Qwen-14B",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-04-02_interview_seed_0/conversation_ml_platform_engineer__00195/turn_0/state_585/sample_4",
+    "2026-04-02_interview_seed_0/conversation_applied_research_scientist__00653/turn_0/state_1961/sample_0",
+    "2026-04-02_interview_seed_0/conversation_product_analytics_manager__00312/turn_0/state_937/sample_22",
+    "2026-04-02_interview_seed_0/conversation_ml_platform_engineer__00096/turn_0/state_288/sample_5",
+    "2026-04-02_interview_seed_0/conversation_product_analytics_manager__00825/turn_0/state_2476/sample_13",
+    "2026-04-02_interview_seed_0/conversation_product_analytics_manager__00760/turn_0/state_2281/sample_38",
+    "2026-04-02_interview_seed_0/conversation_product_analytics_manager__00276/turn_0/state_829/sample_38",
+    "2026-04-02_interview_seed_0/conversation_applied_research_scientist__00299/turn_0/state_899/sample_30",
+    "2026-04-02_interview_seed_0/conversation_product_analytics_manager__00550/turn_0/state_1651/sample_38",
+    "2026-04-02_interview_seed_0/conversation_applied_research_scientist__00528/turn_0/state_1586/sample_5"
+  ]
+}

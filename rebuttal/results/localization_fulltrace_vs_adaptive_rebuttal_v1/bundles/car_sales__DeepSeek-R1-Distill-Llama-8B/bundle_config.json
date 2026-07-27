@@ -1,0 +1,20 @@
+{
+  "bundle_key": "car_sales__DeepSeek-R1-Distill-Llama-8B",
+  "created_at_utc": "2026-07-26T23:58:00.858592+00:00",
+  "env_name": "car_sales",
+  "model_bundle_name": "DeepSeek-R1-Distill-Llama-8B",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-03-29_car_sales_seed_0/game_108/turn_3/state_435/sample_7",
+    "2026-03-29_car_sales_seed_0/game_231/turn_3/state_927/sample_15",
+    "2026-03-29_car_sales_seed_0/game_348/turn_2/state_1394/sample_12",
+    "2026-03-29_car_sales_seed_0/game_452/turn_3/state_1811/sample_0",
+    "2026-03-29_car_sales_seed_0/game_281/turn_3/state_1127/sample_0",
+    "2026-03-29_car_sales_seed_0/game_307/turn_2/state_1230/sample_21",
+    "2026-03-29_car_sales_seed_0/game_82/turn_2/state_330/sample_3",
+    "2026-03-29_car_sales_seed_0/game_135/turn_1/state_541/sample_14",
+    "2026-03-29_car_sales_seed_0/game_317/turn_0/state_1268/sample_24",
+    "2026-03-29_car_sales_seed_0/game_624/turn_2/state_2498/sample_17"
+  ]
+}

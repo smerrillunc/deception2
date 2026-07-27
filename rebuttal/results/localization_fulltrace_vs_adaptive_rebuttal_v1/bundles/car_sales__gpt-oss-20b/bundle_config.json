@@ -1,0 +1,20 @@
+{
+  "bundle_key": "car_sales__gpt-oss-20b",
+  "created_at_utc": "2026-07-26T23:58:17.335756+00:00",
+  "env_name": "car_sales",
+  "model_bundle_name": "gpt-oss-20b",
+  "model_id": "openai/gpt-oss-20b",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-03-28_car_sales_seed_0/game_373/turn_2/state_1494/sample_12",
+    "2026-03-28_car_sales_seed_0/game_494/turn_0/state_1976/sample_12",
+    "2026-03-28_car_sales_seed_0/game_323/turn_3/state_1295/sample_9",
+    "2026-03-28_car_sales_seed_0/game_490/turn_2/state_1962/sample_17",
+    "2026-03-28_car_sales_seed_0/game_322/turn_0/state_1288/sample_4",
+    "2026-03-28_car_sales_seed_0/game_166/turn_0/state_664/sample_11",
+    "2026-03-28_car_sales_seed_0/game_401/turn_0/state_1604/sample_26",
+    "2026-03-28_car_sales_seed_0/game_527/turn_1/state_2109/sample_3",
+    "2026-03-28_car_sales_seed_0/game_50/turn_1/state_201/sample_6",
+    "2026-03-28_car_sales_seed_0/game_167/turn_1/state_669/sample_26"
+  ]
+}

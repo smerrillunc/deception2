@@ -1,0 +1,20 @@
+{
+  "bundle_key": "gridworld__DeepSeek-R1-Distill-Llama-8B",
+  "created_at_utc": "2026-07-26T23:58:34.752901+00:00",
+  "env_name": "gridworld",
+  "model_bundle_name": "DeepSeek-R1-Distill-Llama-8B",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-03-11_18-46-13/game_30/turn_2/state_148/sample_9",
+    "2026-03-13_21-09-12/game_97/turn_2/state_565/sample_0",
+    "2026-03-13_21-09-12/game_67/turn_7/state_368/sample_5",
+    "2026-03-11_18-24-00/game_33/turn_9/state_208/sample_3",
+    "2026-03-13_21-09-12/game_76/turn_3/state_443/sample_5",
+    "2026-03-13_21-09-12/game_127/turn_5/state_775/sample_8",
+    "2026-03-13_21-31-50/game_6/turn_3/state_26/sample_3",
+    "2026-03-13_21-09-12/game_39/turn_11/state_219/sample_0",
+    "2026-03-13_21-31-50/game_33/turn_2/state_217/sample_0",
+    "2026-03-11_14-42-37/game_7/turn_7/state_53/sample_2"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "bundle_key": "gridworld__gpt-oss-20b",
+  "created_at_utc": "2026-07-26T23:58:56.558305+00:00",
+  "env_name": "gridworld",
+  "model_bundle_name": "gpt-oss-20b",
+  "model_id": "openai/gpt-oss-20b",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-03-27_gridworld_seed_0/game_393/turn_2/state_1948/sample_9",
+    "2026-03-27_gridworld_seed_0/game_110/turn_3/state_543/sample_4",
+    "2026-03-27_gridworld_seed_0/game_119/turn_0/state_587/sample_16",
+    "2026-03-27_gridworld_seed_0/game_478/turn_0/state_2302/sample_18",
+    "2026-03-27_gridworld_seed_0/game_288/turn_3/state_1466/sample_12",
+    "2026-03-27_gridworld_seed_0/game_339/turn_7/state_1699/sample_15",
+    "2026-03-27_gridworld_seed_0/game_445/turn_0/state_2170/sample_4",
+    "2026-03-27_gridworld_seed_0/game_16/turn_0/state_60/sample_15",
+    "2026-03-27_gridworld_seed_0/game_460/turn_9/state_2225/sample_21",
+    "2026-03-27_gridworld_seed_0/game_508/turn_2/state_2461/sample_15"
+  ]
+}

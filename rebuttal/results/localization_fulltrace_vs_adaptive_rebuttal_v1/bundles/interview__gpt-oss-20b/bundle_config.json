@@ -1,0 +1,20 @@
+{
+  "bundle_key": "interview__gpt-oss-20b",
+  "created_at_utc": "2026-07-26T23:59:36.102118+00:00",
+  "env_name": "interview",
+  "model_bundle_name": "gpt-oss-20b",
+  "model_id": "openai/gpt-oss-20b",
+  "num_examples": 10,
+  "selected_example_ids": [
+    "2026-03-28_interview_seed_0/conversation_applied_research_scientist__00117/turn_0/state_353/sample_20",
+    "2026-03-28_interview_seed_0/conversation_product_analytics_manager__00657/turn_0/state_1972/sample_13",
+    "2026-03-28_interview_seed_0/conversation_product_analytics_manager__00558/turn_0/state_1675/sample_16",
+    "2026-03-28_interview_seed_0/conversation_ml_platform_engineer__00567/turn_0/state_1701/sample_12",
+    "2026-03-28_interview_seed_0/conversation_ml_platform_engineer__00016/turn_0/state_48/sample_2",
+    "2026-03-28_interview_seed_0/conversation_ml_platform_engineer__00188/turn_0/state_564/sample_5",
+    "2026-03-28_interview_seed_0/conversation_product_analytics_manager__00323/turn_0/state_970/sample_30",
+    "2026-03-28_interview_seed_0/conversation_ml_platform_engineer__00363/turn_0/state_1089/sample_29",
+    "2026-03-28_interview_seed_0/conversation_product_analytics_manager__00617/turn_0/state_1852/sample_12",
+    "2026-03-28_interview_seed_0/conversation_ml_platform_engineer__00605/turn_0/state_1815/sample_11"
+  ]
+}
