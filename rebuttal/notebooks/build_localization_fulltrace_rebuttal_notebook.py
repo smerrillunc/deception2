@@ -55,6 +55,7 @@ def main() -> None:
               - dataset-adaptive-vs-full peak and boundary agreement
               - model-level summaries in addition to model x environment summaries
               - prevalence of gradual and multi-peak exhaustive traces
+              - adaptive-vs-exhaustive shape prevalence and sparsity-ceiling comparisons
               - case-study curves
 
             If the analysis CSVs are missing or stale, run the refresh cell below.
@@ -156,6 +157,43 @@ def main() -> None:
                 return subset
 
 
+            def shape_source_label(source: str) -> str:
+                labels = {
+                    "full": "Exhaustive full",
+                    "adaptive": "Dataset adaptive",
+                    "full_at_adaptive_probes": "Full at adaptive probes",
+                }
+                return labels.get(str(source), str(source).replace("_", " ").title())
+
+
+            def prevalence_pivot_for_label(
+                df: pd.DataFrame,
+                *,
+                index_columns: list[str],
+                trace_shape_label: str,
+            ) -> pd.DataFrame:
+                if df.empty:
+                    return pd.DataFrame()
+                subset = df.loc[df["trace_shape_label"].astype(str).eq(str(trace_shape_label))].copy()
+                if subset.empty:
+                    return pd.DataFrame(columns=index_columns)
+                pivot = (
+                    subset.pivot_table(
+                        index=index_columns,
+                        columns="shape_source",
+                        values="fraction",
+                        fill_value=0.0,
+                    )
+                    .reset_index()
+                )
+                preferred_order = ["full", "adaptive", "full_at_adaptive_probes"]
+                for column in preferred_order:
+                    if column not in pivot.columns:
+                        pivot[column] = 0.0
+                keep_columns = [*index_columns, *preferred_order]
+                return pivot.loc[:, keep_columns]
+
+
             def refresh_analysis() -> subprocess.CompletedProcess:
                 cmd = [
                     sys.executable,
@@ -185,6 +223,8 @@ def main() -> None:
             adaptive_overall_df = read_csv(ANALYSIS_ROOT / "adaptive_vs_full_summary_overall.csv")
             trace_shape_df = read_csv(ANALYSIS_ROOT / "trace_shape_prevalence_by_bundle.csv")
             trace_shape_model_df = read_csv(ANALYSIS_ROOT / "trace_shape_prevalence_by_model.csv")
+            trace_shape_source_df = read_csv(ANALYSIS_ROOT / "trace_shape_prevalence_by_bundle_and_source.csv")
+            trace_shape_source_model_df = read_csv(ANALYSIS_ROOT / "trace_shape_prevalence_by_model_and_source.csv")
             case_studies_df = read_csv(ANALYSIS_ROOT / "case_studies.csv")
             print(
                 "Analysis status:",
@@ -545,6 +585,268 @@ def main() -> None:
                 )
             else:
                 print("No exhaustive trace-shape outputs available yet.")
+            """
+        ),
+        md("## Adaptive vs Exhaustive Shape Prevalence"),
+        code(
+            """
+            trace_shape_source_model_df
+            """
+        ),
+        code(
+            """
+            if not trace_shape_source_model_df.empty:
+                plot_df = prevalence_pivot_for_label(
+                    trace_shape_source_model_df,
+                    index_columns=["model_display"],
+                    trace_shape_label="multi_peak",
+                )
+                if plot_df.empty:
+                    print("No multi-peak prevalence rows available yet.")
+                else:
+                    plot_df["model_label"] = plot_df["model_display"].astype(str)
+                    source_columns = ["full", "adaptive", "full_at_adaptive_probes"]
+                    colors = {
+                        "full": "#2B6CB0",
+                        "adaptive": "#DD6B20",
+                        "full_at_adaptive_probes": "#6B7280",
+                    }
+                    x = np.arange(len(plot_df))
+                    width = 0.22
+                    offsets = (np.arange(len(source_columns)) - 1.0) * width
+                    fig, ax = plt.subplots(figsize=(10.8, 4.8), constrained_layout=True)
+                    for offset, column in zip(offsets, source_columns, strict=False):
+                        ax.bar(
+                            x + offset,
+                            plot_df[column],
+                            width=width,
+                            label=shape_source_label(column),
+                            color=colors[column],
+                        )
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(plot_df["model_label"], rotation=20)
+                    ax.set_ylim(0.0, 1.02)
+                    ax.set_ylabel("Fraction of traces")
+                    ax.set_title("Multi-peak prevalence by model across trace sources")
+                    ax.grid(True, axis="y", alpha=0.25)
+                    ax.legend()
+                    plt.show()
+                    display(
+                        format_summary_table(
+                            plot_df.rename(
+                                columns={column: shape_source_label(column) for column in source_columns}
+                            ),
+                            keep_columns=[
+                                "model_display",
+                                shape_source_label("full"),
+                                shape_source_label("adaptive"),
+                                shape_source_label("full_at_adaptive_probes"),
+                            ],
+                            percent_columns=[
+                                shape_source_label("full"),
+                                shape_source_label("adaptive"),
+                                shape_source_label("full_at_adaptive_probes"),
+                            ],
+                        )
+                    )
+            else:
+                print("No model-level source-comparison trace-shape outputs available yet.")
+            """
+        ),
+        code(
+            """
+            if not trace_shape_source_model_df.empty:
+                plot_df = prevalence_pivot_for_label(
+                    trace_shape_source_model_df,
+                    index_columns=["model_display"],
+                    trace_shape_label="gradual",
+                )
+                if plot_df.empty:
+                    print("No gradual prevalence rows available yet.")
+                else:
+                    plot_df["model_label"] = plot_df["model_display"].astype(str)
+                    source_columns = ["full", "adaptive", "full_at_adaptive_probes"]
+                    colors = {
+                        "full": "#38A169",
+                        "adaptive": "#C05621",
+                        "full_at_adaptive_probes": "#6B7280",
+                    }
+                    x = np.arange(len(plot_df))
+                    width = 0.22
+                    offsets = (np.arange(len(source_columns)) - 1.0) * width
+                    fig, ax = plt.subplots(figsize=(10.8, 4.8), constrained_layout=True)
+                    for offset, column in zip(offsets, source_columns, strict=False):
+                        ax.bar(
+                            x + offset,
+                            plot_df[column],
+                            width=width,
+                            label=shape_source_label(column),
+                            color=colors[column],
+                        )
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(plot_df["model_label"], rotation=20)
+                    ax.set_ylim(0.0, 1.02)
+                    ax.set_ylabel("Fraction of traces")
+                    ax.set_title("Gradual prevalence by model across trace sources")
+                    ax.grid(True, axis="y", alpha=0.25)
+                    ax.legend()
+                    plt.show()
+                    display(
+                        format_summary_table(
+                            plot_df.rename(
+                                columns={column: shape_source_label(column) for column in source_columns}
+                            ),
+                            keep_columns=[
+                                "model_display",
+                                shape_source_label("full"),
+                                shape_source_label("adaptive"),
+                                shape_source_label("full_at_adaptive_probes"),
+                            ],
+                            percent_columns=[
+                                shape_source_label("full"),
+                                shape_source_label("adaptive"),
+                                shape_source_label("full_at_adaptive_probes"),
+                            ],
+                        )
+                    )
+            else:
+                print("No model-level source-comparison trace-shape outputs available yet.")
+            """
+        ),
+        md("## Adaptive vs Exhaustive Shape Agreement"),
+        code(
+            """
+            if not adaptive_model_df.empty:
+                plot_df = adaptive_model_df.copy()
+                plot_df["model_label"] = plot_df["model_display"].astype(str)
+                agreement_columns = [
+                    "adaptive_shape_exact_rate",
+                    "adaptive_multi_peak_exact_rate",
+                    "adaptive_gradual_exact_rate",
+                ]
+                available_columns = [column for column in agreement_columns if column in plot_df.columns]
+                if not available_columns:
+                    print("No adaptive/full trace-shape agreement columns available yet.")
+                else:
+                    labels = {
+                        "adaptive_shape_exact_rate": "3-way label exact",
+                        "adaptive_multi_peak_exact_rate": "Multi-peak exact",
+                        "adaptive_gradual_exact_rate": "Gradual exact",
+                    }
+                    colors = {
+                        "adaptive_shape_exact_rate": "#4C51BF",
+                        "adaptive_multi_peak_exact_rate": "#2B6CB0",
+                        "adaptive_gradual_exact_rate": "#38A169",
+                    }
+                    x = np.arange(len(plot_df))
+                    width = 0.22 if len(available_columns) >= 3 else 0.28
+                    offsets = (np.arange(len(available_columns)) - (len(available_columns) - 1) / 2.0) * width
+                    fig, ax = plt.subplots(figsize=(10.8, 4.8), constrained_layout=True)
+                    for offset, column in zip(offsets, available_columns, strict=False):
+                        ax.bar(
+                            x + offset,
+                            plot_df[column],
+                            width=width,
+                            label=labels[column],
+                            color=colors[column],
+                        )
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(plot_df["model_label"], rotation=20)
+                    ax.set_ylim(0.0, 1.02)
+                    ax.set_ylabel("Agreement rate")
+                    ax.set_title("Adaptive vs exhaustive trace-shape agreement by model")
+                    ax.grid(True, axis="y", alpha=0.25)
+                    ax.legend()
+                    plt.show()
+                    summary_columns = [
+                        column
+                        for column in [
+                            "model_display",
+                            "num_examples",
+                            "adaptive_shape_exact_rate",
+                            "adaptive_multi_peak_exact_rate",
+                            "probe_subset_multi_peak_exact_rate",
+                            "adaptive_gradual_exact_rate",
+                            "probe_subset_gradual_exact_rate",
+                            "adaptive_vs_probe_subset_shape_exact_rate",
+                        ]
+                        if column in plot_df.columns
+                    ]
+                    summary_table = plot_df.loc[:, summary_columns].rename(
+                        columns={
+                            "model_display": "Model",
+                            "num_examples": "Examples",
+                            "adaptive_shape_exact_rate": "Adaptive vs full 3-way label exact",
+                            "adaptive_multi_peak_exact_rate": "Adaptive vs full multi-peak exact",
+                            "probe_subset_multi_peak_exact_rate": "Full-at-probes vs full multi-peak exact",
+                            "adaptive_gradual_exact_rate": "Adaptive vs full gradual exact",
+                            "probe_subset_gradual_exact_rate": "Full-at-probes vs full gradual exact",
+                            "adaptive_vs_probe_subset_shape_exact_rate": "Adaptive vs full-at-probes 3-way exact",
+                        }
+                    )
+                    display(
+                        format_summary_table(
+                            summary_table,
+                            keep_columns=list(summary_table.columns),
+                            percent_columns=[
+                                column
+                                for column in summary_table.columns
+                                if "exact" in str(column).lower()
+                            ],
+                        )
+                    )
+            else:
+                print("No paired adaptive/full results available yet.")
+            """
+        ),
+        code(
+            """
+            shape_bundle_columns = [
+                column
+                for column in [
+                    "env_display",
+                    "model_display",
+                    "num_examples",
+                    "multi_peak_fraction",
+                    "adaptive_multi_peak_fraction",
+                    "full_at_adaptive_multi_peak_fraction",
+                    "gradual_fraction",
+                    "adaptive_gradual_fraction",
+                    "full_at_adaptive_gradual_fraction",
+                    "adaptive_multi_peak_exact_rate",
+                    "adaptive_gradual_exact_rate",
+                ]
+                if column in adaptive_bundle_df.columns
+            ]
+            if shape_bundle_columns:
+                summary_table = adaptive_bundle_df.loc[:, shape_bundle_columns].rename(
+                    columns={
+                        "env_display": "Environment",
+                        "model_display": "Model",
+                        "num_examples": "Examples",
+                        "multi_peak_fraction": "Full multi-peak",
+                        "adaptive_multi_peak_fraction": "Adaptive multi-peak",
+                        "full_at_adaptive_multi_peak_fraction": "Full-at-probes multi-peak",
+                        "gradual_fraction": "Full gradual",
+                        "adaptive_gradual_fraction": "Adaptive gradual",
+                        "full_at_adaptive_gradual_fraction": "Full-at-probes gradual",
+                        "adaptive_multi_peak_exact_rate": "Adaptive vs full multi-peak exact",
+                        "adaptive_gradual_exact_rate": "Adaptive vs full gradual exact",
+                    }
+                )
+                display(
+                    format_summary_table(
+                        summary_table,
+                        keep_columns=list(summary_table.columns),
+                        percent_columns=[
+                            column
+                            for column in summary_table.columns
+                            if column not in {"Environment", "Model", "Examples"}
+                        ],
+                    )
+                )
+            else:
+                print("No bundle-level adaptive/full shape-comparison columns available yet.")
             """
         ),
         md("## Example-Level Metrics"),

@@ -56,6 +56,21 @@ BASE_SUMMARY_METRIC_COLUMNS = [
     "multi_peak_fraction",
     "gradual_fraction",
     "sharp_or_other_fraction",
+    "adaptive_multi_peak_fraction",
+    "adaptive_gradual_fraction",
+    "adaptive_sharp_or_other_fraction",
+    "full_at_adaptive_multi_peak_fraction",
+    "full_at_adaptive_gradual_fraction",
+    "full_at_adaptive_sharp_or_other_fraction",
+    "adaptive_shape_exact_rate",
+    "adaptive_multi_peak_exact_rate",
+    "adaptive_gradual_exact_rate",
+    "probe_subset_shape_exact_rate",
+    "probe_subset_multi_peak_exact_rate",
+    "probe_subset_gradual_exact_rate",
+    "adaptive_vs_probe_subset_shape_exact_rate",
+    "adaptive_vs_probe_subset_multi_peak_exact_rate",
+    "adaptive_vs_probe_subset_gradual_exact_rate",
     "prompt_match_rate",
     "raw_text_match_rate",
 ]
@@ -108,6 +123,36 @@ BASE_PER_EXAMPLE_COLUMNS = [
     "trace_shape_label",
     "is_multi_peak",
     "is_gradual",
+    "adaptive_peak_deception_rate",
+    "adaptive_prominent_peak_count",
+    "adaptive_prominent_peak_sentence_indices",
+    "adaptive_total_positive_rise",
+    "adaptive_max_positive_jump",
+    "adaptive_positive_jump_count",
+    "adaptive_jump_concentration",
+    "adaptive_trace_shape_label",
+    "adaptive_is_multi_peak",
+    "adaptive_is_gradual",
+    "full_at_adaptive_peak_sentence_idx",
+    "full_at_adaptive_peak_deception_rate",
+    "full_at_adaptive_prominent_peak_count",
+    "full_at_adaptive_prominent_peak_sentence_indices",
+    "full_at_adaptive_total_positive_rise",
+    "full_at_adaptive_max_positive_jump",
+    "full_at_adaptive_positive_jump_count",
+    "full_at_adaptive_jump_concentration",
+    "full_at_adaptive_trace_shape_label",
+    "full_at_adaptive_is_multi_peak",
+    "full_at_adaptive_is_gradual",
+    "adaptive_shape_exact",
+    "adaptive_multi_peak_exact",
+    "adaptive_gradual_exact",
+    "probe_subset_shape_exact",
+    "probe_subset_multi_peak_exact",
+    "probe_subset_gradual_exact",
+    "adaptive_vs_probe_subset_shape_exact",
+    "adaptive_vs_probe_subset_multi_peak_exact",
+    "adaptive_vs_probe_subset_gradual_exact",
     "adaptive_output_relpath",
     "full_output_relpath",
 ]
@@ -131,6 +176,20 @@ CURVE_POINT_COLUMNS = [
     "trace_shape_label",
 ]
 SHAPE_PREVALENCE_COLUMNS = BUNDLE_GROUP_COLUMNS + [
+    "trace_shape_label",
+    "num_examples",
+    "total_examples",
+    "fraction",
+]
+SHAPE_PREVALENCE_BY_SOURCE_COLUMNS = BUNDLE_GROUP_COLUMNS + [
+    "shape_source",
+    "trace_shape_label",
+    "num_examples",
+    "total_examples",
+    "fraction",
+]
+MODEL_SHAPE_PREVALENCE_BY_SOURCE_COLUMNS = MODEL_GROUP_COLUMNS + [
+    "shape_source",
     "trace_shape_label",
     "num_examples",
     "total_examples",
@@ -351,21 +410,34 @@ def prominent_peaks(values: np.ndarray, *, thresholds: ShapeThresholds) -> list[
     return sorted(kept)
 
 
-def shape_metrics(values: np.ndarray, *, thresholds: ShapeThresholds) -> dict[str, Any]:
-    if values.size == 0:
+def shape_metrics(
+    frame: pd.DataFrame,
+    *,
+    thresholds: ShapeThresholds,
+    prefix: str,
+    label_column: str,
+    multi_peak_column: str,
+    gradual_column: str,
+) -> dict[str, Any]:
+    if frame.empty:
         return {
-            "full_peak_sentence_idx": math.nan,
-            "full_peak_deception_rate": math.nan,
-            "full_prominent_peak_count": 0,
-            "full_prominent_peak_sentence_indices": "",
-            "full_total_positive_rise": 0.0,
-            "full_max_positive_jump": 0.0,
-            "full_positive_jump_count": 0,
-            "full_jump_concentration": math.nan,
-            "trace_shape_label": "unknown",
-            "is_multi_peak": False,
-            "is_gradual": False,
+            f"{prefix}_peak_sentence_idx": math.nan,
+            f"{prefix}_peak_deception_rate": math.nan,
+            f"{prefix}_prominent_peak_count": 0,
+            f"{prefix}_prominent_peak_sentence_indices": "",
+            f"{prefix}_total_positive_rise": 0.0,
+            f"{prefix}_max_positive_jump": 0.0,
+            f"{prefix}_positive_jump_count": 0,
+            f"{prefix}_jump_concentration": math.nan,
+            label_column: "unknown",
+            multi_peak_column: False,
+            gradual_column: False,
         }
+
+    ordered = frame.sort_values("sentence_idx").reset_index(drop=True)
+    values = ordered["deception_rate"].to_numpy(dtype=np.float64, copy=False)
+    sentence_indices = ordered["sentence_idx"].to_numpy(dtype=np.int64, copy=False)
+    sentence_numbers = ordered["sentence_number"].to_numpy(dtype=np.int64, copy=False)
 
     diffs = np.diff(values) if values.size > 1 else np.asarray([], dtype=np.float64)
     positive_diffs = np.maximum(diffs, 0.0)
@@ -377,10 +449,12 @@ def shape_metrics(values: np.ndarray, *, thresholds: ShapeThresholds) -> dict[st
         if total_positive_rise > 0.0
         else math.nan
     )
-    full_peak_sentence_idx = int(np.argmax(values))
-    full_peak_deception_rate = float(np.max(values))
-    peak_indices = prominent_peaks(values, thresholds=thresholds)
-    is_multi_peak = len(peak_indices) >= 2
+    peak_position = int(np.argmax(values))
+    peak_sentence_idx = int(sentence_indices[peak_position])
+    peak_deception_rate = float(np.max(values))
+    peak_positions = prominent_peaks(values, thresholds=thresholds)
+    peak_sentence_numbers = [int(sentence_numbers[position]) for position in peak_positions]
+    is_multi_peak = len(peak_positions) >= 2
     is_gradual = bool(
         (not is_multi_peak)
         and (total_positive_rise >= thresholds.gradual_total_rise_threshold)
@@ -397,17 +471,17 @@ def shape_metrics(values: np.ndarray, *, thresholds: ShapeThresholds) -> dict[st
         shape_label = "sharp_or_other"
 
     return {
-        "full_peak_sentence_idx": int(full_peak_sentence_idx),
-        "full_peak_deception_rate": float(full_peak_deception_rate),
-        "full_prominent_peak_count": int(len(peak_indices)),
-        "full_prominent_peak_sentence_indices": ",".join(str(int(idx) + 1) for idx in peak_indices),
-        "full_total_positive_rise": float(total_positive_rise),
-        "full_max_positive_jump": float(max_positive_jump),
-        "full_positive_jump_count": int(positive_jump_count),
-        "full_jump_concentration": float(jump_concentration) if not math.isnan(jump_concentration) else math.nan,
-        "trace_shape_label": shape_label,
-        "is_multi_peak": bool(is_multi_peak),
-        "is_gradual": bool(is_gradual),
+        f"{prefix}_peak_sentence_idx": int(peak_sentence_idx),
+        f"{prefix}_peak_deception_rate": float(peak_deception_rate),
+        f"{prefix}_prominent_peak_count": int(len(peak_positions)),
+        f"{prefix}_prominent_peak_sentence_indices": ",".join(str(value) for value in peak_sentence_numbers),
+        f"{prefix}_total_positive_rise": float(total_positive_rise),
+        f"{prefix}_max_positive_jump": float(max_positive_jump),
+        f"{prefix}_positive_jump_count": int(positive_jump_count),
+        f"{prefix}_jump_concentration": float(jump_concentration) if not math.isnan(jump_concentration) else math.nan,
+        label_column: shape_label,
+        multi_peak_column: bool(is_multi_peak),
+        gradual_column: bool(is_gradual),
     }
 
 
@@ -521,6 +595,12 @@ def compare_records(
     full_df["is_probed_by_adaptive"] = full_df["sentence_idx"].isin(set(adaptive_df["sentence_idx"].astype(int)))
     adaptive_df["is_probed_by_adaptive"] = True
     example_is_deceptive = bool(selection_row["deceptive"])
+    full_at_adaptive_df = (
+        full_df.loc[full_df["sentence_idx"].isin(set(adaptive_df["sentence_idx"].astype(int)))]
+        .copy()
+        .sort_values("sentence_idx")
+        .reset_index(drop=True)
+    )
 
     full_values = full_df["deception_rate"].to_numpy(dtype=np.float64, copy=False)
     full_end_indices = full_df["sentence_end_idx"].to_numpy(dtype=np.int64, copy=False)
@@ -536,7 +616,30 @@ def compare_records(
     adaptive_values = adaptive_df["deception_rate"].to_numpy(dtype=np.float64, copy=False)
     adaptive_peak_sentence_idx = int(adaptive_df.loc[adaptive_df["deception_rate"].astype(float).idxmax(), "sentence_idx"])
     adaptive_probed_sentence_idx = sorted(set(int(value) for value in adaptive_df["sentence_idx"].tolist()))
-    peak_metrics = shape_metrics(full_values, thresholds=thresholds)
+    peak_metrics = shape_metrics(
+        full_df,
+        thresholds=thresholds,
+        prefix="full",
+        label_column="trace_shape_label",
+        multi_peak_column="is_multi_peak",
+        gradual_column="is_gradual",
+    )
+    adaptive_shape_metrics = shape_metrics(
+        adaptive_df,
+        thresholds=thresholds,
+        prefix="adaptive",
+        label_column="adaptive_trace_shape_label",
+        multi_peak_column="adaptive_is_multi_peak",
+        gradual_column="adaptive_is_gradual",
+    )
+    full_at_adaptive_shape_metrics = shape_metrics(
+        full_at_adaptive_df,
+        thresholds=thresholds,
+        prefix="full_at_adaptive",
+        label_column="full_at_adaptive_trace_shape_label",
+        multi_peak_column="full_at_adaptive_is_multi_peak",
+        gradual_column="full_at_adaptive_is_gradual",
+    )
     full_peak_sentence_idx = int(peak_metrics["full_peak_sentence_idx"]) if not math.isnan(float(peak_metrics["full_peak_sentence_idx"])) else None
 
     prominent_peak_indices = [
@@ -629,6 +732,37 @@ def compare_records(
         commitment_text_raw_match = math.nan
         commitment_text_normalized_match = math.nan
 
+    adaptive_shape_exact = float(
+        str(peak_metrics["trace_shape_label"]) == str(adaptive_shape_metrics["adaptive_trace_shape_label"])
+    )
+    adaptive_multi_peak_exact = float(
+        bool(peak_metrics["is_multi_peak"]) == bool(adaptive_shape_metrics["adaptive_is_multi_peak"])
+    )
+    adaptive_gradual_exact = float(
+        bool(peak_metrics["is_gradual"]) == bool(adaptive_shape_metrics["adaptive_is_gradual"])
+    )
+    probe_subset_shape_exact = float(
+        str(peak_metrics["trace_shape_label"]) == str(full_at_adaptive_shape_metrics["full_at_adaptive_trace_shape_label"])
+    )
+    probe_subset_multi_peak_exact = float(
+        bool(peak_metrics["is_multi_peak"]) == bool(full_at_adaptive_shape_metrics["full_at_adaptive_is_multi_peak"])
+    )
+    probe_subset_gradual_exact = float(
+        bool(peak_metrics["is_gradual"]) == bool(full_at_adaptive_shape_metrics["full_at_adaptive_is_gradual"])
+    )
+    adaptive_vs_probe_subset_shape_exact = float(
+        str(adaptive_shape_metrics["adaptive_trace_shape_label"])
+        == str(full_at_adaptive_shape_metrics["full_at_adaptive_trace_shape_label"])
+    )
+    adaptive_vs_probe_subset_multi_peak_exact = float(
+        bool(adaptive_shape_metrics["adaptive_is_multi_peak"])
+        == bool(full_at_adaptive_shape_metrics["full_at_adaptive_is_multi_peak"])
+    )
+    adaptive_vs_probe_subset_gradual_exact = float(
+        bool(adaptive_shape_metrics["adaptive_is_gradual"])
+        == bool(full_at_adaptive_shape_metrics["full_at_adaptive_is_gradual"])
+    )
+
     prompt_match = str(full_payload.get("prompt") or "") == str(adaptive_payload.get("prompt") or "")
     raw_text_match = str(full_payload.get("raw_text") or "") == str(adaptive_payload.get("raw_text") or "")
 
@@ -678,8 +812,19 @@ def compare_records(
         "adaptive_exact_peak_probe_recall": float(np.mean(exact_peak_hits)) if exact_peak_hits else math.nan,
         "adaptive_within_one_peak_probe_recall": float(np.mean(within_one_peak_hits)) if within_one_peak_hits else math.nan,
         "adaptive_all_peaks_covered_within_one": float(all(bool(value) for value in within_one_peak_hits)) if within_one_peak_hits else math.nan,
+        "adaptive_shape_exact": float(adaptive_shape_exact),
+        "adaptive_multi_peak_exact": float(adaptive_multi_peak_exact),
+        "adaptive_gradual_exact": float(adaptive_gradual_exact),
+        "probe_subset_shape_exact": float(probe_subset_shape_exact),
+        "probe_subset_multi_peak_exact": float(probe_subset_multi_peak_exact),
+        "probe_subset_gradual_exact": float(probe_subset_gradual_exact),
+        "adaptive_vs_probe_subset_shape_exact": float(adaptive_vs_probe_subset_shape_exact),
+        "adaptive_vs_probe_subset_multi_peak_exact": float(adaptive_vs_probe_subset_multi_peak_exact),
+        "adaptive_vs_probe_subset_gradual_exact": float(adaptive_vs_probe_subset_gradual_exact),
         **commitment_threshold_metrics,
         **peak_metrics,
+        **adaptive_shape_metrics,
+        **full_at_adaptive_shape_metrics,
     }
 
     curve_points = pd.concat([full_df, adaptive_df], ignore_index=True, sort=False)
@@ -720,6 +865,21 @@ def grouped_summary(
         multi_peak_fraction=("is_multi_peak", safe_mean),
         gradual_fraction=("is_gradual", safe_mean),
         sharp_or_other_fraction=("trace_shape_label", lambda values: float(np.mean(pd.Series(values).astype(str).eq("sharp_or_other")))),
+        adaptive_multi_peak_fraction=("adaptive_is_multi_peak", safe_mean),
+        adaptive_gradual_fraction=("adaptive_is_gradual", safe_mean),
+        adaptive_sharp_or_other_fraction=("adaptive_trace_shape_label", lambda values: float(np.mean(pd.Series(values).astype(str).eq("sharp_or_other")))),
+        full_at_adaptive_multi_peak_fraction=("full_at_adaptive_is_multi_peak", safe_mean),
+        full_at_adaptive_gradual_fraction=("full_at_adaptive_is_gradual", safe_mean),
+        full_at_adaptive_sharp_or_other_fraction=("full_at_adaptive_trace_shape_label", lambda values: float(np.mean(pd.Series(values).astype(str).eq("sharp_or_other")))),
+        adaptive_shape_exact_rate=("adaptive_shape_exact", safe_mean),
+        adaptive_multi_peak_exact_rate=("adaptive_multi_peak_exact", safe_mean),
+        adaptive_gradual_exact_rate=("adaptive_gradual_exact", safe_mean),
+        probe_subset_shape_exact_rate=("probe_subset_shape_exact", safe_mean),
+        probe_subset_multi_peak_exact_rate=("probe_subset_multi_peak_exact", safe_mean),
+        probe_subset_gradual_exact_rate=("probe_subset_gradual_exact", safe_mean),
+        adaptive_vs_probe_subset_shape_exact_rate=("adaptive_vs_probe_subset_shape_exact", safe_mean),
+        adaptive_vs_probe_subset_multi_peak_exact_rate=("adaptive_vs_probe_subset_multi_peak_exact", safe_mean),
+        adaptive_vs_probe_subset_gradual_exact_rate=("adaptive_vs_probe_subset_gradual_exact", safe_mean),
         prompt_match_rate=("prompt_match", safe_mean),
         raw_text_match_rate=("raw_text_match", safe_mean),
     )
@@ -754,6 +914,29 @@ def grouped_summary(
             "multi_peak_fraction": safe_mean(df["is_multi_peak"]),
             "gradual_fraction": safe_mean(df["is_gradual"]),
             "sharp_or_other_fraction": float(np.mean(df["trace_shape_label"].astype(str).eq("sharp_or_other"))),
+            "adaptive_multi_peak_fraction": safe_mean(df["adaptive_is_multi_peak"]),
+            "adaptive_gradual_fraction": safe_mean(df["adaptive_is_gradual"]),
+            "adaptive_sharp_or_other_fraction": float(
+                np.mean(df["adaptive_trace_shape_label"].astype(str).eq("sharp_or_other"))
+            ),
+            "full_at_adaptive_multi_peak_fraction": safe_mean(df["full_at_adaptive_is_multi_peak"]),
+            "full_at_adaptive_gradual_fraction": safe_mean(df["full_at_adaptive_is_gradual"]),
+            "full_at_adaptive_sharp_or_other_fraction": float(
+                np.mean(df["full_at_adaptive_trace_shape_label"].astype(str).eq("sharp_or_other"))
+            ),
+            "adaptive_shape_exact_rate": safe_mean(df["adaptive_shape_exact"]),
+            "adaptive_multi_peak_exact_rate": safe_mean(df["adaptive_multi_peak_exact"]),
+            "adaptive_gradual_exact_rate": safe_mean(df["adaptive_gradual_exact"]),
+            "probe_subset_shape_exact_rate": safe_mean(df["probe_subset_shape_exact"]),
+            "probe_subset_multi_peak_exact_rate": safe_mean(df["probe_subset_multi_peak_exact"]),
+            "probe_subset_gradual_exact_rate": safe_mean(df["probe_subset_gradual_exact"]),
+            "adaptive_vs_probe_subset_shape_exact_rate": safe_mean(df["adaptive_vs_probe_subset_shape_exact"]),
+            "adaptive_vs_probe_subset_multi_peak_exact_rate": safe_mean(
+                df["adaptive_vs_probe_subset_multi_peak_exact"]
+            ),
+            "adaptive_vs_probe_subset_gradual_exact_rate": safe_mean(
+                df["adaptive_vs_probe_subset_gradual_exact"]
+            ),
             "prompt_match_rate": safe_mean(df["prompt_match"]),
             "raw_text_match_rate": safe_mean(df["raw_text_match"]),
         }
@@ -789,6 +972,45 @@ def shape_prevalence_table(df: pd.DataFrame, group_columns: list[str]) -> pd.Dat
     merged = counts.merge(totals, on=group_columns, how="left", validate="many_to_one")
     merged["fraction"] = merged["num_examples"] / merged["total_examples"]
     return merged.sort_values(group_columns + ["trace_shape_label"]).reset_index(drop=True)
+
+
+def shape_prevalence_by_source_table(df: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    source_specs = [
+        ("full", "trace_shape_label"),
+        ("adaptive", "adaptive_trace_shape_label"),
+        ("full_at_adaptive_probes", "full_at_adaptive_trace_shape_label"),
+    ]
+    long_frames: list[pd.DataFrame] = []
+    for shape_source, label_column in source_specs:
+        if label_column not in df.columns:
+            continue
+        source_df = df.loc[:, [*group_columns, "example_id", label_column]].copy()
+        source_df["shape_source"] = str(shape_source)
+        source_df["trace_shape_label"] = source_df[label_column].fillna("unknown").astype(str)
+        long_frames.append(
+            source_df.loc[:, [*group_columns, "example_id", "shape_source", "trace_shape_label"]]
+        )
+    if not long_frames:
+        return pd.DataFrame()
+    long_df = pd.concat(long_frames, ignore_index=True, sort=False)
+    counts = (
+        long_df.groupby(group_columns + ["shape_source", "trace_shape_label"], as_index=False)
+        .agg(num_examples=("example_id", "count"))
+    )
+    totals = (
+        long_df.groupby(group_columns + ["shape_source"], as_index=False)
+        .agg(total_examples=("example_id", "count"))
+    )
+    merged = counts.merge(
+        totals,
+        on=[*group_columns, "shape_source"],
+        how="left",
+        validate="many_to_one",
+    )
+    merged["fraction"] = merged["num_examples"] / merged["total_examples"]
+    return merged.sort_values([*group_columns, "shape_source", "trace_shape_label"]).reset_index(drop=True)
 
 
 def plot_bundle_probe_fraction(bundle_summary_df: pd.DataFrame, out_path: Path) -> None:
@@ -1017,8 +1239,16 @@ def build_summary_markdown(
                 *threshold_lines,
                 f"- Any full-peak probed within-one: {float(row['adaptive_any_peak_probe_within_one_rate']):.3f}",
                 f"- Adaptive argmax peak within-one: {float(row['peak_within_one_rate']):.3f}",
-                f"- Multi-peak trace fraction: {float(row['multi_peak_fraction']):.3f}",
-                f"- Gradual trace fraction: {float(row['gradual_fraction']):.3f}",
+                f"- Exhaustive multi-peak trace fraction: {float(row['multi_peak_fraction']):.3f}",
+                f"- Adaptive multi-peak trace fraction: {float(row['adaptive_multi_peak_fraction']):.3f}",
+                f"- Full-at-adaptive-probes multi-peak trace fraction: {float(row['full_at_adaptive_multi_peak_fraction']):.3f}",
+                f"- Adaptive vs exhaustive multi-peak agreement: {float(row['adaptive_multi_peak_exact_rate']):.3f}",
+                f"- Probe-subset vs exhaustive multi-peak agreement: {float(row['probe_subset_multi_peak_exact_rate']):.3f}",
+                f"- Exhaustive gradual trace fraction: {float(row['gradual_fraction']):.3f}",
+                f"- Adaptive gradual trace fraction: {float(row['adaptive_gradual_fraction']):.3f}",
+                f"- Full-at-adaptive-probes gradual trace fraction: {float(row['full_at_adaptive_gradual_fraction']):.3f}",
+                f"- Adaptive vs exhaustive gradual agreement: {float(row['adaptive_gradual_exact_rate']):.3f}",
+                f"- Probe-subset vs exhaustive gradual agreement: {float(row['probe_subset_gradual_exact_rate']):.3f}",
             ]
         )
     if not case_studies_df.empty:
@@ -1232,6 +1462,16 @@ def main() -> None:
     shape_df = ensure_columns(shape_df, SHAPE_PREVALENCE_COLUMNS)
     model_shape_df = shape_prevalence_table(metrics_df, MODEL_GROUP_COLUMNS)
     model_shape_df = ensure_columns(model_shape_df, MODEL_GROUP_COLUMNS + ["trace_shape_label", "num_examples", "total_examples", "fraction"])
+    shape_by_source_df = shape_prevalence_by_source_table(
+        metrics_df,
+        ["env_name", "env_display", "model_bundle_name", "model_display"],
+    )
+    shape_by_source_df = ensure_columns(shape_by_source_df, SHAPE_PREVALENCE_BY_SOURCE_COLUMNS)
+    model_shape_by_source_df = shape_prevalence_by_source_table(metrics_df, MODEL_GROUP_COLUMNS)
+    model_shape_by_source_df = ensure_columns(
+        model_shape_by_source_df,
+        MODEL_SHAPE_PREVALENCE_BY_SOURCE_COLUMNS,
+    )
     case_studies_df = pick_case_studies(metrics_df)
     case_studies_df = ensure_columns(case_studies_df, case_study_column_names)
 
@@ -1245,6 +1485,8 @@ def main() -> None:
     overall_summary_df.to_csv(analysis_root / "adaptive_vs_full_summary_overall.csv", index=False)
     shape_df.to_csv(analysis_root / "trace_shape_prevalence_by_bundle.csv", index=False)
     model_shape_df.to_csv(analysis_root / "trace_shape_prevalence_by_model.csv", index=False)
+    shape_by_source_df.to_csv(analysis_root / "trace_shape_prevalence_by_bundle_and_source.csv", index=False)
+    model_shape_by_source_df.to_csv(analysis_root / "trace_shape_prevalence_by_model_and_source.csv", index=False)
     case_studies_df.to_csv(analysis_root / "case_studies.csv", index=False)
 
     plot_bundle_probe_fraction(bundle_summary_df, figures_root / "adaptive_probe_fraction_by_bundle.png")
