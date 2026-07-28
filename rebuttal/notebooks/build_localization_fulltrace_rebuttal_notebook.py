@@ -194,6 +194,133 @@ def main() -> None:
                 return pivot.loc[:, keep_columns]
 
 
+            def shape_detection_summary(
+                df: pd.DataFrame,
+                *,
+                group_columns: list[str],
+            ) -> pd.DataFrame:
+                if df.empty:
+                    return pd.DataFrame()
+
+                def summarize_group(group: pd.DataFrame) -> dict[str, float | int]:
+                    row: dict[str, float | int] = {
+                        "num_examples": int(len(group)),
+                        "shape_exact_rate": float(
+                            np.mean(
+                                group["trace_shape_label"].astype(str).to_numpy()
+                                == group["adaptive_trace_shape_label"].astype(str).to_numpy()
+                            )
+                        ),
+                    }
+                    for prefix, full_col, adaptive_col in [
+                        ("multi_peak", "is_multi_peak", "adaptive_is_multi_peak"),
+                        ("gradual", "is_gradual", "adaptive_is_gradual"),
+                    ]:
+                        full = group[full_col].fillna(False).astype(bool).to_numpy()
+                        adaptive = group[adaptive_col].fillna(False).astype(bool).to_numpy()
+                        tp = int(np.sum(full & adaptive))
+                        fn = int(np.sum(full & (~adaptive)))
+                        fp = int(np.sum((~full) & adaptive))
+                        tn = int(np.sum((~full) & (~adaptive)))
+                        full_positive = tp + fn
+                        adaptive_positive = tp + fp
+                        union = tp + fn + fp
+                        row[f"{prefix}_full_fraction"] = float(np.mean(full))
+                        row[f"{prefix}_adaptive_fraction"] = float(np.mean(adaptive))
+                        row[f"{prefix}_gap"] = float(np.mean(adaptive) - np.mean(full))
+                        row[f"{prefix}_recall"] = float(tp / full_positive) if full_positive > 0 else np.nan
+                        row[f"{prefix}_precision"] = float(tp / adaptive_positive) if adaptive_positive > 0 else np.nan
+                        row[f"{prefix}_jaccard"] = float(tp / union) if union > 0 else np.nan
+                        row[f"{prefix}_tp"] = tp
+                        row[f"{prefix}_fn"] = fn
+                        row[f"{prefix}_fp"] = fp
+                        row[f"{prefix}_tn"] = tn
+                    return row
+
+                if not group_columns:
+                    return pd.DataFrame([summarize_group(df)])
+
+                rows: list[dict[str, object]] = []
+                for keys, group in df.groupby(group_columns, sort=True, dropna=False):
+                    if not isinstance(keys, tuple):
+                        keys = (keys,)
+                    row = {column: value for column, value in zip(group_columns, keys, strict=False)}
+                    row.update(summarize_group(group))
+                    rows.append(row)
+                return pd.DataFrame(rows).sort_values(group_columns).reset_index(drop=True)
+
+
+            def plot_prevalence_parity(
+                df: pd.DataFrame,
+                *,
+                ax=None,
+                label_column: str,
+                full_column: str,
+                adaptive_column: str,
+                title: str,
+                color: str,
+            ) -> None:
+                if df.empty:
+                    print(f"No rows available for {title.lower()}.")
+                    return
+                plot_df = df.copy()
+                if ax is None:
+                    _, ax = plt.subplots(figsize=(5.4, 5.0), constrained_layout=True)
+                ax.scatter(
+                    plot_df[full_column],
+                    plot_df[adaptive_column],
+                    s=85,
+                    color=color,
+                    alpha=0.9,
+                )
+                for row in plot_df.itertuples(index=False):
+                    ax.text(
+                        float(getattr(row, full_column)) + 0.01,
+                        float(getattr(row, adaptive_column)) + 0.01,
+                        str(getattr(row, label_column)),
+                        fontsize=8,
+                    )
+                ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.2, color="black", alpha=0.55)
+                ax.set_xlim(0.0, 1.02)
+                ax.set_ylim(0.0, 1.02)
+                ax.set_xlabel("Exhaustive prevalence")
+                ax.set_ylabel("Adaptive prevalence")
+                ax.set_title(title)
+                ax.grid(True, alpha=0.25)
+                if ax is not None and ax.figure is not None:
+                    ax.figure.canvas.draw_idle()
+
+
+            def plot_confusion_heatmap(confusion_df: pd.DataFrame, *, title: str) -> None:
+                if confusion_df.empty:
+                    print(f"No rows available for {title.lower()}.")
+                    return
+                labels = list(confusion_df.index.astype(str))
+                fig, ax = plt.subplots(figsize=(6.2, 4.6), constrained_layout=True)
+                image = ax.imshow(confusion_df.to_numpy(dtype=float), cmap="Blues", vmin=0.0, vmax=1.0)
+                ax.set_xticks(np.arange(len(confusion_df.columns)))
+                ax.set_yticks(np.arange(len(confusion_df.index)))
+                ax.set_xticklabels(confusion_df.columns.astype(str), rotation=20)
+                ax.set_yticklabels(labels)
+                ax.set_xlabel("Adaptive label")
+                ax.set_ylabel("Exhaustive label")
+                ax.set_title(title)
+                for row_idx in range(confusion_df.shape[0]):
+                    for col_idx in range(confusion_df.shape[1]):
+                        value = float(confusion_df.iloc[row_idx, col_idx])
+                        ax.text(
+                            col_idx,
+                            row_idx,
+                            f"{value * 100.0:.1f}%",
+                            ha="center",
+                            va="center",
+                            color="white" if value >= 0.45 else "black",
+                            fontsize=9,
+                        )
+                fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+                plt.show()
+
+
             def refresh_analysis() -> subprocess.CompletedProcess:
                 cmd = [
                     sys.executable,
@@ -587,7 +714,187 @@ def main() -> None:
                 print("No exhaustive trace-shape outputs available yet.")
             """
         ),
-        md("## Adaptive vs Exhaustive Shape Prevalence"),
+        md("## Direct Full vs Adaptive Shape Comparison"),
+        code(
+            """
+            if not per_example_df.empty:
+                overall_detection_df = shape_detection_summary(per_example_df, group_columns=[])
+                overall_detection_df
+            else:
+                print("No paired per-example outputs available yet.")
+            """
+        ),
+        code(
+            """
+            if not per_example_df.empty:
+                confusion_counts = pd.crosstab(
+                    per_example_df["trace_shape_label"].astype(str),
+                    per_example_df["adaptive_trace_shape_label"].astype(str),
+                    dropna=False,
+                ).sort_index().sort_index(axis=1)
+                confusion_row_norm = confusion_counts.div(
+                    confusion_counts.sum(axis=1).replace(0, np.nan),
+                    axis=0,
+                ).fillna(0.0)
+                display(confusion_counts)
+                plot_confusion_heatmap(
+                    confusion_row_norm,
+                    title="Adaptive label given exhaustive trace label",
+                )
+            else:
+                print("No paired per-example outputs available yet.")
+            """
+        ),
+        code(
+            """
+            if not per_example_df.empty:
+                model_detection_df = shape_detection_summary(
+                    per_example_df,
+                    group_columns=["model_display"],
+                )
+                fig, axes = plt.subplots(1, 2, figsize=(11.2, 5.0), constrained_layout=True)
+                plot_prevalence_parity(
+                    model_detection_df,
+                    ax=axes[0],
+                    label_column="model_display",
+                    full_column="multi_peak_full_fraction",
+                    adaptive_column="multi_peak_adaptive_fraction",
+                    title="Model-level multi-peak prevalence: full vs adaptive",
+                    color="#2B6CB0",
+                )
+                plot_prevalence_parity(
+                    model_detection_df,
+                    ax=axes[1],
+                    label_column="model_display",
+                    full_column="gradual_full_fraction",
+                    adaptive_column="gradual_adaptive_fraction",
+                    title="Model-level gradual prevalence: full vs adaptive",
+                    color="#38A169",
+                )
+                plt.show()
+            else:
+                print("No paired per-example outputs available yet.")
+            """
+        ),
+        code(
+            """
+            if not per_example_df.empty:
+                model_detection_df = shape_detection_summary(
+                    per_example_df,
+                    group_columns=["model_display"],
+                )
+                summary_table = model_detection_df.rename(
+                    columns={
+                        "model_display": "Model",
+                        "num_examples": "Examples",
+                        "shape_exact_rate": "3-way label exact",
+                        "multi_peak_full_fraction": "Full multi-peak",
+                        "multi_peak_adaptive_fraction": "Adaptive multi-peak",
+                        "multi_peak_gap": "Adaptive - full multi-peak",
+                        "multi_peak_recall": "Adaptive multi-peak recall",
+                        "multi_peak_precision": "Adaptive multi-peak precision",
+                        "gradual_full_fraction": "Full gradual",
+                        "gradual_adaptive_fraction": "Adaptive gradual",
+                        "gradual_gap": "Adaptive - full gradual",
+                        "gradual_recall": "Adaptive gradual recall",
+                        "gradual_precision": "Adaptive gradual precision",
+                    }
+                )
+                display(
+                    format_summary_table(
+                        summary_table,
+                        keep_columns=[
+                            "Model",
+                            "Examples",
+                            "3-way label exact",
+                            "Full multi-peak",
+                            "Adaptive multi-peak",
+                            "Adaptive - full multi-peak",
+                            "Adaptive multi-peak recall",
+                            "Adaptive multi-peak precision",
+                            "Full gradual",
+                            "Adaptive gradual",
+                            "Adaptive - full gradual",
+                            "Adaptive gradual recall",
+                            "Adaptive gradual precision",
+                        ],
+                        percent_columns=[
+                            "3-way label exact",
+                            "Full multi-peak",
+                            "Adaptive multi-peak",
+                            "Adaptive - full multi-peak",
+                            "Adaptive multi-peak recall",
+                            "Adaptive multi-peak precision",
+                            "Full gradual",
+                            "Adaptive gradual",
+                            "Adaptive - full gradual",
+                            "Adaptive gradual recall",
+                            "Adaptive gradual precision",
+                        ],
+                    )
+                )
+            else:
+                print("No paired per-example outputs available yet.")
+            """
+        ),
+        code(
+            """
+            if not per_example_df.empty:
+                bundle_detection_df = shape_detection_summary(
+                    per_example_df,
+                    group_columns=["env_display", "model_display"],
+                )
+                summary_table = bundle_detection_df.rename(
+                    columns={
+                        "env_display": "Environment",
+                        "model_display": "Model",
+                        "num_examples": "Examples",
+                        "shape_exact_rate": "3-way label exact",
+                        "multi_peak_full_fraction": "Full multi-peak",
+                        "multi_peak_adaptive_fraction": "Adaptive multi-peak",
+                        "multi_peak_recall": "Adaptive multi-peak recall",
+                        "multi_peak_precision": "Adaptive multi-peak precision",
+                        "gradual_full_fraction": "Full gradual",
+                        "gradual_adaptive_fraction": "Adaptive gradual",
+                        "gradual_recall": "Adaptive gradual recall",
+                        "gradual_precision": "Adaptive gradual precision",
+                    }
+                )
+                display(
+                    format_summary_table(
+                        summary_table,
+                        keep_columns=[
+                            "Environment",
+                            "Model",
+                            "Examples",
+                            "3-way label exact",
+                            "Full multi-peak",
+                            "Adaptive multi-peak",
+                            "Adaptive multi-peak recall",
+                            "Adaptive multi-peak precision",
+                            "Full gradual",
+                            "Adaptive gradual",
+                            "Adaptive gradual recall",
+                            "Adaptive gradual precision",
+                        ],
+                        percent_columns=[
+                            "3-way label exact",
+                            "Full multi-peak",
+                            "Adaptive multi-peak",
+                            "Adaptive multi-peak recall",
+                            "Adaptive multi-peak precision",
+                            "Full gradual",
+                            "Adaptive gradual",
+                            "Adaptive gradual recall",
+                            "Adaptive gradual precision",
+                        ],
+                    )
+                )
+            else:
+                print("No paired per-example outputs available yet.")
+            """
+        ),
+        md("## Reference: Source Prevalence"),
         code(
             """
             trace_shape_source_model_df
