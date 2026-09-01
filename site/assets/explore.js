@@ -1,8 +1,8 @@
 import {
   h, el, lineChart, sparkline, initTheme, fmtPct, fmtNum,
   rateColor, rateTint, showTip, hideTip, isDark, clamp,
-} from './viz.js?v=28';
-import { loadSource, canLoadSource, peek } from './hfsource.js?v=28';
+} from './viz.js?v=29';
+import { loadSource, canLoadSource, peek } from './hfsource.js?v=29';
 
 initTheme();
 const $ = (id) => document.getElementById(id);

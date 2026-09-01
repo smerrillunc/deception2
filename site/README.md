@@ -181,28 +181,37 @@ Two passes over the Hub produce the inputs:
 
 ## Conventions
 
-**Commitment juncture.** As the paper defines it: the first pair of consecutive
-probed sentence boundaries whose counterfactual deception rate shifts by at least
-**|Δp̂| = 0.30**, in *either* direction — a 30-point collapse toward disclosure
-counts exactly as much as a 30-point jump toward deception. `build_data.py`
-records the 0-based sentence closing the later boundary, the direction (`jdir`:
-`rise` / `fall`) and the signed shift (`jdelta`).
+**Commitment juncture.** As the paper defines it: the first pair of **adjacent**
+sentence boundaries — k and k+1, with no gap — whose counterfactual deception
+rate shifts by at least **|Δp̂| = 0.30**, in *either* direction. A 30-point
+collapse toward disclosure counts exactly as much as a 30-point jump toward
+deception. `build_data.py` records the 0-based sentence closing the later
+boundary, the direction (`jdir`: `rise` / `fall`) and the signed shift
+(`jdelta`).
 
-Two things follow that are worth stating plainly:
+Adjacency is load-bearing. The corpus probes boundaries adaptively, so only 69%
+of consecutive *probed* pairs are actually adjacent sentences; a Δ measured
+across a multi-sentence gap is not a single-sentence shift, so those pairs are
+skipped. The same adjacency rule applies to the *sharpest single-sentence jump*
+filter in Explore, which would otherwise measure something its name does not
+claim. A build-time check confirms no juncture sits on a non-adjacent pair.
 
-- The adaptive search's own bracket (`right_sentence_end_idx`) is **not** this
-  definition. An earlier version of this site used it as a stand-in, which put
-  the juncture rate at 79.4% and its mean position at 0.35. Under the paper's
-  rule it is **41.7%** at mean position **0.82** — the shift usually happens late.
-- The corpus probes boundaries adaptively, so "consecutive" here means
-  consecutive *probed* boundaries. 69% of those pairs are genuinely adjacent
-  sentences; the other 31% span a gap, where the measured Δ covers more than one
-  sentence. This is the closest reading the data supports, but it is not
-  identical to a strict adjacent-sentence Δ.
+Two earlier versions of this site got it wrong, and the numbers moved a long way
+each time:
+
+| rule | traces with a juncture | mean position |
+|---|---|---|
+| adaptive-search bracket (`right_sentence_end_idx`) — **wrong** | 79.4% | 0.35 |
+| \|Δ\| ≥ 0.30 on consecutive *probed* boundaries — still wrong | 41.7% | 0.82 |
+| **\|Δ\| ≥ 0.30 on adjacent sentences** | **35.9%** | **0.81** |
+
+The search bracket is an artefact of how the corpus was probed, not a definition;
+it must never stand in for one. Under the correct rule, junctures are much rarer
+and much later in the trace than the site once claimed, and direction is almost
+perfectly balanced (901 rises, 895 falls).
 
 Because the rule is symmetric, averaging rates locked to the juncture cancels
-out: rises and falls are near-balanced (972 vs 1,114), so the aligned mean is
-flat unless it is split by direction.
+out — the aligned mean is flat unless split by direction.
 
 **Wording.** The site says *deceive* / *deception* throughout, never *lie*. The
 environments define deception from state (a claim that contradicts hidden state,
