@@ -1,7 +1,7 @@
 import {
   h, el, lineChart, initTheme,
   fmtPct, fmtNum, rateColor, rateTint, showTip, hideTip, isDark,
-} from './viz.js?v=28';
+} from './viz.js?v=29';
 
 initTheme();
 
