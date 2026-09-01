@@ -1,8 +1,8 @@
 import {
   h, el, lineChart, sparkline, initTheme, fmtPct, fmtNum,
   rateColor, rateTint, showTip, hideTip, isDark, clamp,
-} from './viz.js?v=27';
-import { loadSource, canLoadSource, peek } from './hfsource.js?v=27';
+} from './viz.js?v=28';
+import { loadSource, canLoadSource, peek } from './hfsource.js?v=28';
 
 initTheme();
 const $ = (id) => document.getElementById(id);
@@ -13,7 +13,7 @@ const state = {
   meta: null, rows: [], filtered: [],
   env: new Set(), model: new Set(), junc: new Set(), out: new Set(),
   jpLo: 0, jpHi: 1, frLo: 0, frHi: 1, jmLo: 0, npLo: 0, gpLo: 10,
-  q: '', sort: 'jump', shown: PAGE, sel: null,
+  q: '', sort: 'final', shown: PAGE, sel: null,
 };
 const curveCache = new Map();          // "env__model" -> [{path, pts}]
 const detailCache = new Map();         // "env__model" -> {path: detail}
@@ -210,15 +210,10 @@ function apply() {
   });
 
   const cmp = {
-    jump: (a, b) => b.jump - a.jump,
-    jpos: (a, b) => (a.jpos ?? 9) - (b.jpos ?? 9),
-    jposd: (a, b) => (b.jpos ?? -9) - (a.jpos ?? -9),
     final: (a, b) => b.r1 - a.r1,
     finala: (a, b) => a.r1 - b.r1,
-    swing: (a, b) => Math.abs(b.swing) - Math.abs(a.swing),
-    np: (a, b) => b.np - a.np,
     id: (a, b) => a.id.localeCompare(b.id),
-  }[s.sort];
+  }[s.sort] || ((a, b) => b.r1 - a.r1);
   s.filtered.sort(cmp);
 
   $('n-shown').textContent = fmtNum(s.filtered.length);
@@ -227,35 +222,8 @@ function apply() {
   $('gp-excl').textContent = held
     ? `Currently holding back ${fmtNum(held)} of ${fmtNum(s.rows.length)}.`
     : 'Nothing held back.';
-  drawSummary();
   drawList();
   writeUrl();
-}
-
-/* ================================================== summary of the selection */
-function drawSummary() {
-  const box = $('summary-strip');
-  box.innerHTML = '';
-  const f = state.filtered;
-  if (!f.length) return;
-
-  const hasJ = f.filter(r => r.j != null);
-  const dec = f.filter(r => r.r1 >= 0.5).length;
-  const mean = (xs) => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
-
-  const tiles = [
-    [fmtNum(f.length), 'traces in view'],
-    [fmtPct(hasJ.length / f.length), 'reach a juncture'],
-    [hasJ.length ? fmtPct(mean(hasJ.map(r => r.jpos).filter(v => v != null))) : '--', 'mean juncture position'],
-    [fmtPct(dec / f.length), 'end deceptive'],
-    [fmtPct(mean(f.map(r => r.r1))), 'mean final rate'],
-    [fmtNum(f.reduce((a, r) => a + r.nv, 0)), 'graded continuations'],
-  ];
-  box.appendChild(h('div', { class: 'stats six', style: 'margin-top:0' },
-    tiles.map(([v, l]) => h('div', { class: 'stat' }, [
-      h('div', { class: 'v', style: 'font-size:20px' }, v),
-      h('div', { class: 'l' }, l),
-    ]))));
 }
 
 /* ================================================================== list */
@@ -1166,7 +1134,7 @@ function writeUrl() {
   if (state.npLo > 0) p.set('nplo', String(state.npLo));
   if (state.gpLo !== 10) p.set('gplo', String(state.gpLo));
   if (state.q) p.set('q', state.q);
-  if (state.sort !== 'jump') p.set('sort', state.sort);
+  if (state.sort !== 'final') p.set('sort', state.sort);
   if (state.sel) p.set('trace', state.sel.path);
   const url = location.pathname + (p.toString() ? '?' + p : '');
   history.replaceState(null, '', url);
@@ -1186,7 +1154,9 @@ function readUrl() {
   state.jmLo = num('jmlo', 0); state.npLo = num('nplo', 0);
   state.gpLo = num('gplo', 10);
   state.q = p.get('q') || '';
-  state.sort = p.get('sort') || 'jump';
+  const SORTS = new Set(['final', 'finala', 'id']);
+  const wanted = p.get('sort');
+  state.sort = SORTS.has(wanted) ? wanted : 'final';
   $('q').value = state.q;
   $('sort').value = state.sort;
 

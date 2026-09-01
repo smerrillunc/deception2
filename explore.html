@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;450;500;600&display=swap">
-<link rel="stylesheet" href="assets/style.css?v=27">
+<link rel="stylesheet" href="assets/style.css?v=28">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23fafafa'/><rect x='4' y='12' width='8' height='8' fill='%233e6ecd'/><rect x='20' y='12' width='8' height='8' fill='%23cb4f4f'/></svg>">
 </head>
 <body>
@@ -85,7 +85,7 @@
         <span class="range-val" id="jm-lo-v">0.00</span>
       </div>
       <div style="font-size:11px;color:var(--text-muted);margin-top:3px">
-        largest rise between consecutive probed boundaries
+        largest shift between consecutive probed boundaries
       </div>
     </div>
     <div class="side-group">
@@ -100,7 +100,7 @@
         sampled at every boundary and a typical trace grades about 50 of them;
         this slider only excludes the few traces where most continuations failed
         to parse, because a rate from a handful of samples snaps to 0 or 1 and
-        fakes a sharp jump. <span id="gp-excl"></span>
+        fakes a shift that is not there. <span id="gp-excl"></span>
       </div>
     </div>
     <div class="side-group">
@@ -120,19 +120,13 @@
       <span class="count"><b id="n-shown">0</b> of <b id="n-total">0</b> traces</span>
       <input class="search" id="q" type="search" placeholder="Search example id, environment, model&hellip;" autocomplete="off">
       <select class="sortsel" id="sort">
-        <option value="jump">Sort: sharpest jump</option>
-        <option value="jpos">Sort: earliest juncture</option>
-        <option value="jposd">Sort: latest juncture</option>
         <option value="final">Sort: highest final rate</option>
         <option value="finala">Sort: lowest final rate</option>
-        <option value="swing">Sort: largest swing</option>
-        <option value="np">Sort: most boundaries</option>
         <option value="id">Sort: example id</option>
       </select>
       <span class="count" id="sel-summary" style="margin-left:auto"></span>
     </div>
 
-    <div id="summary-strip" style="padding:14px 20px 0"></div>
     <div class="tlist" id="tlist"></div>
     <div id="more-wrap" style="padding:0 20px 40px"></div>
   </div>
@@ -151,6 +145,6 @@
   <div class="detail-body" id="d-body"></div>
 </aside>
 
-<script type="module" src="assets/explore.js?v=27"></script>
+<script type="module" src="assets/explore.js?v=28"></script>
 </body>
 </html>
