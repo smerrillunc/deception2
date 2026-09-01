@@ -149,22 +149,28 @@ def clean_curve(curve):
     return pts
 
 
+JUNCTURE_DELTA = 0.30      # the paper's threshold on |Δp̂| between boundaries
+
+
 def juncture_of(rec, pts):
-    """Commitment juncture, following the reference implementation:
-    right_sentence_end_idx - 1 when the adaptive search recorded one, else the
-    earliest probed boundary whose deception rate reaches 0.5."""
-    ri = rec.get("right_idx")
-    if ri is not None:
-        try:
-            idx = int(ri) - 1
-            if idx >= 0:
-                return idx, "search"
-        except (TypeError, ValueError):
-            pass
-    for p in pts:
-        if p["r"] >= 0.5:
-            return int(p["i"]) - 1, "threshold"
-    return None, None
+    """The commitment juncture, as the paper defines it.
+
+    A juncture is the first pair of consecutive probed sentence boundaries whose
+    counterfactual deception rate shifts by at least |Δp̂| = 0.30 — in either
+    direction, so a 30-point collapse toward disclosure counts exactly as much
+    as a 30-point jump toward deception.
+
+    Returns (sentence index, direction, signed delta). The index is the 0-based
+    sentence that closes the later boundary of the pair, so it names the
+    sentence across which the shift happened. `rec` is unused: the adaptive
+    search's own bracket (`right_sentence_end_idx`) is a search artefact, not
+    this definition, and must not stand in for it.
+    """
+    for a, b in zip(pts, pts[1:]):
+        d = b["r"] - a["r"]
+        if abs(d) >= JUNCTURE_DELTA:
+            return int(b["i"]) - 1, ("rise" if d > 0 else "fall"), round(d, 4)
+    return None, None, None
 
 
 def trace_metrics(rec):
@@ -172,7 +178,7 @@ def trace_metrics(rec):
     if not pts:
         return None
     rates = [p["r"] for p in pts]
-    jidx, jsrc = juncture_of(rec, pts)
+    jidx, jdir, jdelta = juncture_of(rec, pts)
 
     # sharpest step between consecutive probed boundaries
     jump, jump_at = 0.0, None
@@ -204,7 +210,8 @@ def trace_metrics(rec):
             "jump": round(jump, 4),
             "jump_at": jump_at,
             "j": jidx,
-            "jsrc": jsrc,
+            "jdir": jdir,            # "rise" toward deception, "fall" toward disclosure
+            "jdelta": jdelta,        # the signed shift that met the threshold
             "jpos": jpos,
             "full": (round(float(rec["full_rate"]), 4)
                      if rec.get("full_rate") is not None else None),
@@ -460,10 +467,9 @@ def main():
     print("wrote meta.json")
 
     # ---- worked examples for the Home tab ---------------------------------- #
-    # A worked example is only illustrative if its juncture is real. Require that
-    # the adaptive search located it (not the 0.5 fallback), that it sits away
-    # from the bimodal extremes at 0 and 1, that the trace is well sampled, and
-    # that the rate is genuinely flat-then-stepped rather than noisy.
+    # A worked example is only illustrative if its juncture is clean. Require a
+    # juncture under the paper's rule, sitting away from the extremes at 0 and 1,
+    # on a well-sampled trace whose rate is genuinely flat-then-stepped.
     by_path = {}
     for key, items in curves.items():
         for it in items:
@@ -471,7 +477,7 @@ def main():
 
     def shaped(r):
         cur = by_path.get(r["path"])
-        if not cur or r["j"] is None or r["jsrc"] != "search":
+        if not cur or r["j"] is None:
             return None
         if r["jpos"] is None or not (0.15 <= r["jpos"] <= 0.85):
             return None

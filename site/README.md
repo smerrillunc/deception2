@@ -181,17 +181,28 @@ Two passes over the Hub produce the inputs:
 
 ## Conventions
 
-**Commitment juncture.** Following the reference implementation, a trace's
-juncture is `right_sentence_end_idx - 1` when the adaptive coarse search recorded
-a bracket, and otherwise the earliest probed boundary whose deception rate
-reaches 0.5. Traces where neither applies are reported as *never commits* rather
-than being dropped.
+**Commitment juncture.** As the paper defines it: the first pair of consecutive
+probed sentence boundaries whose counterfactual deception rate shifts by at least
+**|Δp̂| = 0.30**, in *either* direction — a 30-point collapse toward disclosure
+counts exactly as much as a 30-point jump toward deception. `build_data.py`
+records the 0-based sentence closing the later boundary, the direction (`jdir`:
+`rise` / `fall`) and the signed shift (`jdelta`).
 
-Note that this is defined as the *onset of deception*, so it is only meaningful
-on a trace whose rate rises. On one that resolves toward disclosure the search
-still returns a value, but it does not line up with the visible transition — the
-worked example that resolves toward honesty is therefore labelled *no deception
-onset* and marks the downward 0.5 crossing instead.
+Two things follow that are worth stating plainly:
+
+- The adaptive search's own bracket (`right_sentence_end_idx`) is **not** this
+  definition. An earlier version of this site used it as a stand-in, which put
+  the juncture rate at 79.4% and its mean position at 0.35. Under the paper's
+  rule it is **41.7%** at mean position **0.82** — the shift usually happens late.
+- The corpus probes boundaries adaptively, so "consecutive" here means
+  consecutive *probed* boundaries. 69% of those pairs are genuinely adjacent
+  sentences; the other 31% span a gap, where the measured Δ covers more than one
+  sentence. This is the closest reading the data supports, but it is not
+  identical to a strict adjacent-sentence Δ.
+
+Because the rule is symmetric, averaging rates locked to the juncture cancels
+out: rises and falls are near-balanced (972 vs 1,114), so the aligned mean is
+flat unless it is split by direction.
 
 **Wording.** The site says *deceive* / *deception* throughout, never *lie*. The
 environments define deception from state (a claim that contradicts hidden state,
