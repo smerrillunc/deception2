@@ -78,7 +78,9 @@ echo "Publishing $PREFIX/ -> $REMOTE ($URL), branch $BRANCH"
 SHA="$(git subtree split --prefix "$PREFIX" HEAD)"
 git push --force "$REMOTE" "$SHA:refs/heads/$BRANCH"
 
-PAGES_URL="$(printf '%s' "$URL" | sed -E 's#.*[:/]([^/]+)/([^/]+?)(\.git)?$#https://\1.github.io/\2/#')"
+# strip any .git suffix first - sed has no lazy quantifier to do it inline
+CLEAN_URL="${URL%.git}"
+PAGES_URL="$(printf '%s' "$CLEAN_URL" | sed -E 's#.*[:/]([^/]+)/([^/]+)$#https://\1.github.io/\2/#')"
 cat <<EOF
 
 Pushed. If this is the first deploy, enable it once:
