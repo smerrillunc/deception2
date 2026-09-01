@@ -250,6 +250,15 @@ section > .wrap > .eyebrow { grid-column: 1; grid-row: 1; display: block; margin
 /* prose holds a readable measure; everything else fills the column */
 .lede, .hero .lede, .note, figcaption { max-width: var(--measure); }
 
+/* A note that belongs to the full-width row above it - the statistics strip -
+   is centred under that row rather than hugging the prose column's left edge,
+   which left it stranded against half the width. */
+.note-under {
+  margin: 18px auto 0; max-width: 78ch;
+  font-size: 13px; line-height: 1.65; color: var(--text-muted);
+  text-align: center;
+}
+
 @media (max-width: 860px) {
   .hero > .wrap, section > .wrap { display: block; }
   .hero > .wrap > .eyebrow, section > .wrap > .eyebrow { margin-bottom: 16px; }
